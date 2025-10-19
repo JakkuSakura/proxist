@@ -23,7 +23,7 @@ Proxist is a Rust-native time-series proxy that keeps the hot working set in mem
 
 1. Client submits ticks to an ingress endpoint with tenant and table metadata.
 2. `proxistd` validates schema/version via the metadata store and enriches ticks with symbol IDs.
-3. Data is appended into the WAL and in-memory columns in a zero-copy fashion.
+3. Data is appended into the WAL (disk-backed when `PROXIST_WAL_DIR` is set, in-memory otherwise) and streamed into the hot column store.
 4. Acknowledgment returns as soon as the WAL fsync completes (target < 100 µs).
 5. The metadata service updates per-table high-watermarks, out-of-order buffers, and ingress metrics.
 

@@ -1,6 +1,8 @@
 mod ingest;
 
+use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +22,7 @@ use proxist_core::{
 };
 use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
 use proxist_metadata_sqlite::SqliteMetadataStore;
-use proxist_wal::{InMemoryWal, WalWriter};
+use proxist_wal::{FileWal, InMemoryWal, WalConfig, WalWriter};
 use serde_bytes::ByteBuf;
 use serde_json::json;
 use tokio::signal;
@@ -35,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     info!(?config, "starting proxistd");
 
     let metadata_store = SqliteMetadataStore::connect(&config.metadata_path).await?;
-    let daemon = ProxistDaemon::new(config, metadata_store);
+    let daemon = ProxistDaemon::new(config, metadata_store).await?;
     daemon.run().await?;
 
     Ok(())
@@ -72,6 +74,19 @@ impl DaemonConfig {
     }
 }
 
+async fn wal_from_env() -> anyhow::Result<Option<Arc<dyn WalWriter>>> {
+    if let Ok(dir) = env::var("PROXIST_WAL_DIR") {
+        let path = PathBuf::from(dir);
+        let config = WalConfig {
+            directory: path,
+            ..WalConfig::default()
+        };
+        let wal = FileWal::open(config).await?;
+        return Ok(Some(Arc::new(wal)));
+    }
+    Ok(None)
+}
+
 fn load_clickhouse_config() -> Option<ClickhouseConfig> {
     let endpoint = std::env::var("PROXIST_CLICKHOUSE_ENDPOINT").ok()?;
     let database =
@@ -104,16 +119,25 @@ struct ProxistDaemon {
     metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
     metadata_store: SqliteMetadataStore,
     hot_store: Arc<dyn HotColumnStore>,
-    _wal: Arc<dyn WalWriter>,
     ingest_service: Arc<IngestService>,
 }
 
 impl ProxistDaemon {
-    fn new(config: DaemonConfig, metadata_store: SqliteMetadataStore) -> Self {
+    async fn new(
+        config: DaemonConfig,
+        metadata_store: SqliteMetadataStore,
+    ) -> anyhow::Result<Self> {
         let cache = Arc::new(tokio::sync::Mutex::new(ClusterMetadata::default()));
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
+        let wal: Arc<dyn WalWriter> = match wal_from_env().await {
+            Ok(Some(wal)) => wal,
+            Ok(None) => Arc::new(InMemoryWal::new()),
+            Err(err) => {
+                tracing::error!(error = %err, "failed to initialize disk WAL; falling back to in-memory");
+                Arc::new(InMemoryWal::new())
+            }
+        };
 
         let clickhouse_pair = config.clickhouse.clone().and_then(|cfg| {
             ClickhouseHttpSink::new(cfg.clone())
@@ -134,14 +158,13 @@ impl ProxistDaemon {
             hot_store.clone(),
             clickhouse_pair.clone(),
         ));
-        Self {
+        Ok(Self {
             config,
             metadata_cache: cache,
             metadata_store,
             hot_store,
-            _wal: wal,
             ingest_service,
-        }
+        })
     }
 
     #[instrument(skip(self))]

@@ -98,16 +98,18 @@ impl IngestService {
             None
         };
 
+        let target = self
+            .clickhouse_target
+            .as_ref()
+            .map(|t| proxist_api::ClickhouseTarget {
+                endpoint: t.endpoint.clone(),
+                database: t.database.clone(),
+                table: t.table.clone(),
+            });
+
         ClickhouseStatus {
             enabled: self.clickhouse.is_some(),
-            target: self
-                .clickhouse_target
-                .clone()
-                .map(|t| proxist_api::ClickhouseTarget {
-                    endpoint: t.endpoint,
-                    database: t.database,
-                    table: t.table,
-                }),
+            target,
             last_flush,
         }
     }
