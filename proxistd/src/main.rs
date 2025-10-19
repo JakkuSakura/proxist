@@ -14,6 +14,7 @@ use axum::{
 };
 use ingest::IngestService;
 use proxist_api::{IngestBatchRequest, QueryRequest, QueryResponse, StatusResponse};
+use proxist_ch::{ClickhouseConfig, ClickhouseHttpSink, ClickhouseSink};
 use proxist_core::{
     metadata::ClusterMetadata, MetadataStore, ShardAssignment, ShardHealth, ShardPersistenceTracker,
 };
@@ -52,6 +53,7 @@ fn init_tracing() -> anyhow::Result<()> {
 struct DaemonConfig {
     metadata_path: String,
     http_addr: SocketAddr,
+    clickhouse: Option<ClickhouseConfig>,
 }
 
 impl DaemonConfig {
@@ -61,11 +63,40 @@ impl DaemonConfig {
         let http_addr = std::env::var("PROXIST_HTTP_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8080".into())
             .parse()?;
+        let clickhouse = load_clickhouse_config();
         Ok(Self {
             metadata_path,
             http_addr,
+            clickhouse,
         })
     }
+}
+
+fn load_clickhouse_config() -> Option<ClickhouseConfig> {
+    let endpoint = std::env::var("PROXIST_CLICKHOUSE_ENDPOINT").ok()?;
+    let database =
+        std::env::var("PROXIST_CLICKHOUSE_DATABASE").unwrap_or_else(|_| "proxist".into());
+    let table = std::env::var("PROXIST_CLICKHOUSE_TABLE").unwrap_or_else(|_| "ticks".into());
+    let username = std::env::var("PROXIST_CLICKHOUSE_USER").ok();
+    let password = std::env::var("PROXIST_CLICKHOUSE_PASSWORD").ok();
+    let insert_batch_rows = std::env::var("PROXIST_CLICKHOUSE_BATCH_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let timeout_secs = std::env::var("PROXIST_CLICKHOUSE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+
+    Some(ClickhouseConfig {
+        endpoint,
+        database,
+        table,
+        username,
+        password,
+        insert_batch_rows,
+        timeout_secs,
+    })
 }
 
 struct ProxistDaemon {
@@ -73,6 +104,7 @@ struct ProxistDaemon {
     metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
     metadata_store: SqliteMetadataStore,
     hot_store: Arc<dyn HotColumnStore>,
+    _wal: Arc<dyn WalWriter>,
     ingest_service: Arc<IngestService>,
 }
 
@@ -82,16 +114,37 @@ impl ProxistDaemon {
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
         let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
+
+        let clickhouse_pair = config.clickhouse.clone().and_then(|cfg| {
+            let cfg_clone = cfg.clone();
+            ClickhouseHttpSink::new(cfg_clone)
+                .map(|sink| {
+                    let target = proxist_api::ClickhouseTarget {
+                        endpoint: cfg.endpoint.clone(),
+                        database: cfg.database.clone(),
+                        table: cfg.table.clone(),
+                    };
+                    (Arc::new(sink) as Arc<dyn ClickhouseSink>, target)
+                })
+                .map_err(|err| {
+                    tracing::error!(error = %err, "failed to initialize ClickHouse sink");
+                    err
+                })
+                .ok()
+        });
+
         let ingest_service = Arc::new(IngestService::new(
             metadata_store.clone(),
             wal.clone(),
             hot_store.clone(),
+            clickhouse_pair.clone(),
         ));
         Self {
             config,
             metadata_cache: cache,
             metadata_store,
             hot_store,
+            _wal: wal,
             ingest_service,
         }
     }
@@ -163,9 +216,11 @@ impl ProxistDaemon {
         ) -> Result<Json<StatusResponse>, AppError> {
             let metadata = state.metadata_cache.lock().await.clone();
             let shard_health = state.metadata.list_shard_health().await?;
+            let clickhouse = state.ingest.clickhouse_status();
             Ok(Json(StatusResponse {
                 metadata,
                 shard_health,
+                clickhouse,
             }))
         }
 

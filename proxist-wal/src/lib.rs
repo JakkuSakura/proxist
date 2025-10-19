@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use anyhow::anyhow;
 use async_trait::async_trait;
 use proxist_core::{metadata::TenantId, watermark::PersistenceBatch};
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,7 @@ impl Default for WalConfig {
 #[async_trait]
 pub trait WalWriter: Send + Sync {
     async fn append(&self, record: WalRecord) -> anyhow::Result<WalOffset>;
-    async fn flush_segment(&self) -> anyhow::Result<PersistenceBatch>;
+    async fn flush_segment(&self) -> anyhow::Result<WalSegment>;
 }
 
 #[async_trait]
@@ -59,6 +60,25 @@ pub struct WalSegment {
 impl WalSegment {
     pub fn end_offset(&self) -> WalOffset {
         WalOffset(self.base_offset.0 + self.records.len() as u64)
+    }
+
+    pub fn to_persistence_batch(&self) -> anyhow::Result<PersistenceBatch> {
+        let start = self
+            .records
+            .first()
+            .ok_or_else(|| anyhow!("empty WAL segment"))?
+            .timestamp;
+        let end = self
+            .records
+            .last()
+            .ok_or_else(|| anyhow!("empty WAL segment"))?
+            .timestamp;
+
+        Ok(PersistenceBatch::new(
+            format!("batch-{}", self.base_offset.0),
+            start,
+            end,
+        ))
     }
 }
 
@@ -95,26 +115,21 @@ impl WalWriter for InMemoryWal {
         Ok(offset)
     }
 
-    async fn flush_segment(&self) -> anyhow::Result<PersistenceBatch> {
+    async fn flush_segment(&self) -> anyhow::Result<WalSegment> {
         let mut state = self.state.lock().await;
         if state.records.len() == state.last_flush_index {
             anyhow::bail!("no WAL records to flush");
         }
 
-        let pending = &state.records[state.last_flush_index..];
-        let start_ts = pending
-            .first()
-            .map(|record| record.timestamp)
-            .ok_or_else(|| anyhow::anyhow!("empty pending segment"))?;
-        let end_ts = pending
-            .last()
-            .map(|record| record.timestamp)
-            .ok_or_else(|| anyhow::anyhow!("empty pending segment"))?;
-
-        let batch_id = format!("batch-{}", state.last_flush_index);
+        let base_offset = state.last_flush_index as u64;
+        let records = state.records[state.last_flush_index..].to_vec();
         state.last_flush_index = state.records.len();
 
-        Ok(PersistenceBatch::new(batch_id, start_ts, end_ts))
+        Ok(WalSegment {
+            base_offset: WalOffset(base_offset),
+            records,
+            written_at: SystemTime::now(),
+        })
     }
 }
 

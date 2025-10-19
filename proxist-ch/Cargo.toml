@@ -13,3 +13,6 @@ tokio.workspace = true
 tracing.workspace = true
 proxist-core = { path = "../proxist-core" }
 proxist-wal = { path = "../proxist-wal" }
+reqwest.workspace = true
+serde_json.workspace = true
+base64.workspace = true

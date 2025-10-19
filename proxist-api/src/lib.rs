@@ -39,6 +39,22 @@ pub struct QueryResponse {
 pub struct StatusResponse {
     pub metadata: proxist_core::metadata::ClusterMetadata,
     pub shard_health: Vec<ShardHealth>,
+    pub clickhouse: ClickhouseStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClickhouseStatus {
+    pub enabled: bool,
+    pub target: Option<ClickhouseTarget>,
+    #[serde(with = "proxist_core::time::serde_opt_micros")]
+    pub last_flush: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClickhouseTarget {
+    pub endpoint: String,
+    pub database: String,
+    pub table: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

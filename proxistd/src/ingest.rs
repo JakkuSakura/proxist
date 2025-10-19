@@ -1,7 +1,11 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc,
+};
 
 use anyhow::Result;
-use proxist_api::IngestBatchRequest;
+use proxist_api::{ClickhouseStatus, ClickhouseTarget, IngestBatchRequest};
+use proxist_ch::ClickhouseSink;
 use proxist_core::metadata::TenantId;
 use proxist_core::MetadataStore;
 use proxist_mem::HotColumnStore;
@@ -13,6 +17,9 @@ pub struct IngestService {
     metadata: SqliteMetadataStore,
     wal: Arc<dyn WalWriter>,
     hot_store: Arc<dyn HotColumnStore>,
+    clickhouse: Option<Arc<dyn ClickhouseSink>>,
+    clickhouse_target: Option<ClickhouseTarget>,
+    last_flush_micros: AtomicI64,
 }
 
 impl IngestService {
@@ -20,11 +27,19 @@ impl IngestService {
         metadata: SqliteMetadataStore,
         wal: Arc<dyn WalWriter>,
         hot_store: Arc<dyn HotColumnStore>,
+        clickhouse: Option<(Arc<dyn ClickhouseSink>, ClickhouseTarget)>,
     ) -> Self {
+        let (clickhouse_sink, target) = match clickhouse {
+            Some((sink, target)) => (Some(sink), Some(target)),
+            None => (None, None),
+        };
         Self {
             metadata,
             wal,
             hot_store,
+            clickhouse: clickhouse_sink,
+            clickhouse_target: target,
+            last_flush_micros: AtomicI64::new(-1),
         }
     }
 
@@ -57,11 +72,37 @@ impl IngestService {
         }
 
         if !batch.ticks.is_empty() {
-            let batch = self.wal.flush_segment().await?;
-            tracing::debug!(id = %batch.id, "flushed WAL segment");
+            let segment = self.wal.flush_segment().await?;
+            if let Some(sink) = &self.clickhouse {
+                sink.flush_segment(&segment).await?;
+                if let Some(last) = segment
+                    .records
+                    .last()
+                    .map(|record| system_time_to_micros(record.timestamp))
+                {
+                    self.last_flush_micros.store(last, Ordering::SeqCst);
+                }
+            }
+            let batch = segment.to_persistence_batch()?;
+            tracing::debug!(id = %batch.id, rows = segment.records.len(), "flushed WAL segment");
         }
 
         Ok(())
+    }
+
+    pub fn clickhouse_status(&self) -> ClickhouseStatus {
+        let micros = self.last_flush_micros.load(Ordering::SeqCst);
+        let last_flush = if micros >= 0 {
+            Some(micros_to_system_time(micros))
+        } else {
+            None
+        };
+
+        ClickhouseStatus {
+            enabled: self.clickhouse.is_some(),
+            target: self.clickhouse_target.clone(),
+            last_flush,
+        }
     }
 }
 
@@ -84,4 +125,21 @@ async fn resolve_shard(
 
 fn payload_to_vec(buf: &ByteBuf) -> Vec<u8> {
     buf.as_ref().to_vec()
+}
+
+fn system_time_to_micros(ts: std::time::SystemTime) -> i64 {
+    ts.duration_since(std::time::UNIX_EPOCH)
+        .map(|dur| dur.as_micros() as i64)
+        .unwrap_or_else(|err| {
+            let dur = err.duration();
+            -(dur.as_micros() as i64)
+        })
+}
+
+fn micros_to_system_time(micros: i64) -> std::time::SystemTime {
+    if micros >= 0 {
+        std::time::UNIX_EPOCH + std::time::Duration::from_micros(micros as u64)
+    } else {
+        std::time::UNIX_EPOCH - std::time::Duration::from_micros((-micros) as u64)
+    }
 }
