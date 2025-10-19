@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use proxist_core::metadata::{ClusterMetadata, MetadataStore, ShardAssignment, ShardHealth, TenantId};
+use proxist_core::metadata::{
+    ClusterMetadata, MetadataStore, ShardAssignment, ShardHealth, TenantId,
+};
 use proxist_core::{PersistenceState, Watermark};
 use sqlx::{sqlite::SqliteConnectOptions, Row, SqlitePool};
 use tracing::info;
@@ -72,7 +74,6 @@ impl SqliteMetadataStore {
                 .ok()
         })
     }
-
 }
 
 #[async_trait]
@@ -191,7 +192,8 @@ impl MetadataStore for SqliteMetadataStore {
         .bind(tenant_id)
         .bind(symbol)
         .fetch_optional(&mut *tx)
-        .await? {
+        .await?
+        {
             let id: i64 = existing.get("symbol_id");
             tx.commit().await?;
             return Ok(id as u32);
@@ -248,8 +250,7 @@ impl SqliteMetadataStore {
         let watermark_json: String = row.get("watermark_json");
         let persistence_state_json: String = row.get("persistence_state_json");
         let watermark: Watermark = serde_json::from_str(&watermark_json)?;
-        let persistence_state: PersistenceState =
-            serde_json::from_str(&persistence_state_json)?;
+        let persistence_state: PersistenceState = serde_json::from_str(&persistence_state_json)?;
 
         Ok(Some(ShardHealth {
             shard_id: row.get("shard_id"),

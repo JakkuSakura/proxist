@@ -8,6 +8,9 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
@@ -17,3 +20,4 @@ proxist-core = { path = "../proxist-core" }
 proxist-mem = { path = "../proxist-mem" }
 proxist-wal = { path = "../proxist-wal" }
 proxist-metadata-sqlite = { path = "../proxist-metadata-sqlite" }
+serde_bytes.workspace = true

@@ -7,13 +7,15 @@ use proxist_core::{
     query::QueryRange,
 };
 use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestTick {
     pub tenant: TenantId,
     pub symbol: String,
+    #[serde(with = "proxist_core::time::serde_micros")]
     pub timestamp: SystemTime,
-    pub payload: Vec<u8>,
+    pub payload: ByteBuf,
     pub seq: u64,
 }
 
@@ -32,7 +34,7 @@ pub struct QueryRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
-    pub rows: Vec<Vec<u8>>,
+    pub rows: Vec<ByteBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

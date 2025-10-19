@@ -8,7 +8,9 @@ use crate::metadata::ShardId;
 /// Time window for a query, inclusive of `start`, exclusive of `end`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueryRange {
+    #[serde(with = "crate::time::serde_micros")]
     pub start: SystemTime,
+    #[serde(with = "crate::time::serde_micros")]
     pub end: SystemTime,
 }
 

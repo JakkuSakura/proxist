@@ -2,6 +2,7 @@
 
 pub mod metadata;
 pub mod query;
+pub mod time;
 pub mod watermark;
 
 pub use metadata::{ClusterMetadata, MetadataStore, ShardAssignment, ShardHealth};

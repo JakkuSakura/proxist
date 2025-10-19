@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Watermark {
     /// Highest timestamp durably persisted to ClickHouse.
+    #[serde(with = "crate::time::serde_opt_micros")]
     pub persisted: Option<SystemTime>,
     /// Highest timestamp confirmed in the local WAL.
+    #[serde(with = "crate::time::serde_opt_micros")]
     pub wal_high: Option<SystemTime>,
 }
 
@@ -61,7 +63,9 @@ impl Watermark {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PersistenceBatch {
     pub id: String,
+    #[serde(with = "crate::time::serde_micros")]
     pub start: SystemTime,
+    #[serde(with = "crate::time::serde_micros")]
     pub end: SystemTime,
 }
 
@@ -79,11 +83,22 @@ impl PersistenceBatch {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistenceState {
     Capture,
-    FlushReady { batch: PersistenceBatch },
-    Persisting { batch: PersistenceBatch },
-    Committed { batch: PersistenceBatch },
-    Published { batch: PersistenceBatch },
-    Checkpointed { batch: PersistenceBatch, snapshot_id: String },
+    FlushReady {
+        batch: PersistenceBatch,
+    },
+    Persisting {
+        batch: PersistenceBatch,
+    },
+    Committed {
+        batch: PersistenceBatch,
+    },
+    Published {
+        batch: PersistenceBatch,
+    },
+    Checkpointed {
+        batch: PersistenceBatch,
+        snapshot_id: String,
+    },
 }
 
 impl PersistenceState {
@@ -102,11 +117,22 @@ impl PersistenceState {
 /// Legal transitions between persistence states. Each transition is validated by the tracker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistenceTransition {
-    Enqueue { batch: PersistenceBatch },
-    BeginPersist { batch_id: String },
-    ConfirmPersist { batch_id: String },
-    Publish { batch_id: String },
-    Checkpoint { batch_id: String, snapshot_id: String },
+    Enqueue {
+        batch: PersistenceBatch,
+    },
+    BeginPersist {
+        batch_id: String,
+    },
+    ConfirmPersist {
+        batch_id: String,
+    },
+    Publish {
+        batch_id: String,
+    },
+    Checkpoint {
+        batch_id: String,
+        snapshot_id: String,
+    },
     Reset,
 }
 
@@ -137,9 +163,7 @@ impl ShardPersistenceTracker {
                 self.watermark.bump_wal(batch.end);
                 self.state = FlushReady { batch };
             }
-            (FlushReady { batch }, BeginPersist { batch_id })
-                if batch.id == batch_id =>
-            {
+            (FlushReady { batch }, BeginPersist { batch_id }) if batch.id == batch_id => {
                 self.state = Persisting {
                     batch: batch.clone(),
                 };
@@ -155,9 +179,13 @@ impl ShardPersistenceTracker {
                     batch: batch.clone(),
                 };
             }
-            (Published { batch }, Checkpoint { batch_id, snapshot_id })
-                if batch.id == batch_id =>
-            {
+            (
+                Published { batch },
+                Checkpoint {
+                    batch_id,
+                    snapshot_id,
+                },
+            ) if batch.id == batch_id => {
                 self.state = Checkpointed {
                     batch: batch.clone(),
                     snapshot_id,
