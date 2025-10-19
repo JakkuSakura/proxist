@@ -1,3 +1,5 @@
+mod ingest;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,10 +12,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use proxist_api::{IngestBatchRequest, QueryRequest, QueryResponse};
-use proxist_core::{metadata::ClusterMetadata, MetadataStore, ShardPersistenceTracker};
+use ingest::IngestService;
+use proxist_api::{IngestBatchRequest, QueryRequest, QueryResponse, StatusResponse};
+use proxist_core::{
+    metadata::ClusterMetadata, MetadataStore, ShardAssignment, ShardHealth, ShardPersistenceTracker,
+};
 use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
 use proxist_metadata_sqlite::SqliteMetadataStore;
+use proxist_wal::{InMemoryWal, WalWriter};
 use serde_bytes::ByteBuf;
 use serde_json::json;
 use tokio::signal;
@@ -67,6 +73,7 @@ struct ProxistDaemon {
     metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
     metadata_store: SqliteMetadataStore,
     hot_store: Arc<dyn HotColumnStore>,
+    ingest_service: Arc<IngestService>,
 }
 
 impl ProxistDaemon {
@@ -74,11 +81,18 @@ impl ProxistDaemon {
         let cache = Arc::new(tokio::sync::Mutex::new(ClusterMetadata::default()));
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
+        let ingest_service = Arc::new(IngestService::new(
+            metadata_store.clone(),
+            wal.clone(),
+            hot_store.clone(),
+        ));
         Self {
             config,
             metadata_cache: cache,
             metadata_store,
             hot_store,
+            ingest_service,
         }
     }
 
@@ -114,6 +128,17 @@ impl ProxistDaemon {
             tracker
                 .apply(proxist_core::PersistenceTransition::Reset)
                 .context("reset tracker")?;
+
+            let health = ShardHealth {
+                shard_id: "shard-0".to_string(),
+                is_leader: true,
+                wal_backlog_bytes: 0,
+                clickhouse_lag_ms: 0,
+                watermark: tracker.watermark,
+                persistence_state: tracker.state.clone(),
+            };
+
+            self.metadata_store.record_shard_health(health).await?;
         }
     }
 
@@ -123,40 +148,52 @@ impl ProxistDaemon {
             metadata: SqliteMetadataStore,
             metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
             hot_store: Arc<dyn HotColumnStore>,
+            ingest: Arc<IngestService>,
         }
 
         let state = AppState {
             metadata: self.metadata_store.clone(),
             metadata_cache: Arc::clone(&self.metadata_cache),
             hot_store: Arc::clone(&self.hot_store),
+            ingest: Arc::clone(&self.ingest_service),
         };
 
         async fn status_handler(
             State(state): State<AppState>,
-        ) -> Result<Json<ClusterMetadata>, AppError> {
-            let snapshot = state.metadata_cache.lock().await.clone();
-            Ok(Json(snapshot))
+        ) -> Result<Json<StatusResponse>, AppError> {
+            let metadata = state.metadata_cache.lock().await.clone();
+            let shard_health = state.metadata.list_shard_health().await?;
+            Ok(Json(StatusResponse {
+                metadata,
+                shard_health,
+            }))
+        }
+
+        async fn upsert_assignments_handler(
+            State(state): State<AppState>,
+            Json(assignments): Json<Vec<ShardAssignment>>,
+        ) -> Result<StatusCode, AppError> {
+            for assignment in &assignments {
+                state
+                    .metadata
+                    .put_shard_assignment(assignment.clone())
+                    .await?;
+            }
+
+            let snapshot = state.metadata.get_cluster_metadata().await?;
+            {
+                let mut cache = state.metadata_cache.lock().await;
+                *cache = snapshot;
+            }
+
+            Ok(StatusCode::NO_CONTENT)
         }
 
         async fn ingest_handler(
             State(state): State<AppState>,
             Json(request): Json<IngestBatchRequest>,
         ) -> Result<StatusCode, AppError> {
-            for tick in &request.ticks {
-                state
-                    .metadata
-                    .alloc_symbol(&tick.tenant, &tick.symbol)
-                    .await?;
-                state
-                    .hot_store
-                    .append_row(
-                        &tick.tenant,
-                        &tick.symbol,
-                        tick.timestamp,
-                        tick.payload.as_ref(),
-                    )
-                    .await?;
-            }
+            state.ingest.ingest(request).await?;
             Ok(StatusCode::ACCEPTED)
         }
 
@@ -172,10 +209,20 @@ impl ProxistDaemon {
             Ok(Json(QueryResponse { rows: encoded }))
         }
 
+        async fn health_handler(
+            State(state): State<AppState>,
+            Json(health): Json<ShardHealth>,
+        ) -> Result<StatusCode, AppError> {
+            state.metadata.record_shard_health(health).await?;
+            Ok(StatusCode::ACCEPTED)
+        }
+
         let app = Router::new()
             .route("/status", get(status_handler))
             .route("/ingest", post(ingest_handler))
             .route("/query", post(query_handler))
+            .route("/assignments", post(upsert_assignments_handler))
+            .route("/health", post(health_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(self.config.http_addr).await?;

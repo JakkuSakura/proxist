@@ -227,6 +227,39 @@ impl MetadataStore for SqliteMetadataStore {
 
         Ok(next_id as u32)
     }
+
+    async fn list_shard_health(&self) -> Result<Vec<ShardHealth>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT shard_id, is_leader, wal_backlog_bytes, clickhouse_lag_ms,
+                   watermark_json, persistence_state_json
+            FROM shard_health
+            ORDER BY shard_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut health = Vec::with_capacity(rows.len());
+        for row in rows {
+            let watermark_json: String = row.get("watermark_json");
+            let persistence_state_json: String = row.get("persistence_state_json");
+            let watermark: Watermark = serde_json::from_str(&watermark_json)?;
+            let persistence_state: PersistenceState =
+                serde_json::from_str(&persistence_state_json)?;
+
+            health.push(ShardHealth {
+                shard_id: row.get("shard_id"),
+                is_leader: row.get::<i64, _>("is_leader") != 0,
+                wal_backlog_bytes: row.get::<i64, _>("wal_backlog_bytes") as u64,
+                clickhouse_lag_ms: row.get::<i64, _>("clickhouse_lag_ms") as u64,
+                watermark,
+                persistence_state,
+            });
+        }
+
+        Ok(health)
+    }
 }
 
 impl SqliteMetadataStore {

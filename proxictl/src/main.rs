@@ -1,6 +1,9 @@
 use anyhow::bail;
 use clap::{Parser, Subcommand};
-use proxist_api::{ControlCommand, IngestBatchRequest, QueryRequest, QueryResponse};
+use proxist_api::{
+    ControlCommand, IngestBatchRequest, QueryRequest, QueryResponse, ShardAssignment,
+    StatusResponse,
+};
 use reqwest::Client;
 use tokio::runtime::Runtime;
 use tracing::info;
@@ -47,16 +50,36 @@ fn main() -> anyhow::Result<()> {
             let url = format!("{}/status", endpoint);
             rt.block_on(async {
                 let response = client.get(url).send().await?.error_for_status()?;
-                let value: serde_json::Value = response.json().await?;
-                println!("{}", serde_json::to_string_pretty(&value)?);
+                let status: StatusResponse = response.json().await?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
                 Ok::<(), anyhow::Error>(())
             })?;
         }
         Commands::ApplyAssignments { file } => {
             let json = std::fs::read_to_string(file)?;
-            let cmd: ControlCommand = serde_json::from_str(&json)?;
-            info!(?cmd, "apply assignments endpoint not yet implemented");
-            bail!("apply-assignments command is not wired to HTTP yet");
+            let assignments: Vec<ShardAssignment> =
+                match serde_json::from_str::<Vec<ShardAssignment>>(&json) {
+                    Ok(list) => list,
+                    Err(_) => {
+                        let cmd: ControlCommand = serde_json::from_str(&json)?;
+                        match cmd {
+                            ControlCommand::ApplyShardAssignments(list) => list,
+                            other => bail!("unexpected command payload: {:?}", other),
+                        }
+                    }
+                };
+
+            let url = format!("{}/assignments", endpoint);
+            info!(rows = assignments.len(), "applying shard assignments");
+            rt.block_on(async {
+                client
+                    .post(url)
+                    .json(&assignments)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                Ok::<(), anyhow::Error>(())
+            })?;
         }
         Commands::Query { file } => {
             let json = std::fs::read_to_string(file)?;
