@@ -1,0 +1,18 @@
+[package]
+name = "proxistd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+proxist-api = { path = "../proxist-api" }
+proxist-ch = { path = "../proxist-ch" }
+proxist-core = { path = "../proxist-core" }
+proxist-mem = { path = "../proxist-mem" }
+proxist-wal = { path = "../proxist-wal" }

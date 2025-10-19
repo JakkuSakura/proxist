@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "proxist-core",
+    "proxist-mem",
+    "proxist-wal",
+    "proxist-ch",
+    "proxist-api",
+    "proxistd",
+    "proxictl",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[workspace.metadata]
+description = "Proxist workspace"
