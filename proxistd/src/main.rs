@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use proxist_core::{metadata::ClusterMetadata, ShardPersistenceTracker};
+use proxist_core::{metadata::ClusterMetadata, MetadataStore, ShardPersistenceTracker};
+use proxist_metadata_sqlite::SqliteMetadataStore;
 use tokio::signal;
 use tracing::{info, instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -14,7 +15,8 @@ async fn main() -> anyhow::Result<()> {
 
     info!(?config, "starting proxistd");
 
-    let daemon = ProxistDaemon::new(config);
+    let metadata_store = SqliteMetadataStore::connect(&config.metadata_path).await?;
+    let daemon = ProxistDaemon::new(config, metadata_store);
     daemon.run().await?;
 
     Ok(())
@@ -30,28 +32,30 @@ fn init_tracing() -> anyhow::Result<()> {
 
 #[derive(Debug, Clone)]
 struct DaemonConfig {
-    metadata_endpoint: String,
+    metadata_path: String,
 }
 
 impl DaemonConfig {
     fn load() -> anyhow::Result<Self> {
-        let metadata_endpoint =
-            std::env::var("PROXIST_METADATA_ENDPOINT").unwrap_or_else(|_| "memory://".into());
-        Ok(Self { metadata_endpoint })
+        let metadata_path = std::env::var("PROXIST_METADATA_SQLITE_PATH")
+            .unwrap_or_else(|_| "./proxist-meta.db".into());
+        Ok(Self { metadata_path })
     }
 }
 
 struct ProxistDaemon {
     config: DaemonConfig,
     _metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
+    metadata_store: SqliteMetadataStore,
 }
 
 impl ProxistDaemon {
-    fn new(config: DaemonConfig) -> Self {
+    fn new(config: DaemonConfig, metadata_store: SqliteMetadataStore) -> Self {
         let cache = Arc::new(tokio::sync::Mutex::new(ClusterMetadata::default()));
         Self {
             config,
             _metadata_cache: cache,
+            metadata_store,
         }
     }
 
@@ -72,15 +76,16 @@ impl ProxistDaemon {
     async fn control_loop(&self) -> anyhow::Result<()> {
         info!("control loop placeholder started");
         loop {
-            info!(
-                endpoint = %self.config.metadata_endpoint,
-                "poll metadata endpoint placeholder"
-            );
-            // TODO: hook in metadata polling and ingest service wiring.
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            let snapshot = self.metadata_store.get_cluster_metadata().await?;
+            {
+                let mut cache = self._metadata_cache.lock().await;
+                *cache = snapshot;
+            }
 
-            let mut cache = self._metadata_cache.lock().await;
-            cache.assignments.retain(|_assignment| true);
+            info!(path = %self.config.metadata_path, "metadata snapshot refreshed");
+
+            // TODO: hook in metadata-driven ingest and shard supervision.
+            tokio::time::sleep(Duration::from_secs(5)).await;
 
             // Example seam tracker update.
             let mut tracker = ShardPersistenceTracker::new("shard-0");
