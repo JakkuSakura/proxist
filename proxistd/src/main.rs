@@ -116,14 +116,9 @@ impl ProxistDaemon {
         let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
 
         let clickhouse_pair = config.clickhouse.clone().and_then(|cfg| {
-            let cfg_clone = cfg.clone();
-            ClickhouseHttpSink::new(cfg_clone)
+            ClickhouseHttpSink::new(cfg.clone())
                 .map(|sink| {
-                    let target = proxist_api::ClickhouseTarget {
-                        endpoint: cfg.endpoint.clone(),
-                        database: cfg.database.clone(),
-                        table: cfg.table.clone(),
-                    };
+                    let target = sink.target();
                     (Arc::new(sink) as Arc<dyn ClickhouseSink>, target)
                 })
                 .map_err(|err| {

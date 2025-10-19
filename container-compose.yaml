@@ -1,0 +1,25 @@
+version: '3.9'
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.11
+    environment:
+      CLICKHOUSE_DB: proxist
+    ports:
+      - "18123:8123"
+      - "19000:9000"
+
+  tester:
+    image: rust:1.75
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    environment:
+      PROXIST_CLICKHOUSE_ENDPOINT: http://clickhouse:8123
+      PROXIST_CLICKHOUSE_DATABASE: proxist
+      PROXIST_CLICKHOUSE_TABLE: ticks
+      PROXIST_METADATA_SQLITE_PATH: /workspace/.tmp-meta/proxist-meta.db
+    depends_on:
+      - clickhouse
+    command: |
+      bash -lc "cargo test --package proxistd ingest::tests::ingest_pipeline_wal_clickhouse_and_memory -- --nocapture"
