@@ -5,7 +5,7 @@
 - Define schemas for WAL records, symbol dictionary persistence, and snapshot manifests.
 - Implement minimal hot-set column store with sorted append, seam cache, and WAL replay.
 - Build ClickHouse sink with ordered micro-batching and watermark advancement logic.
-- Stand up control-plane skeleton: metadata store abstraction, shard registry, heartbeat ingestion, and CLI scaffolding (`proxictl status`, `proxictl apply`).
+- Stand up control-plane skeleton: metadata store abstraction, shard registry, heartbeat ingestion, and CLI scaffolding (`pxctl status`, `pxctl apply`).
 - Expose basic ingest/query APIs (gRPC + Arrow Flight or protobuf stubs) behind auth tokens.
 - Unit and integration tests for WAL recovery, seam stitching, and ClickHouse retry semantics.
 

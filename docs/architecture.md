@@ -10,7 +10,7 @@ Proxist is a Rust-native time-series proxy that keeps the hot working set in mem
 4. **Persistence Sink (`proxist-ch`)** — micro-batches log segments to ClickHouse using ordered inserts and deduplication guards.
 5. **Query Engine (`proxist-core`)** — vectorized operators for `asof`, `last-by`, rolling windows, and seam stitching.
 6. **Metadata & Control Plane (`proxistd` control loop)** — authoritative state for shards, tenants, symbol dictionaries, watermarks, snapshots, secrets, and ClickHouse lag.
-7. **Operator Surface (`proxictl` / `pxctl`, `proxist-api`)** — declarative cluster management, observability endpoints, RBAC, and automation hooks.
+7. **Operator Surface (`pxctl`, `proxist-api`)** — declarative cluster management, observability endpoints, RBAC, and automation hooks.
 
 ## Data Flow
 
@@ -56,7 +56,7 @@ During recovery, the node loads the latest snapshot, replays WAL entries newer t
 - **Authoritative Store** — Raft-backed or transactional KV containing tenants, schemas, shard assignments, symbol dictionaries, snapshots, watermarks, WAL manifests, secrets, and RBAC policy.
 - **Placement & Scale** — control loop places shards on available nodes based on resource hints (CPU, RAM, NVMe), tracks leases/heartbeats, and orchestrates rebalancing or failover.
 - **Lifecycle Automation** — rolling upgrades, snapshot scheduling, WAL compaction, and ClickHouse lag remediation run as state machines driven by metadata events.
-- **Operator Interfaces** — `proxictl`/`pxctl` issue declarative specs (clusters, tables, tenants). Control plane computes diffs, applies configs, and reports status with structured events.
+- **Operator Interfaces** — `pxctl` issues declarative specs (clusters, tables, tenants). Control plane computes diffs, applies configs, and reports status with structured events.
 - **Audit & Versioning** — every change is revisioned; CLI can diff historical specs, roll back, or generate change plans for review.
 
 ## Deployment Model
@@ -70,7 +70,7 @@ During recovery, the node loads the latest snapshot, replays WAL entries newer t
 
 - Metrics endpoints expose ingest lag, ClickHouse flush latency, WAL depth, seam stitch counts, query latency histograms, and control-plane leader health.
 - Tracing spans capture end-to-end flow across ingress, hot path, seam, and ClickHouse.
-- Diagnostics bundle (`proxictl diagnostics collect`) gathers logs, snapshots, metadata revisions, and ClickHouse status for incident response.
+- Diagnostics bundle (`pxctl diagnostics collect`) gathers logs, snapshots, metadata revisions, and ClickHouse status for incident response.
 
 ## Future Extensions
 

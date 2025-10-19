@@ -40,7 +40,7 @@ Deliver sub-millisecond, kdb+-like analytics on hot market ticks held entirely i
 - Placement engine assigns shards to nodes and orchestrates rebalancing, rolling upgrades, and failure recovery.
 - Health model watches ingest lag, WAL backlog, ClickHouse part counts, and node heartbeats; exposes automation hooks for remediation.
 - Configuration layers (profiles, cluster policies, secrets) stored durably and versioned for audit.
-- CLI (`proxictl`/`pxctl`) and API offer declarative control over topology, schema evolution, and security policies.
+- CLI (`pxctl`) and API offer declarative control over topology, schema evolution, and security policies.
 
 ## Boundary Handling
 

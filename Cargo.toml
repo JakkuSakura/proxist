@@ -7,7 +7,7 @@ members = [
     "proxist-api",
     "proxist-metadata-sqlite",
     "proxistd",
-    "proxictl",
+    "pxctl",
 ]
 resolver = "2"
 

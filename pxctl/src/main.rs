@@ -9,7 +9,7 @@ use tokio::runtime::Runtime;
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(name = "proxictl", about = "Operator CLI for Proxist clusters")]
+#[command(name = "pxctl", about = "Operator CLI for Proxist clusters")]
 struct Cli {
     #[arg(long, global = true, default_value = "http://127.0.0.1:8080")]
     endpoint: String,
