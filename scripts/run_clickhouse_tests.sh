@@ -15,5 +15,11 @@ mkdir -p .tmp-meta
 
 cleanup
 
-echo "[run] docker compose up tester" >&2
-docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" up --build --abort-on-container-exit tester
+echo "[run] docker compose up clickhouse" >&2
+docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" up -d clickhouse
+
+echo "[wait] giving ClickHouse time to start" >&2
+sleep 5
+
+echo "[test] running cargo test" >&2
+cargo test
