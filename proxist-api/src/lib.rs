@@ -48,6 +48,7 @@ pub struct ClickhouseStatus {
     pub target: Option<ClickhouseTarget>,
     #[serde(with = "proxist_core::time::serde_opt_micros")]
     pub last_flush: Option<SystemTime>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

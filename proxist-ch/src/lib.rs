@@ -20,6 +20,8 @@ pub struct ClickhouseConfig {
     pub password: Option<String>,
     pub insert_batch_rows: usize,
     pub timeout_secs: u64,
+    pub max_retries: usize,
+    pub retry_backoff_ms: u64,
 }
 
 impl Default for ClickhouseConfig {
@@ -32,6 +34,8 @@ impl Default for ClickhouseConfig {
             password: None,
             insert_batch_rows: 100_000,
             timeout_secs: 5,
+            max_retries: 3,
+            retry_backoff_ms: 200,
         }
     }
 }
@@ -123,18 +127,49 @@ impl ClickhouseSink for ClickhouseHttpSink {
                 request = request.basic_auth(username, self.config.password.as_ref());
             }
 
-            let response = request.send().await.context("send ClickHouse request")?;
-            let status = response.status();
-            if !status.is_success() {
-                let text = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<unavailable>".into());
-                return Err(anyhow!(
-                    "clickhouse insert failed: status={} body={}",
-                    status,
-                    text
-                ));
+            let mut attempt = 0;
+            loop {
+                let response = request
+                    .try_clone()
+                    .ok_or_else(|| anyhow!("failed to clone ClickHouse request"))?
+                    .send()
+                    .await;
+
+                match response {
+                    Ok(resp) if resp.status().is_success() => break,
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_else(|_| "<unavailable>".into());
+                        attempt += 1;
+                        if attempt > self.config.max_retries {
+                            return Err(anyhow!(
+                                "clickhouse insert failed after {} retries: status={} body={}",
+                                self.config.max_retries,
+                                status,
+                                body
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_millis(
+                            self.config.retry_backoff_ms * attempt as u64,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    Err(err) => {
+                        attempt += 1;
+                        if attempt > self.config.max_retries {
+                            return Err(anyhow!(
+                                "clickhouse insert error after {} retries: {err}",
+                                self.config.max_retries
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_millis(
+                            self.config.retry_backoff_ms * attempt as u64,
+                        ))
+                        .await;
+                        continue;
+                    }
+                }
             }
         }
 

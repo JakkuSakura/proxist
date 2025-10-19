@@ -102,6 +102,14 @@ fn load_clickhouse_config() -> Option<ClickhouseConfig> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
+    let max_retries = std::env::var("PROXIST_CLICKHOUSE_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let retry_backoff_ms = std::env::var("PROXIST_CLICKHOUSE_RETRY_BACKOFF_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
 
     Some(ClickhouseConfig {
         endpoint,
@@ -111,6 +119,8 @@ fn load_clickhouse_config() -> Option<ClickhouseConfig> {
         password,
         insert_batch_rows,
         timeout_secs,
+        max_retries,
+        retry_backoff_ms,
     })
 }
 

@@ -75,7 +75,7 @@ During recovery, the node loads the latest snapshot, replays WAL entries newer t
 
 - Metrics endpoints expose ingest lag, ClickHouse flush latency, WAL depth, seam stitch counts, query latency histograms, and control-plane leader health.
 - Tracing spans capture end-to-end flow across ingress, hot path, seam, and ClickHouse.
-- Diagnostics bundle (`pxctl diagnostics collect`) gathers logs, snapshots, metadata revisions, and ClickHouse status for incident response.
+- Diagnostics bundle (`pxctl diagnostics collect`) gathers logs, snapshots, metadata revisions, and ClickHouse status (including last flush/error) for incident response.
 
 ## Future Extensions
 

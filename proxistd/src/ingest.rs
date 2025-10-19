@@ -1,6 +1,6 @@
 use std::sync::{
     atomic::{AtomicI64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use anyhow::Result;
@@ -20,6 +20,7 @@ pub struct IngestService {
     clickhouse: Option<Arc<dyn ClickhouseSink>>,
     clickhouse_target: Option<ClickhouseTarget>,
     last_flush_micros: AtomicI64,
+    clickhouse_error: Mutex<Option<String>>,
 }
 
 impl IngestService {
@@ -40,6 +41,7 @@ impl IngestService {
             clickhouse: clickhouse_sink,
             clickhouse_target: target,
             last_flush_micros: AtomicI64::new(-1),
+            clickhouse_error: Mutex::new(None),
         }
     }
 
@@ -74,13 +76,21 @@ impl IngestService {
         if !batch.ticks.is_empty() {
             let segment = self.wal.flush_segment().await?;
             if let Some(sink) = &self.clickhouse {
-                sink.flush_segment(&segment).await?;
-                if let Some(last) = segment
-                    .records
-                    .last()
-                    .map(|record| system_time_to_micros(record.timestamp))
-                {
-                    self.last_flush_micros.store(last, Ordering::SeqCst);
+                match sink.flush_segment(&segment).await {
+                    Ok(_) => {
+                        if let Some(last) = segment
+                            .records
+                            .last()
+                            .map(|record| system_time_to_micros(record.timestamp))
+                        {
+                            self.last_flush_micros.store(last, Ordering::SeqCst);
+                        }
+                        *self.clickhouse_error.lock().unwrap() = None;
+                    }
+                    Err(err) => {
+                        *self.clickhouse_error.lock().unwrap() = Some(err.to_string());
+                        return Err(err);
+                    }
                 }
             }
             let batch = segment.to_persistence_batch()?;
@@ -111,6 +121,7 @@ impl IngestService {
             enabled: self.clickhouse.is_some(),
             target,
             last_flush,
+            last_error: self.clickhouse_error.lock().unwrap().clone(),
         }
     }
 }
@@ -275,6 +286,7 @@ mod tests {
         assert!(status.enabled);
         assert_eq!(status.target.unwrap().table, target.table);
         assert!(status.last_flush.is_some());
+        assert!(status.last_error.is_none());
 
         Ok(())
     }
