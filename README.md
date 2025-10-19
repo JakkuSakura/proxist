@@ -41,6 +41,34 @@ For the full design matrix, see `docs/design-goals.md`.
 - Design goals and MVP acceptance criteria: `docs/design-goals.md`.
 - Roadmap, CLI ergonomics, and deployment guidance (in progress): `docs/roadmap.md`.
 
+## Current Capabilities
+
+- HTTP daemon (`proxistd`) exposes `/ingest`, `/query`, `/status`, `/assignments`, and `/health`.
+- Ingest pipeline appends to an in-memory WAL, writes into the hot column store, and optionally flushes batches to ClickHouse via JSONEachRow.
+- Metadata lives in SQLite with shard assignments, symbol dictionaries, and shard health snapshots surfaced through `/status`.
+- `pxctl` CLI drives status, ingest, query, and assignment workflows over REST.
+- Integration harness (`scripts/run_clickhouse_tests.sh`) launches ClickHouse with Docker Compose and runs `cargo test`.
+
+## MVP Scope
+
+Must-have features before calling Proxist “MVP”:
+
+- Durable ingest: disk-backed WAL, replay + snapshots, <100 µs ack.
+- Seam-aware queries: `asof`, `last-by`, rolling windows stitched across `T_persisted`.
+- ClickHouse persistence: batched inserts with retries/idempotence and watermark advancement.
+- Authoritative metadata: shard placement, watermarks, symbol dictionaries managed via `pxctl`.
+- Operability: metrics/tracing, diagnostics bundle, automated ingest→ClickHouse→replay tests.
+- Security hooks: TLS/auth/secrets ready for controlled deployments.
+
+## Scale Targets
+
+After MVP lands, focus shifts to:
+
+- Ingest ≥2–5M rows/sec with <100 µs ack and <50 ms ClickHouse lag on a single node.
+- Latency targets met for `asof`/`last-by` on 100–500 GB hot sets.
+- Large-scale seam validation and replay suites for `T_persisted`.
+- Degradation + recovery workflows that guarantee zero data loss after ClickHouse outages.
+
 ## Branding Quick Reference
 
 - Pronunciation: **PROX-ist**
@@ -49,4 +77,4 @@ For the full design matrix, see `docs/design-goals.md`.
 
 ## Status
 
-Pre-initial implementation. Expect active iteration on interfaces, on-disk formats, and management workflows.
+Working alpha focused on wiring the ingest pipeline, metadata cache, and ClickHouse persistence. Expect rapid iteration on durability, seam-aware queries, and operational tooling while closing out the minimal MVP scope.

@@ -102,9 +102,18 @@ Deliver sub-millisecond, kdb+-like analytics on hot market ticks held entirely i
 - No arbitrary joins beyond time-series patterns; focus remains on ordered, symbol-centric workloads.
 - No guarantee of sub-ms latency once data is fully cold in ClickHouse; cold scans are delegated entirely to ClickHouse.
 
-## MVP Acceptance Criteria
+## MVP Criteria
+
+- Durable ingest path with on-disk WAL, fast replay, and regular snapshots that keep ack latency under 100 µs.
+- Seam-aware query operators (`asof`, `last-by`, rolling windows) over the hot set with deterministic stitching across `T_persisted`.
+- ClickHouse flush loop with retry/backoff, idempotent inserts, and watermark advancement surfaced through `/status`.
+- Authoritative metadata flows (`pxctl status/apply`), shard placement, and symbol dictionaries stored in the metadata service.
+- Baseline observability: metrics, tracing, diagnostics bundle, and automated integration tests covering ingest → ClickHouse → replay.
+- Security hooks (TLS/auth/secrets) sufficient for controlled deployments.
+
+## Scale Targets
 
 - Sustained ingest ≥ 2–5 million rows/sec on one node with < 100 µs WAL ack and < 50 ms ClickHouse persistence lag.
 - `asof` join and `last-by` meet latency targets on a 100–500 GB RAM-resident hot set.
-- Seam-consistent results with verified stitching across `T_persisted`.
+- Seam-consistent results validated against large replay suites across `T_persisted`.
 - Clean degradation and recovery when ClickHouse is unavailable, with no data loss after WAL replay and snapshot restore.
