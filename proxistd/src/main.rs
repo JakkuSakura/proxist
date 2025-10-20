@@ -37,9 +37,6 @@ use proxist_wal::{FileWal, InMemoryWal, WalConfig, WalRecord, WalWriter};
 use serde_bytes::ByteBuf;
 use serde_json::json;
 use tokio::signal;
-use tokio_rustls::{rustls::{self, Certificate, PrivateKey, ServerConfig}, TlsAcceptor};
-use tokio_stream::wrappers::TcpListenerStream;
-use futures_util::StreamExt;
 use tracing::{error, info, instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -82,7 +79,6 @@ struct DaemonConfig {
     metadata_path: String,
     http_addr: SocketAddr,
     clickhouse: Option<ClickhouseConfig>,
-    tls: Option<TlsConfig>,
     api_token: Option<String>,
 }
 
@@ -94,23 +90,15 @@ impl DaemonConfig {
             .unwrap_or_else(|_| "127.0.0.1:8080".into())
             .parse()?;
         let clickhouse = load_clickhouse_config();
-        let tls = load_tls_config()?;
         let api_token = std::env::var("PROXIST_API_TOKEN").ok();
 
         Ok(Self {
             metadata_path,
             http_addr,
             clickhouse,
-            tls,
             api_token,
         })
     }
-}
-
-#[derive(Debug, Clone)]
-struct TlsConfig {
-    cert_path: PathBuf,
-    key_path: PathBuf,
 }
 
 struct WalBootstrap {
@@ -172,28 +160,6 @@ fn load_clickhouse_config() -> Option<ClickhouseConfig> {
         retry_backoff_ms,
         query_timeout_secs,
     })
-}
-
-fn load_tls_config() -> anyhow::Result<Option<TlsConfig>> {
-    let cert = match std::env::var("PROXIST_TLS_CERT_PATH") {
-        Ok(path) => Some(PathBuf::from(path)),
-        Err(_) => None,
-    };
-    let key = match std::env::var("PROXIST_TLS_KEY_PATH") {
-        Ok(path) => Some(PathBuf::from(path)),
-        Err(_) => None,
-    };
-
-    match (cert, key) {
-        (Some(cert_path), Some(key_path)) => Ok(Some(TlsConfig {
-            cert_path,
-            key_path,
-        })),
-        (None, None) => Ok(None),
-        _ => anyhow::bail!(
-            "Both PROXIST_TLS_CERT_PATH and PROXIST_TLS_KEY_PATH must be set to enable TLS"
-        ),
-    }
 }
 
 struct ProxistDaemon {
@@ -708,35 +674,11 @@ impl ProxistDaemon {
             app
         };
 
-        let tls_router = app.clone();
-
-        match &self.config.tls {
-            Some(tls) => {
-                let rustls_config =
-                    RustlsConfig::from_pem_file(tls.cert_path.clone(), tls.key_path.clone())
-                        .await?;
-                let handle = axum_server::Handle::new();
-                let server = axum_server::bind_rustls(self.config.http_addr, rustls_config)
-                    .handle(handle.clone());
-                info!(addr = %self.config.http_addr, "HTTPS server listening");
-                tokio::spawn(async move {
-                    shutdown_signal().await;
-                    handle.graceful_shutdown(Some(Duration::from_secs(5)));
-                });
-                let make_service = tls_router.into_make_service();
-                let mapped = ServiceBuilder::new()
-                    .map_request(|req: Request<hyper::Body>| req.map(axum::body::Body::new))
-                    .service(make_service);
-                server.serve(Shared::new(mapped)).await?;
-            }
-            None => {
-                let listener = tokio::net::TcpListener::bind(self.config.http_addr).await?;
-                info!(addr = %self.config.http_addr, "HTTP server listening");
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(shutdown_signal())
-                    .await?;
-            }
-        }
+        let listener = tokio::net::TcpListener::bind(self.config.http_addr).await?;
+        info!(addr = %self.config.http_addr, "HTTP server listening");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
         Ok(())
     }
 }

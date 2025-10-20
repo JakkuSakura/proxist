@@ -14,3 +14,4 @@ sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 proxist-core = { path = "../proxist-core" }
+tempfile.workspace = true

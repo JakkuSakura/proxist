@@ -76,6 +76,13 @@ impl SqliteMetadataStore {
     }
 }
 
+#[cfg(test)]
+impl SqliteMetadataStore {
+    fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+}
+
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata> {
@@ -345,5 +352,78 @@ impl SqliteMetadataStore {
             watermark,
             persistence_state,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    async fn store() -> (SqliteMetadataStore, TempDir) {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("metadata.db");
+        let store = SqliteMetadataStore::connect(path.to_str().unwrap())
+            .await
+            .expect("connect sqlite");
+        (store, dir)
+    }
+
+    #[tokio::test]
+    async fn put_shard_assignment_roundtrip() -> Result<()> {
+        let (store, _dir) = store().await;
+        let assignment = ShardAssignment {
+            shard_id: "s-0".into(),
+            tenant_id: "tenant".into(),
+            node_id: "node-a".into(),
+            symbol_range: ("AAPL".into(), "MSFT".into()),
+        };
+        store.put_shard_assignment(assignment.clone()).await?;
+
+        let metadata = store.get_cluster_metadata().await?;
+        assert_eq!(metadata.assignments.len(), 1);
+        assert_eq!(metadata.assignments[0], assignment);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upsert_symbols_deduplicates_and_appends() -> Result<()> {
+        let (store, _dir) = store().await;
+
+        store
+            .upsert_symbols(&"tenant".into(), &["AAPL".into(), "AAPL".into()])
+            .await?;
+        store
+            .upsert_symbols(
+                &"tenant".into(),
+                &["MSFT".into(), "AAPL".into(), "GOOG".into()],
+            )
+            .await?;
+
+        let metadata = store.get_cluster_metadata().await?;
+        let symbols = metadata
+            .symbol_dictionaries
+            .get("tenant")
+            .cloned()
+            .unwrap_or_default();
+
+        assert_eq!(symbols, vec!["AAPL", "MSFT", "GOOG"]);
+
+        // Ensure symbol IDs are stable and sequential (no duplicates).
+        let rows = sqlx::query(
+            r#"
+            SELECT symbol_id, symbol FROM symbols
+            WHERE tenant_id = ?1
+            ORDER BY symbol_id
+            "#,
+        )
+        .bind("tenant")
+        .fetch_all(store.pool())
+        .await?;
+
+        let ids: Vec<i64> = rows.iter().map(|row| row.get("symbol_id")).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+
+        Ok(())
     }
 }

@@ -35,11 +35,6 @@ base64 = "0.21"
 tempfile = "3"
 metrics = "0.21"
 metrics-exporter-prometheus = "0.13"
-hyper = "0.14"
-rustls-pemfile = "1"
-tokio-rustls = { version = "0.24", features = ["tls12"] }
-tokio-stream = "0.1"
-futures-util = "0.3"
 
 [workspace.metadata]
 description = "Proxist workspace"
