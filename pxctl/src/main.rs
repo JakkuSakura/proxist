@@ -1,5 +1,6 @@
 use anyhow::bail;
 use clap::{Parser, Subcommand};
+use proxist_core::query::{QueryOperation, QueryRange};
 use proxist_api::{
     ControlCommand, IngestBatchRequest, QueryRequest, QueryResponse, ShardAssignment,
     StatusResponse,
@@ -26,10 +27,20 @@ enum Commands {
         #[arg(long)]
         file: String,
     },
-    /// Submit an ad-hoc query described via JSON.
+    /// Submit an ad-hoc query described via JSON or CLI flags.
     Query {
         #[arg(long)]
-        file: String,
+        file: Option<String>,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long)]
+        symbols: Vec<String>,
+        #[arg(long)]
+        start_micros: Option<i64>,
+        #[arg(long)]
+        end_micros: Option<i64>,
+        #[arg(long, default_value = "range")]
+        op: String,
     },
     /// Inject a test ingest batch described via JSON.
     Ingest {
@@ -81,9 +92,20 @@ fn main() -> anyhow::Result<()> {
                 Ok::<(), anyhow::Error>(())
             })?;
         }
-        Commands::Query { file } => {
-            let json = std::fs::read_to_string(file)?;
-            let request: QueryRequest = serde_json::from_str(&json)?;
+        Commands::Query {
+            file,
+            tenant,
+            symbols,
+            start_micros,
+            end_micros,
+            op,
+        } => {
+            let request = if let Some(path) = file {
+                let json = std::fs::read_to_string(&path)?;
+                serde_json::from_str::<QueryRequest>(&json)?
+            } else {
+                build_query_request(tenant, symbols, start_micros, end_micros, op)?
+            };
             let url = format!("{}/query", endpoint);
             info!("submitting query to {}", url);
             rt.block_on(async {
@@ -116,4 +138,50 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn build_query_request(
+    tenant: Option<String>,
+    symbols: Vec<String>,
+    start_micros: Option<i64>,
+    end_micros: Option<i64>,
+    op: String,
+) -> anyhow::Result<QueryRequest> {
+    let tenant =
+        tenant.ok_or_else(|| anyhow::anyhow!("tenant is required unless --file is provided"))?;
+    let op = match op.as_str() {
+        "range" => QueryOperation::Range,
+        "last_by" => QueryOperation::LastBy,
+        "asof" => QueryOperation::AsOf,
+        other => anyhow::bail!("unknown query op: {}", other),
+    };
+
+    let end_micros = end_micros.unwrap_or_else(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        now.as_micros() as i64
+    });
+    let start_micros = start_micros.unwrap_or(end_micros.saturating_sub(1_000_000));
+
+    let range = QueryRange::new(
+        micros_to_system_time(start_micros),
+        micros_to_system_time(end_micros),
+    );
+
+    Ok(QueryRequest {
+        tenant,
+        symbols,
+        range,
+        include_cold: false,
+        op,
+    })
+}
+
+fn micros_to_system_time(micros: i64) -> std::time::SystemTime {
+    if micros >= 0 {
+        std::time::UNIX_EPOCH + std::time::Duration::from_micros(micros as u64)
+    } else {
+        std::time::UNIX_EPOCH - std::time::Duration::from_micros((-micros) as u64)
+    }
 }

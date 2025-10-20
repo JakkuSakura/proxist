@@ -14,3 +14,4 @@ tokio.workspace = true
 proxist-api = { path = "../proxist-api" }
 tracing-subscriber.workspace = true
 reqwest.workspace = true
+proxist-core = { path = "../proxist-core" }

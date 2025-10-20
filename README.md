@@ -46,7 +46,7 @@ For the full design matrix, see `docs/design-goals.md`.
 - HTTP daemon (`proxistd`) exposes `/ingest`, `/query`, `/status`, `/assignments`, and `/health`.
 - Ingest pipeline appends to an in-memory WAL, writes into the hot column store, and optionally flushes batches to ClickHouse via JSONEachRow.
 - Metadata lives in SQLite with shard assignments, symbol dictionaries, and shard health snapshots surfaced through `/status`.
-- `pxctl` CLI drives status, ingest, query, and assignment workflows over REST.
+- `pxctl` CLI drives status, ingest, query, and assignment workflows over REST (e.g., `pxctl query --tenant alpha --symbols AAPL --op last_by --end-micros …`).
 - Integration harness (`scripts/run_clickhouse_tests.sh`) launches ClickHouse with Docker Compose and runs `cargo test`.
 - Set `PROXIST_WAL_DIR` to enable disk-backed WAL persistence and replay; otherwise the daemon falls back to in-memory WALs for dev.
 - Hot query path supports `range`, `last_by`, and `asof` operations across the in-memory store; planners will stitch in ClickHouse results once persistence watermarking is complete.
