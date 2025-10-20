@@ -34,11 +34,19 @@ pub struct QueryRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
-    pub rows: Vec<ByteBuf>,
+    pub rows: Vec<QueryRow>,
 }
 
 fn default_query_op() -> proxist_core::query::QueryOperation {
     proxist_core::query::QueryOperation::Range
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryRow {
+    pub symbol: String,
+    #[serde(with = "proxist_core::time::serde_micros")]
+    pub timestamp: SystemTime,
+    pub payload: ByteBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

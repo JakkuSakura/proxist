@@ -1,5 +1,6 @@
 mod ingest;
 
+use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -285,7 +286,7 @@ impl ProxistDaemon {
             State(state): State<AppState>,
             Json(request): Json<QueryRequest>,
         ) -> Result<Json<QueryResponse>, AppError> {
-            let rows = match request.op {
+            let mut rows = match request.op {
                 QueryOperation::Range => {
                     state
                         .hot_store
@@ -305,7 +306,45 @@ impl ProxistDaemon {
                         .await?
                 }
             };
-            let encoded: Vec<ByteBuf> = rows.into_iter().map(ByteBuf::from).collect();
+
+            if request.include_cold
+                && matches!(request.op, QueryOperation::LastBy | QueryOperation::AsOf)
+                && !request.symbols.is_empty()
+            {
+                let mut map: HashMap<String, proxist_mem::HotRow> = rows
+                    .into_iter()
+                    .map(|row| (row.symbol.clone(), row))
+                    .collect();
+
+                let seam_rows = state
+                    .hot_store
+                    .seam_rows(&request.tenant, &request.range)
+                    .await?;
+
+                for seam in seam_rows {
+                    if request.symbols.contains(&seam.symbol) && !map.contains_key(&seam.symbol) {
+                        map.insert(
+                            seam.symbol.clone(),
+                            proxist_mem::HotRow {
+                                symbol: seam.symbol.clone(),
+                                timestamp: seam.timestamp,
+                                payload: seam.payload,
+                            },
+                        );
+                    }
+                }
+
+                rows = map.into_values().collect();
+            }
+
+            let encoded = rows
+                .into_iter()
+                .map(|row| proxist_api::QueryRow {
+                    symbol: row.symbol,
+                    timestamp: row.timestamp,
+                    payload: ByteBuf::from(row.payload),
+                })
+                .collect();
             Ok(Json(QueryResponse { rows: encoded }))
         }
 

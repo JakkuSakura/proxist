@@ -34,6 +34,13 @@ pub struct SeamBoundaryRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct HotRow {
+    pub symbol: String,
+    pub timestamp: SystemTime,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
 struct Row {
     timestamp: SystemTime,
     micros: i64,
@@ -87,7 +94,7 @@ pub trait HotColumnStore: Send + Sync {
         tenant: &TenantId,
         range: &QueryRange,
         symbols: &[String],
-    ) -> anyhow::Result<Vec<Vec<u8>>>;
+    ) -> anyhow::Result<Vec<HotRow>>;
 
     async fn seam_rows(
         &self,
@@ -102,14 +109,14 @@ pub trait HotColumnStore: Send + Sync {
         tenant: &TenantId,
         symbols: &[String],
         at: SystemTime,
-    ) -> anyhow::Result<Vec<Vec<u8>>>;
+    ) -> anyhow::Result<Vec<HotRow>>;
 
     async fn asof(
         &self,
         tenant: &TenantId,
         symbols: &[String],
         at: SystemTime,
-    ) -> anyhow::Result<Vec<Vec<u8>>>;
+    ) -> anyhow::Result<Vec<HotRow>>;
 }
 
 #[async_trait]
@@ -192,7 +199,11 @@ impl HotColumnStore for InMemoryHotColumnStore {
             let end_idx = store.rows.partition_point(|row| row.micros < end_micros);
 
             for row in &store.rows[start_idx..end_idx] {
-                results.push(row.payload.clone());
+                results.push(HotRow {
+                    symbol: symbol.clone(),
+                    timestamp: row.timestamp,
+                    payload: row.payload.clone(),
+                });
             }
         }
 
@@ -293,8 +304,12 @@ impl HotColumnStore for InMemoryHotColumnStore {
 
         for symbol in symbol_keys {
             if let Some(store) = tenant_store.symbols.get(symbol) {
-                if let Some(payload) = find_last_le(&store.rows, micros) {
-                    results.push(payload);
+                if let Some(row) = find_last_le(&store.rows, micros) {
+                    results.push(HotRow {
+                        symbol: symbol.clone(),
+                        timestamp: row.timestamp,
+                        payload: row.payload.clone(),
+                    });
                 }
             }
         }
@@ -313,7 +328,7 @@ impl HotColumnStore for InMemoryHotColumnStore {
     }
 }
 
-fn find_last_le(rows: &[Row], micros: i64) -> Option<Vec<u8>> {
+fn find_last_le(rows: &[Row], micros: i64) -> Option<&Row> {
     if rows.is_empty() {
         return None;
     }
@@ -321,7 +336,7 @@ fn find_last_le(rows: &[Row], micros: i64) -> Option<Vec<u8>> {
     if idx == 0 {
         None
     } else {
-        Some(rows[idx - 1].payload.clone())
+        Some(&rows[idx - 1])
     }
 }
 
@@ -347,13 +362,13 @@ mod tests {
             .last_by(&"tenant".into(), &["AAPL".into()], ts(1_500))
             .await?;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], b"r1".to_vec());
+        assert_eq!(rows[0].payload, b"r1".to_vec());
 
         let rows = store
             .last_by(&"tenant".into(), &["AAPL".into()], ts(2_500))
             .await?;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], b"r2".to_vec());
+        assert_eq!(rows[0].payload, b"r2".to_vec());
         Ok(())
     }
 
@@ -367,7 +382,7 @@ mod tests {
             .asof(&"tenant".into(), &["AAPL".into()], ts(1_500))
             .await?;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], b"r1".to_vec());
+        assert_eq!(rows[0].payload, b"r1".to_vec());
         Ok(())
     }
 }
