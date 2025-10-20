@@ -50,6 +50,20 @@ pub struct QueryRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolDictionarySpec {
+    pub tenant: TenantId,
+    pub symbols: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticsBundle {
+    #[serde(with = "proxist_core::time::serde_micros")]
+    pub captured_at: SystemTime,
+    pub status: StatusResponse,
+    pub metrics: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub metadata: proxist_core::metadata::ClusterMetadata,
     pub shard_health: Vec<ShardHealth>,

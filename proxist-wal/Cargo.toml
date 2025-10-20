@@ -16,3 +16,4 @@ tokio.workspace = true
 tracing.workspace = true
 proxist-core = { path = "../proxist-core" }
 tempfile.workspace = true
+crc32fast = "1.4"

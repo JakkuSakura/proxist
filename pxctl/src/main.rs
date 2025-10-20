@@ -1,11 +1,16 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+
 use anyhow::bail;
 use clap::{Parser, Subcommand};
 use proxist_api::{
-    ControlCommand, IngestBatchRequest, QueryRequest, QueryResponse, ShardAssignment,
-    StatusResponse,
+    ControlCommand, DiagnosticsBundle, IngestBatchRequest, QueryRequest, QueryResponse,
+    ShardAssignment, StatusResponse, SymbolDictionarySpec,
 };
-use proxist_core::query::{QueryOperation, QueryRange};
-use reqwest::Client;
+use proxist_core::{
+    metadata::ClusterMetadata,
+    query::{QueryOperation, QueryRange},
+};
+use reqwest::{Client, RequestBuilder};
 use tokio::runtime::Runtime;
 use tracing::info;
 
@@ -14,6 +19,8 @@ use tracing::info;
 struct Cli {
     #[arg(long, global = true, default_value = "http://127.0.0.1:8080")]
     endpoint: String,
+    #[arg(long, global = true)]
+    token: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -21,11 +28,18 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Show cluster status summary.
-    Status,
-    /// Apply shard assignments from a JSON payload.
-    ApplyAssignments {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Capture diagnostics bundle (status + metrics snapshot).
+    Diagnostics,
+    /// Apply cluster metadata (assignments, symbol dictionaries) from a JSON payload.
+    Apply {
         #[arg(long)]
         file: String,
+        #[arg(long)]
+        yes: bool,
     },
     /// Submit an ad-hoc query described via JSON or CLI flags.
     Query {
@@ -55,40 +69,96 @@ fn main() -> anyhow::Result<()> {
     let rt = Runtime::new()?;
     let client = Client::new();
     let endpoint = cli.endpoint.trim_end_matches('/').to_string();
+    let token = cli.token.clone();
 
     match cli.command {
-        Commands::Status => {
-            let url = format!("{}/status", endpoint);
-            rt.block_on(async {
-                let response = client.get(url).send().await?.error_for_status()?;
-                let status: StatusResponse = response.json().await?;
+        Commands::Status { json } => {
+            let status = fetch_status(&rt, &client, &endpoint, token.as_deref())?;
+            if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
-                Ok::<(), anyhow::Error>(())
-            })?;
+            } else {
+                render_status(&status);
+            }
         }
-        Commands::ApplyAssignments { file } => {
-            let json = std::fs::read_to_string(file)?;
-            let assignments: Vec<ShardAssignment> =
-                match serde_json::from_str::<Vec<ShardAssignment>>(&json) {
-                    Ok(list) => list,
-                    Err(_) => {
-                        let cmd: ControlCommand = serde_json::from_str(&json)?;
-                        match cmd {
-                            ControlCommand::ApplyShardAssignments(list) => list,
-                            other => bail!("unexpected command payload: {:?}", other),
-                        }
-                    }
-                };
+        Commands::Apply { file, yes } => {
+            let spec = load_cluster_spec(&file)?;
+            let status = fetch_status(&rt, &client, &endpoint, token.as_deref())?;
 
-            let url = format!("{}/assignments", endpoint);
-            info!(rows = assignments.len(), "applying shard assignments");
+            let assignment_diffs =
+                compute_assignment_diffs(&status.metadata.assignments, &spec.assignments);
+            let symbol_updates = compute_symbol_updates(
+                &status.metadata.symbol_dictionaries,
+                &spec.symbol_dictionaries,
+            );
+
+            if assignment_diffs.updates.is_empty() && symbol_updates.is_empty() {
+                if assignment_diffs.missing.is_empty() {
+                    println!("No metadata changes required; cluster already matches spec.");
+                } else {
+                    print_change_summary(
+                        &assignment_diffs.updates,
+                        &assignment_diffs.missing,
+                        &symbol_updates,
+                    );
+                    println!("Removal of shards is not yet automated; update the spec once nodes are drained.");
+                }
+                return Ok(());
+            }
+
+            print_change_summary(
+                &assignment_diffs.updates,
+                &assignment_diffs.missing,
+                &symbol_updates,
+            );
+
+            if !yes {
+                println!("Re-run with --yes to apply these changes.");
+                return Ok(());
+            }
+
+            if !assignment_diffs.updates.is_empty() {
+                let url = format!("{}/assignments", endpoint);
+                let payload: Vec<ShardAssignment> = assignment_diffs
+                    .updates
+                    .iter()
+                    .map(|change| change.desired.clone())
+                    .collect();
+                info!(rows = payload.len(), "upserting shard assignments");
+                rt.block_on(async {
+                    apply_auth(client.post(&url).json(&payload), token.as_deref())
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Ok::<(), anyhow::Error>(())
+                })?;
+            }
+
+            if !symbol_updates.is_empty() {
+                let url = format!("{}/symbols", endpoint);
+                info!(
+                    tenants = symbol_updates.len(),
+                    "upserting symbol dictionaries"
+                );
+                rt.block_on(async {
+                    apply_auth(client.post(&url).json(&symbol_updates), token.as_deref())
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Ok::<(), anyhow::Error>(())
+                })?;
+            }
+
+            println!("Cluster metadata updated successfully.");
+        }
+        Commands::Diagnostics => {
+            let url = format!("{}/diagnostics", endpoint);
             rt.block_on(async {
-                client
-                    .post(url)
-                    .json(&assignments)
+                let response = apply_auth(client.get(&url), token.as_deref())
                     .send()
                     .await?
                     .error_for_status()?;
+                let bundle: DiagnosticsBundle = response.json().await?;
+                println!("{}", serde_json::to_string_pretty(&bundle)?);
                 Ok::<(), anyhow::Error>(())
             })?;
         }
@@ -109,9 +179,7 @@ fn main() -> anyhow::Result<()> {
             let url = format!("{}/query", endpoint);
             info!("submitting query to {}", url);
             rt.block_on(async {
-                let response = client
-                    .post(url)
-                    .json(&request)
+                let response = apply_auth(client.post(&url).json(&request), token.as_deref())
                     .send()
                     .await?
                     .error_for_status()?;
@@ -126,9 +194,7 @@ fn main() -> anyhow::Result<()> {
             let url = format!("{}/ingest", endpoint);
             info!(rows = batch.ticks.len(), "submitting ingest batch");
             rt.block_on(async {
-                client
-                    .post(url)
-                    .json(&batch)
+                apply_auth(client.post(&url).json(&batch), token.as_deref())
                     .send()
                     .await?
                     .error_for_status()?;
@@ -183,5 +249,263 @@ fn micros_to_system_time(micros: i64) -> std::time::SystemTime {
         std::time::UNIX_EPOCH + std::time::Duration::from_micros(micros as u64)
     } else {
         std::time::UNIX_EPOCH - std::time::Duration::from_micros((-micros) as u64)
+    }
+}
+
+fn fetch_status(
+    rt: &Runtime,
+    client: &Client,
+    endpoint: &str,
+    token: Option<&str>,
+) -> anyhow::Result<StatusResponse> {
+    let url = format!("{}/status", endpoint);
+    let status = rt.block_on(async {
+        let response = apply_auth(client.get(&url), token)
+            .send()
+            .await?
+            .error_for_status()?;
+        let status: StatusResponse = response.json().await?;
+        Ok::<StatusResponse, anyhow::Error>(status)
+    })?;
+    Ok(status)
+}
+
+fn load_cluster_spec(path: &str) -> anyhow::Result<ClusterMetadata> {
+    let json = std::fs::read_to_string(path)?;
+    if let Ok(spec) = serde_json::from_str::<ClusterMetadata>(&json) {
+        return Ok(spec);
+    }
+    if let Ok(assignments) = serde_json::from_str::<Vec<ShardAssignment>>(&json) {
+        let mut spec = ClusterMetadata::default();
+        spec.assignments = assignments;
+        return Ok(spec);
+    }
+    if let Ok(cmd) = serde_json::from_str::<ControlCommand>(&json) {
+        if let ControlCommand::ApplyShardAssignments(assignments) = cmd {
+            let mut spec = ClusterMetadata::default();
+            spec.assignments = assignments;
+            return Ok(spec);
+        } else {
+            bail!("unsupported control command in spec");
+        }
+    }
+    bail!("failed to parse cluster spec: expected ClusterMetadata or assignment list")
+}
+
+fn apply_auth(builder: RequestBuilder, token: Option<&str>) -> RequestBuilder {
+    if let Some(token) = token {
+        builder.bearer_auth(token)
+    } else {
+        builder
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentChange {
+    shard_id: String,
+    previous: Option<ShardAssignment>,
+    desired: ShardAssignment,
+}
+
+#[derive(Debug, Default)]
+struct AssignmentDiffs {
+    updates: Vec<AssignmentChange>,
+    missing: Vec<ShardAssignment>,
+}
+
+fn compute_assignment_diffs(
+    current: &[ShardAssignment],
+    desired: &[ShardAssignment],
+) -> AssignmentDiffs {
+    let mut current_map: HashMap<&str, &ShardAssignment> = HashMap::new();
+    for assignment in current {
+        current_map.insert(assignment.shard_id.as_str(), assignment);
+    }
+
+    let mut desired_ids: HashSet<&str> = HashSet::new();
+    let mut updates = Vec::new();
+
+    for new in desired {
+        desired_ids.insert(new.shard_id.as_str());
+        if let Some(existing) = current_map.get(new.shard_id.as_str()) {
+            if *existing == new {
+                continue;
+            }
+            updates.push(AssignmentChange {
+                shard_id: new.shard_id.clone(),
+                previous: Some((*existing).clone()),
+                desired: new.clone(),
+            });
+        } else {
+            updates.push(AssignmentChange {
+                shard_id: new.shard_id.clone(),
+                previous: None,
+                desired: new.clone(),
+            });
+        }
+    }
+
+    let mut missing = Vec::new();
+    for assignment in current {
+        if !desired_ids.contains(assignment.shard_id.as_str()) {
+            missing.push(assignment.clone());
+        }
+    }
+
+    AssignmentDiffs { updates, missing }
+}
+
+fn compute_symbol_updates(
+    current: &BTreeMap<String, Vec<String>>,
+    desired: &BTreeMap<String, Vec<String>>,
+) -> Vec<SymbolDictionarySpec> {
+    let mut updates = Vec::new();
+    for (tenant, symbols) in desired {
+        let existing_lookup: HashSet<&String> = current
+            .get(tenant)
+            .map(|list| list.iter().collect())
+            .unwrap_or_else(HashSet::new);
+        let mut seen = HashSet::new();
+        let mut additions = Vec::new();
+        for symbol in symbols {
+            if !seen.insert(symbol.as_str()) {
+                continue;
+            }
+            if !existing_lookup.contains(symbol) {
+                additions.push(symbol.clone());
+            }
+        }
+        if !additions.is_empty() {
+            updates.push(SymbolDictionarySpec {
+                tenant: tenant.clone(),
+                symbols: additions,
+            });
+        }
+    }
+    updates
+}
+
+fn print_change_summary(
+    changes: &[AssignmentChange],
+    missing: &[ShardAssignment],
+    symbol_updates: &[SymbolDictionarySpec],
+) {
+    if !changes.is_empty() {
+        println!("Shard assignments to apply:");
+        for change in changes {
+            if let Some(prev) = &change.previous {
+                println!(
+                    "  {}: tenant {} on {} [{}..{}) → tenant {} on {} [{}..{})",
+                    change.shard_id,
+                    prev.tenant_id,
+                    prev.node_id,
+                    prev.symbol_range.0,
+                    prev.symbol_range.1,
+                    change.desired.tenant_id,
+                    change.desired.node_id,
+                    change.desired.symbol_range.0,
+                    change.desired.symbol_range.1,
+                );
+            } else {
+                println!(
+                    "  {}: assign tenant {} to node {} [{}..{})",
+                    change.shard_id,
+                    change.desired.tenant_id,
+                    change.desired.node_id,
+                    change.desired.symbol_range.0,
+                    change.desired.symbol_range.1,
+                );
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        println!("Shards present in cluster but missing from spec (not modified):");
+        for shard in missing {
+            println!(
+                "  {}: tenant {} on {} [{}..{})",
+                shard.shard_id,
+                shard.tenant_id,
+                shard.node_id,
+                shard.symbol_range.0,
+                shard.symbol_range.1
+            );
+        }
+    }
+
+    if !symbol_updates.is_empty() {
+        println!("Symbol dictionaries additions:");
+        for spec in symbol_updates {
+            println!("  {}: {}", spec.tenant, spec.symbols.join(", "));
+        }
+    }
+}
+
+fn render_status(status: &StatusResponse) {
+    println!("Shard Assignments:");
+    if status.metadata.assignments.is_empty() {
+        println!("  <none>");
+    } else {
+        for assignment in &status.metadata.assignments {
+            println!(
+                "  {}: tenant {} on {} [{}..{})",
+                assignment.shard_id,
+                assignment.tenant_id,
+                assignment.node_id,
+                assignment.symbol_range.0,
+                assignment.symbol_range.1
+            );
+        }
+    }
+
+    println!("Symbol Dictionaries:");
+    if status.metadata.symbol_dictionaries.is_empty() {
+        println!("  <none>");
+    } else {
+        for (tenant, symbols) in &status.metadata.symbol_dictionaries {
+            println!("  {}: {}", tenant, symbols.join(", "));
+        }
+    }
+
+    println!("Shard Health:");
+    if status.shard_health.is_empty() {
+        println!("  <none>");
+    } else {
+        for health in &status.shard_health {
+            println!(
+                "  {} leader={} persisted={} wal={} state={:?}",
+                health.shard_id,
+                health.is_leader,
+                format_system_time(health.watermark.persisted),
+                format_system_time(health.watermark.wal_high),
+                health.persistence_state
+            );
+        }
+    }
+
+    println!("ClickHouse:");
+    println!("  enabled: {}", status.clickhouse.enabled);
+    if let Some(target) = &status.clickhouse.target {
+        println!(
+            "  target: {}/{}/{}",
+            target.endpoint, target.database, target.table
+        );
+    }
+    println!(
+        "  last_flush: {}",
+        format_system_time(status.clickhouse.last_flush)
+    );
+    if let Some(error) = &status.clickhouse.last_error {
+        println!("  last_error: {}", error);
+    }
+}
+
+fn format_system_time(ts: Option<std::time::SystemTime>) -> String {
+    match ts {
+        Some(value) => match value.duration_since(std::time::UNIX_EPOCH) {
+            Ok(dur) => format!("{} µs", dur.as_micros()),
+            Err(err) => format!("-{} µs", err.duration().as_micros()),
+        },
+        None => "-".into(),
     }
 }

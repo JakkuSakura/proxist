@@ -44,4 +44,5 @@ pub trait MetadataStore: Send + Sync {
     async fn record_shard_health(&self, health: ShardHealth) -> anyhow::Result<()>;
     async fn alloc_symbol(&self, tenant_id: &TenantId, symbol: &str) -> anyhow::Result<u32>;
     async fn list_shard_health(&self) -> anyhow::Result<Vec<ShardHealth>>;
+    async fn upsert_symbols(&self, tenant_id: &TenantId, symbols: &[String]) -> anyhow::Result<()>;
 }

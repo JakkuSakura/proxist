@@ -1,16 +1,22 @@
-use std::sync::{
-    atomic::{AtomicI64, Ordering},
-    Arc,
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
+    time::{Instant, SystemTime},
 };
 
 use anyhow::Result;
 use proxist_api::{ClickhouseStatus, IngestBatchRequest};
 use proxist_ch::{ClickhouseHttpClient, ClickhouseSink, ClickhouseTarget};
-use proxist_core::metadata::TenantId;
-use proxist_core::MetadataStore;
+use proxist_core::{
+    metadata::{ShardHealth, TenantId},
+    MetadataStore, PersistenceBatch, PersistenceTransition, ShardPersistenceTracker,
+};
 use proxist_mem::HotColumnStore;
 use proxist_metadata_sqlite::SqliteMetadataStore;
-use proxist_wal::{WalRecord, WalWriter};
+use proxist_wal::{WalRecord, WalSegment, WalWriter};
 use serde_bytes::ByteBuf;
 use tokio::sync::Mutex;
 
@@ -23,6 +29,78 @@ pub struct IngestService {
     clickhouse_client: Option<Arc<ClickhouseHttpClient>>,
     last_flush_micros: AtomicI64,
     clickhouse_error: Mutex<Option<String>>,
+    persistence_trackers: Mutex<HashMap<String, ShardPersistenceTracker>>,
+}
+
+#[derive(Debug, Clone)]
+struct ShardBatchPlan {
+    shard_id: String,
+    tenant: TenantId,
+    batch: PersistenceBatch,
+    wal_first_offset: u64,
+    wal_last_offset: u64,
+    rows: usize,
+}
+
+#[derive(Debug)]
+struct ShardBatchAccumulator {
+    shard_id: String,
+    tenant: TenantId,
+    start: SystemTime,
+    end: SystemTime,
+    wal_first_offset: u64,
+    wal_last_offset: u64,
+    rows: usize,
+}
+
+impl ShardBatchAccumulator {
+    fn new(record: &WalRecord, offset: u64) -> Self {
+        Self {
+            shard_id: record.shard_id.clone(),
+            tenant: record.tenant.clone(),
+            start: record.timestamp,
+            end: record.timestamp,
+            wal_first_offset: offset,
+            wal_last_offset: offset,
+            rows: 1,
+        }
+    }
+
+    fn observe(&mut self, record: &WalRecord, offset: u64) {
+        debug_assert_eq!(
+            self.shard_id, record.shard_id,
+            "shard mismatch within batch accumulator"
+        );
+        if record.timestamp < self.start {
+            self.start = record.timestamp;
+        }
+        if record.timestamp > self.end {
+            self.end = record.timestamp;
+        }
+        if offset < self.wal_first_offset {
+            self.wal_first_offset = offset;
+        }
+        if offset > self.wal_last_offset {
+            self.wal_last_offset = offset;
+        }
+        self.rows += 1;
+    }
+
+    fn into_plan(self) -> ShardBatchPlan {
+        let batch_id = format!(
+            "{}-{}",
+            self.shard_id.replace(':', "_"),
+            self.wal_first_offset
+        );
+        ShardBatchPlan {
+            shard_id: self.shard_id,
+            tenant: self.tenant,
+            batch: PersistenceBatch::new(batch_id, self.start, self.end),
+            wal_first_offset: self.wal_first_offset,
+            wal_last_offset: self.wal_last_offset,
+            rows: self.rows,
+        }
+    }
 }
 
 impl IngestService {
@@ -49,10 +127,124 @@ impl IngestService {
             clickhouse_client: client,
             last_flush_micros: AtomicI64::new(-1),
             clickhouse_error: Mutex::new(None),
+            persistence_trackers: Mutex::new(HashMap::new()),
         }
     }
 
+    fn plan_shard_batches(segment: &WalSegment) -> Vec<ShardBatchPlan> {
+        let mut accumulators: HashMap<String, ShardBatchAccumulator> = HashMap::new();
+
+        for (idx, record) in segment.records.iter().enumerate() {
+            let offset = segment.base_offset.0 + idx as u64;
+            accumulators
+                .entry(record.shard_id.clone())
+                .and_modify(|acc| acc.observe(record, offset))
+                .or_insert_with(|| ShardBatchAccumulator::new(record, offset));
+        }
+
+        accumulators
+            .into_iter()
+            .map(|(_, acc)| acc.into_plan())
+            .collect()
+    }
+
+    async fn begin_persistence(&self, plans: &[ShardBatchPlan]) -> anyhow::Result<()> {
+        if plans.is_empty() {
+            return Ok(());
+        }
+        let mut trackers = self.persistence_trackers.lock().await;
+        let mut publish = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let tracker = trackers
+                .entry(plan.shard_id.clone())
+                .or_insert_with(|| ShardPersistenceTracker::new(plan.shard_id.clone()));
+            tracker.apply(PersistenceTransition::Enqueue {
+                batch: plan.batch.clone(),
+            })?;
+            tracker.apply(PersistenceTransition::BeginPersist {
+                batch_id: plan.batch.id.clone(),
+            })?;
+            publish.push((plan.shard_id.clone(), tracker.clone()));
+        }
+        drop(trackers);
+
+        for (shard, tracker) in publish {
+            self.publish_shard_health(&shard, &tracker).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn commit_persistence(&self, plans: &[ShardBatchPlan]) -> anyhow::Result<()> {
+        if plans.is_empty() {
+            return Ok(());
+        }
+        let mut trackers = self.persistence_trackers.lock().await;
+        let mut publish = Vec::with_capacity(plans.len());
+        for plan in plans {
+            if let Some(tracker) = trackers.get_mut(&plan.shard_id) {
+                tracker.apply(PersistenceTransition::ConfirmPersist {
+                    batch_id: plan.batch.id.clone(),
+                })?;
+                tracker.apply(PersistenceTransition::Publish {
+                    batch_id: plan.batch.id.clone(),
+                })?;
+                publish.push((plan.shard_id.clone(), tracker.clone()));
+            }
+        }
+        drop(trackers);
+
+        for (shard, tracker) in publish {
+            self.publish_shard_health(&shard, &tracker).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn fail_persistence(&self, plans: &[ShardBatchPlan]) -> anyhow::Result<()> {
+        if plans.is_empty() {
+            return Ok(());
+        }
+        let mut trackers = self.persistence_trackers.lock().await;
+        let mut publish = Vec::with_capacity(plans.len());
+        for plan in plans {
+            if let Some(tracker) = trackers.get_mut(&plan.shard_id) {
+                tracker.apply(PersistenceTransition::Reset)?;
+                publish.push((plan.shard_id.clone(), tracker.clone()));
+            }
+        }
+        drop(trackers);
+
+        for (shard, tracker) in publish {
+            self.publish_shard_health(&shard, &tracker).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn publish_shard_health(
+        &self,
+        shard_id: &str,
+        tracker: &ShardPersistenceTracker,
+    ) -> anyhow::Result<()> {
+        let health = ShardHealth {
+            shard_id: shard_id.to_string(),
+            is_leader: true,
+            wal_backlog_bytes: 0,
+            clickhouse_lag_ms: 0,
+            watermark: tracker.watermark,
+            persistence_state: tracker.state.clone(),
+        };
+        self.metadata.record_shard_health(health).await?;
+        Ok(())
+    }
+
     pub async fn ingest(&self, batch: IngestBatchRequest) -> Result<()> {
+        let start = Instant::now();
+        let mut rows_written = 0_u64;
+        let span = tracing::info_span!("ingest", rows = batch.ticks.len());
+        let _guard = span.enter();
+        metrics::counter!("proxist_ingest_requests_total", 1);
         for tick in &batch.ticks {
             let shard_id = resolve_shard(&self.metadata, &tick.tenant, &tick.symbol).await?;
 
@@ -78,32 +270,87 @@ impl IngestService {
                     tick.payload.as_ref(),
                 )
                 .await?;
+            rows_written += 1;
         }
 
         if !batch.ticks.is_empty() {
             let segment = self.wal.flush_segment().await?;
+            let shard_plans = Self::plan_shard_batches(&segment);
+            self.begin_persistence(&shard_plans).await?;
+
             if let Some(sink) = &self.clickhouse {
-                match sink.flush_segment(&segment).await {
-                    Ok(_) => {
-                        if let Some(last) = segment
-                            .records
-                            .last()
-                            .map(|record| system_time_to_micros(record.timestamp))
-                        {
-                            self.last_flush_micros.store(last, Ordering::SeqCst);
-                        }
-                        *self.clickhouse_error.lock().await = None;
-                    }
-                    Err(err) => {
-                        *self.clickhouse_error.lock().await = Some(err.to_string());
-                        return Err(err);
-                    }
+                if let Err(err) = sink.flush_segment(&segment).await {
+                    *self.clickhouse_error.lock().await = Some(err.to_string());
+                    metrics::counter!("proxist_clickhouse_flush_total", 1, "status" => "error");
+                    metrics::counter!("proxist_ingest_failures_total", 1);
+                    self.fail_persistence(&shard_plans).await?;
+                    return Err(err);
                 }
+                *self.clickhouse_error.lock().await = None;
+                metrics::counter!("proxist_clickhouse_flush_total", 1, "status" => "ok");
             }
-            let batch = segment.to_persistence_batch()?;
-            tracing::debug!(id = %batch.id, rows = segment.records.len(), "flushed WAL segment");
+
+            if let Some(last) = segment
+                .records
+                .iter()
+                .map(|record| system_time_to_micros(record.timestamp))
+                .max()
+            {
+                self.last_flush_micros.store(last, Ordering::SeqCst);
+            }
+
+            if self.clickhouse.is_none() {
+                *self.clickhouse_error.lock().await = None;
+            }
+
+            self.commit_persistence(&shard_plans).await?;
+            for plan in &shard_plans {
+                tracing::debug!(
+                    shard = %plan.shard_id,
+                    tenant = %plan.tenant,
+                    rows = plan.rows,
+                    wal_first = plan.wal_first_offset,
+                    wal_last = plan.wal_last_offset,
+                    start = ?plan.batch.start,
+                    end = ?plan.batch.end,
+                    "persisted shard batch"
+                );
+            }
         }
 
+        if rows_written > 0 {
+            let elapsed = start.elapsed();
+            metrics::counter!("proxist_ingest_rows_total", rows_written);
+            metrics::counter!("proxist_ingest_success_total", 1);
+            metrics::histogram!(
+                "proxist_ingest_latency_usec",
+                elapsed.as_secs_f64() * 1_000_000.0
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn warm_from_records(&self, records: &[WalRecord]) -> anyhow::Result<()> {
+        let mut last_ts: Option<SystemTime> = None;
+        for record in records {
+            self.metadata
+                .alloc_symbol(&record.tenant, &record.symbol)
+                .await?;
+            self.hot_store
+                .append_row(
+                    &record.tenant,
+                    &record.symbol,
+                    record.timestamp,
+                    &record.payload,
+                )
+                .await?;
+            last_ts = Some(record.timestamp);
+        }
+        if let Some(ts) = last_ts {
+            self.last_flush_micros
+                .store(system_time_to_micros(ts), Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -244,10 +491,10 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn seam_rows(
+        async fn seam_rows_at(
             &self,
             _tenant: &TenantId,
-            _range: &QueryRange,
+            _seam: std::time::SystemTime,
         ) -> anyhow::Result<Vec<SeamBoundaryRow>> {
             Ok(Vec::new())
         }

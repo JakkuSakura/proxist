@@ -101,11 +101,17 @@ impl ClickhouseSink for ClickhouseHttpSink {
             return Ok(());
         }
 
-        for chunk in segment.records.chunks(self.chunk_size()) {
+        for (chunk_idx, chunk) in segment.records.chunks(self.chunk_size()).enumerate() {
             let mut body = String::new();
+            let insert_id = format!(
+                "{}-{}-{}",
+                self.config.table.replace('.', "_"),
+                segment.base_offset.0,
+                chunk_idx
+            );
             body.push_str(&format!(
-                "INSERT INTO {} FORMAT JSONEachRow\n",
-                self.config.table
+                "INSERT INTO {} SETTINGS insert_id='{}', deduplicate=1 FORMAT JSONEachRow\n",
+                self.config.table, insert_id
             ));
 
             for record in chunk {

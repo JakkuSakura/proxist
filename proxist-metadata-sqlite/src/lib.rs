@@ -1,6 +1,6 @@
 //! SQLite-backed implementation of the Proxist metadata store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -226,6 +226,58 @@ impl MetadataStore for SqliteMetadataStore {
         tx.commit().await?;
 
         Ok(next_id as u32)
+    }
+
+    async fn upsert_symbols(&self, tenant_id: &TenantId, symbols: &[String]) -> Result<()> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let existing_rows = sqlx::query(
+            r#"
+            SELECT symbol, symbol_id FROM symbols
+            WHERE tenant_id = ?1
+            ORDER BY symbol_id
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut known: HashSet<String> = HashSet::new();
+        let mut max_id: i64 = -1;
+        for row in existing_rows {
+            let symbol: String = row.get("symbol");
+            let id: i64 = row.get("symbol_id");
+            known.insert(symbol);
+            if id > max_id {
+                max_id = id;
+            }
+        }
+
+        let mut next_id = max_id + 1;
+        for symbol in symbols {
+            if known.contains(symbol) {
+                continue;
+            }
+            sqlx::query(
+                r#"
+                INSERT INTO symbols (tenant_id, symbol, symbol_id)
+                VALUES (?1, ?2, ?3)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(symbol)
+            .bind(next_id)
+            .execute(&mut *tx)
+            .await?;
+            known.insert(symbol.clone());
+            next_id += 1;
+        }
+
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn list_shard_health(&self) -> Result<Vec<ShardHealth>> {

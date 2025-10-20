@@ -96,10 +96,10 @@ pub trait HotColumnStore: Send + Sync {
         symbols: &[String],
     ) -> anyhow::Result<Vec<HotRow>>;
 
-    async fn seam_rows(
+    async fn seam_rows_at(
         &self,
         tenant: &TenantId,
-        range: &QueryRange,
+        seam: SystemTime,
     ) -> anyhow::Result<Vec<SeamBoundaryRow>>;
 
     async fn snapshot(&self, shard_tracker: &ShardPersistenceTracker) -> anyhow::Result<Vec<u8>>;
@@ -210,12 +210,12 @@ impl HotColumnStore for InMemoryHotColumnStore {
         Ok(results)
     }
 
-    async fn seam_rows(
+    async fn seam_rows_at(
         &self,
         tenant: &TenantId,
-        range: &QueryRange,
+        seam: SystemTime,
     ) -> anyhow::Result<Vec<SeamBoundaryRow>> {
-        let boundary = system_time_to_micros(range.start);
+        let boundary = system_time_to_micros(seam);
 
         let guard = self.inner.read().await;
         let Some(tenant_store) = guard.get(tenant) else {
