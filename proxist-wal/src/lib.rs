@@ -12,6 +12,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::Mutex,
 };
+use serde_json;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WalOffset(pub u64);
@@ -186,6 +187,12 @@ struct WalDiskEntry {
     record: WalRecord,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapshotManifest {
+    snapshot: String,
+    last_offset: u64,
+}
+
 impl FileWal {
     pub async fn open(config: WalConfig) -> anyhow::Result<Self> {
         fs::create_dir_all(&config.directory).await?;
@@ -232,6 +239,57 @@ impl FileWal {
             last_offset = entry.offset + 1;
         }
         Ok(last_offset)
+    }
+
+    pub async fn create_snapshot(&self) -> anyhow::Result<PathBuf> {
+        let state = self.state.lock().await;
+        let snapshot_name = format!(
+            "{}-snapshot-{}.json",
+            self.config.file_prefix, state.next_offset
+        );
+        let snapshot_path = self.config.directory.join(&snapshot_name);
+        fs::copy(&self.path, &snapshot_path).await?;
+
+        let manifest = SnapshotManifest {
+            snapshot: snapshot_name,
+            last_offset: state.next_offset,
+        };
+        let manifest_path = manifest_path(&self.config);
+        let manifest_json = serde_json::to_string(&manifest)?;
+        fs::write(manifest_path, manifest_json).await?;
+        Ok(snapshot_path)
+    }
+
+    pub async fn load_snapshot(&self) -> anyhow::Result<Option<WalSegment>> {
+        let manifest_path = manifest_path(&self.config);
+        let manifest_bytes = match fs::read(&manifest_path).await {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(None),
+        };
+        let manifest: SnapshotManifest = serde_json::from_slice(&manifest_bytes)?;
+        let snapshot_path = self.config.directory.join(&manifest.snapshot);
+        let file = OpenOptions::new().read(true).open(&snapshot_path).await?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut records = Vec::new();
+        while reader.read_line(&mut line).await? != 0 {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                line.clear();
+                continue;
+            }
+            let entry: WalDiskEntry = serde_json::from_str(trimmed)?;
+            records.push(entry.record);
+            line.clear();
+        }
+        if records.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(WalSegment {
+            base_offset: WalOffset(0),
+            records,
+            written_at: SystemTime::now(),
+        }))
     }
 }
 
@@ -333,6 +391,12 @@ fn wal_path(config: &WalConfig) -> PathBuf {
         .join(format!("{}-primary.log", config.file_prefix))
 }
 
+fn manifest_path(config: &WalConfig) -> PathBuf {
+    config
+        .directory
+        .join(format!("{}-manifest.json", config.file_prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +423,25 @@ mod tests {
         assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[0].seq, 1);
         assert_eq!(replayed[1].seq, 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_wal_snapshot_and_load() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let mut config = WalConfig::default();
+        config.directory = dir.path().to_path_buf();
+        let wal = FileWal::open(config.clone()).await?;
+        wal.append(sample_record("AAPL", 1)).await?;
+        wal.append(sample_record("AAPL", 2)).await?;
+        wal.flush_segment().await?;
+
+        let snapshot_path = wal.create_snapshot().await?;
+        assert!(snapshot_path.exists());
+
+        let snapshot_segment = wal.load_snapshot().await?.expect("snapshot segment");
+        assert_eq!(snapshot_segment.records.len(), 2);
 
         Ok(())
     }
