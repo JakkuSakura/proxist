@@ -49,6 +49,7 @@ For the full design matrix, see `docs/design-goals.md`.
 - `pxctl` CLI drives status, ingest, query, and assignment workflows over REST.
 - Integration harness (`scripts/run_clickhouse_tests.sh`) launches ClickHouse with Docker Compose and runs `cargo test`.
 - Set `PROXIST_WAL_DIR` to enable disk-backed WAL persistence and replay; otherwise the daemon falls back to in-memory WALs for dev.
+- Hot query path supports `range`, `last_by`, and `asof` operations across the in-memory store; planners will stitch in ClickHouse results once persistence watermarking is complete.
 
 ## MVP Scope
 

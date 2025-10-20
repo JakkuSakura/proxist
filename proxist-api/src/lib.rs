@@ -28,11 +28,17 @@ pub struct QueryRequest {
     pub symbols: Vec<String>,
     pub range: QueryRange,
     pub include_cold: bool,
+    #[serde(default = "default_query_op")]
+    pub op: proxist_core::query::QueryOperation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
     pub rows: Vec<ByteBuf>,
+}
+
+fn default_query_op() -> proxist_core::query::QueryOperation {
+    proxist_core::query::QueryOperation::Range
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

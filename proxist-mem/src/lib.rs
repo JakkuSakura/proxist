@@ -96,6 +96,20 @@ pub trait HotColumnStore: Send + Sync {
     ) -> anyhow::Result<Vec<SeamBoundaryRow>>;
 
     async fn snapshot(&self, shard_tracker: &ShardPersistenceTracker) -> anyhow::Result<Vec<u8>>;
+
+    async fn last_by(
+        &self,
+        tenant: &TenantId,
+        symbols: &[String],
+        at: SystemTime,
+    ) -> anyhow::Result<Vec<Vec<u8>>>;
+
+    async fn asof(
+        &self,
+        tenant: &TenantId,
+        symbols: &[String],
+        at: SystemTime,
+    ) -> anyhow::Result<Vec<Vec<u8>>>;
 }
 
 #[async_trait]
@@ -253,5 +267,107 @@ impl HotColumnStore for InMemoryHotColumnStore {
             "generated in-memory snapshot"
         );
         Ok(bytes)
+    }
+
+    async fn last_by(
+        &self,
+        tenant: &TenantId,
+        symbols: &[String],
+        at: SystemTime,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        let micros = system_time_to_micros(at);
+        let guard = self.inner.read().await;
+        let Some(tenant_store) = guard.get(tenant) else {
+            return Ok(Vec::new());
+        };
+
+        let mut results = Vec::new();
+        let symbol_keys: Vec<&String> = if symbols.is_empty() {
+            tenant_store.symbols.keys().collect()
+        } else {
+            symbols
+                .iter()
+                .filter(|sym| tenant_store.symbols.contains_key(*sym))
+                .collect()
+        };
+
+        for symbol in symbol_keys {
+            if let Some(store) = tenant_store.symbols.get(symbol) {
+                if let Some(payload) = find_last_le(&store.rows, micros) {
+                    results.push(payload);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn asof(
+        &self,
+        tenant: &TenantId,
+        symbols: &[String],
+        at: SystemTime,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        // For hot data, ASOF behaves like last_by on the requested timestamp.
+        self.last_by(tenant, symbols, at).await
+    }
+}
+
+fn find_last_le(rows: &[Row], micros: i64) -> Option<Vec<u8>> {
+    if rows.is_empty() {
+        return None;
+    }
+    let idx = rows.partition_point(|row| row.micros <= micros);
+    if idx == 0 {
+        None
+    } else {
+        Some(rows[idx - 1].payload.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(offset_ms: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(offset_ms)
+    }
+
+    #[tokio::test]
+    async fn last_by_returns_latest_row_before_timestamp() -> anyhow::Result<()> {
+        let store = InMemoryHotColumnStore::new(MemConfig::default());
+        store
+            .append_row(&"tenant".into(), "AAPL", ts(1_000), b"r1")
+            .await?;
+        store
+            .append_row(&"tenant".into(), "AAPL", ts(2_000), b"r2")
+            .await?;
+
+        let rows = store
+            .last_by(&"tenant".into(), &["AAPL".into()], ts(1_500))
+            .await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], b"r1".to_vec());
+
+        let rows = store
+            .last_by(&"tenant".into(), &["AAPL".into()], ts(2_500))
+            .await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], b"r2".to_vec());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn asof_aliases_last_by() -> anyhow::Result<()> {
+        let store = InMemoryHotColumnStore::new(MemConfig::default());
+        store
+            .append_row(&"tenant".into(), "AAPL", ts(1_000), b"r1")
+            .await?;
+        let rows = store
+            .asof(&"tenant".into(), &["AAPL".into()], ts(1_500))
+            .await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], b"r1".to_vec());
+        Ok(())
     }
 }

@@ -18,7 +18,8 @@ use ingest::IngestService;
 use proxist_api::{IngestBatchRequest, QueryRequest, QueryResponse, StatusResponse};
 use proxist_ch::{ClickhouseConfig, ClickhouseHttpSink, ClickhouseSink};
 use proxist_core::{
-    metadata::ClusterMetadata, MetadataStore, ShardAssignment, ShardHealth, ShardPersistenceTracker,
+    metadata::ClusterMetadata, query::QueryOperation, MetadataStore, ShardAssignment, ShardHealth,
+    ShardPersistenceTracker,
 };
 use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
 use proxist_metadata_sqlite::SqliteMetadataStore;
@@ -284,10 +285,26 @@ impl ProxistDaemon {
             State(state): State<AppState>,
             Json(request): Json<QueryRequest>,
         ) -> Result<Json<QueryResponse>, AppError> {
-            let rows = state
-                .hot_store
-                .scan_range(&request.tenant, &request.range, &request.symbols)
-                .await?;
+            let rows = match request.op {
+                QueryOperation::Range => {
+                    state
+                        .hot_store
+                        .scan_range(&request.tenant, &request.range, &request.symbols)
+                        .await?
+                }
+                QueryOperation::LastBy => {
+                    state
+                        .hot_store
+                        .last_by(&request.tenant, &request.symbols, request.range.end)
+                        .await?
+                }
+                QueryOperation::AsOf => {
+                    state
+                        .hot_store
+                        .asof(&request.tenant, &request.symbols, request.range.end)
+                        .await?
+                }
+            };
             let encoded: Vec<ByteBuf> = rows.into_iter().map(ByteBuf::from).collect();
             Ok(Json(QueryResponse { rows: encoded }))
         }

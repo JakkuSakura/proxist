@@ -30,6 +30,14 @@ pub struct QueryShardPlan {
     pub include_cold: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryOperation {
+    Range,
+    LastBy,
+    AsOf,
+}
+
 #[async_trait]
 pub trait QueryPlanner: Send + Sync {
     async fn plan_query(

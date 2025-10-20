@@ -39,7 +39,7 @@ Proxist is a Rust-native time-series proxy that keeps the hot working set in mem
 
 1. Query arrives with a time range and optional filters (tenant, symbol set, window config).
 2. The planner consults the metadata store for `T_persisted`, shard placement, and cached seam rows.
-3. The hot-set executor serves data for `(T_persisted, now]`, operating purely in memory.
+3. The hot-set executor serves data for `(T_persisted, now]`, operating purely in memory, with support for `range`, `last_by`, and `asof` semantics.
 4. ClickHouse handles `(-∞, T_persisted]`; results stream back through the proxy.
 5. A seam stitcher merges the two streams, using cached boundary rows and window statistics to ensure determinism.
 

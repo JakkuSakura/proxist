@@ -1,6 +1,6 @@
 use std::sync::{
     atomic::{AtomicI64, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
 use anyhow::Result;
@@ -12,6 +12,7 @@ use proxist_mem::HotColumnStore;
 use proxist_metadata_sqlite::SqliteMetadataStore;
 use proxist_wal::{WalRecord, WalWriter};
 use serde_bytes::ByteBuf;
+use tokio::sync::Mutex;
 
 pub struct IngestService {
     metadata: SqliteMetadataStore,
@@ -85,10 +86,10 @@ impl IngestService {
                         {
                             self.last_flush_micros.store(last, Ordering::SeqCst);
                         }
-                        *self.clickhouse_error.lock().unwrap() = None;
+                        *self.clickhouse_error.lock().await = None;
                     }
                     Err(err) => {
-                        *self.clickhouse_error.lock().unwrap() = Some(err.to_string());
+                        *self.clickhouse_error.lock().await = Some(err.to_string());
                         return Err(err);
                     }
                 }
@@ -117,11 +118,17 @@ impl IngestService {
                 table: t.table.clone(),
             });
 
+        let last_error = self
+            .clickhouse_error
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+
         ClickhouseStatus {
             enabled: self.clickhouse.is_some(),
             target,
             last_flush,
-            last_error: self.clickhouse_error.lock().unwrap().clone(),
+            last_error,
         }
     }
 }
@@ -220,6 +227,39 @@ mod tests {
             _shard_tracker: &proxist_core::ShardPersistenceTracker,
         ) -> anyhow::Result<Vec<u8>> {
             Ok(Vec::new())
+        }
+
+        async fn last_by(
+            &self,
+            tenant: &TenantId,
+            symbols: &[String],
+            at: std::time::SystemTime,
+        ) -> anyhow::Result<Vec<Vec<u8>>> {
+            let rows = self.rows.lock().await;
+            let mut result = Vec::new();
+            for symbol in symbols {
+                let mut best: Option<(std::time::SystemTime, Vec<u8>)> = None;
+                for (row_tenant, row_symbol, ts, payload) in rows.iter() {
+                    if row_tenant == tenant && row_symbol == symbol && ts <= &at {
+                        if best.as_ref().map_or(true, |(best_ts, _)| ts > best_ts) {
+                            best = Some((*ts, payload.clone()));
+                        }
+                    }
+                }
+                if let Some((_, payload)) = best {
+                    result.push(payload);
+                }
+            }
+            Ok(result)
+        }
+
+        async fn asof(
+            &self,
+            tenant: &TenantId,
+            symbols: &[String],
+            at: std::time::SystemTime,
+        ) -> anyhow::Result<Vec<Vec<u8>>> {
+            self.last_by(tenant, symbols, at).await
         }
     }
 
