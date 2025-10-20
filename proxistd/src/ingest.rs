@@ -30,7 +30,11 @@ impl IngestService {
         metadata: SqliteMetadataStore,
         wal: Arc<dyn WalWriter>,
         hot_store: Arc<dyn HotColumnStore>,
-        clickhouse: Option<(Arc<dyn ClickhouseSink>, ClickhouseTarget, Arc<ClickhouseHttpClient>)>,
+        clickhouse: Option<(
+            Arc<dyn ClickhouseSink>,
+            ClickhouseTarget,
+            Arc<ClickhouseHttpClient>,
+        )>,
     ) -> Self {
         let (clickhouse_sink, target, client) = match clickhouse {
             Some((sink, target, client)) => (Some(sink), Some(target), Some(client)),
@@ -151,6 +155,10 @@ impl IngestService {
         } else {
             None
         }
+    }
+
+    pub fn clickhouse_client(&self) -> Option<Arc<ClickhouseHttpClient>> {
+        self.clickhouse_client.as_ref().map(Arc::clone)
     }
 }
 
@@ -325,7 +333,11 @@ mod tests {
             metadata.clone(),
             wal,
             hot_store_arc,
-            Some((Arc::new(mock_sink.clone()), target.clone(), Arc::clone(&clickhouse_client))),
+            Some((
+                Arc::new(mock_sink.clone()),
+                target.clone(),
+                Arc::clone(&clickhouse_client),
+            )),
         );
 
         let now = std::time::SystemTime::now();

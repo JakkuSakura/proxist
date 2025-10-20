@@ -256,7 +256,10 @@ impl ClickhouseHttpClient {
                 body
             ));
         }
-        let body = response.text().await.context("read ClickHouse query body")?;
+        let body = response
+            .text()
+            .await
+            .context("read ClickHouse query body")?;
         let mut rows = Vec::new();
         for line in body.lines() {
             let trimmed = line.trim();
