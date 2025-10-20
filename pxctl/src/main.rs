@@ -1,10 +1,10 @@
 use anyhow::bail;
 use clap::{Parser, Subcommand};
-use proxist_core::query::{QueryOperation, QueryRange};
 use proxist_api::{
     ControlCommand, IngestBatchRequest, QueryRequest, QueryResponse, ShardAssignment,
     StatusResponse,
 };
+use proxist_core::query::{QueryOperation, QueryRange};
 use reqwest::Client;
 use tokio::runtime::Runtime;
 use tracing::info;

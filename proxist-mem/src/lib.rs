@@ -170,7 +170,7 @@ impl HotColumnStore for InMemoryHotColumnStore {
         tenant: &TenantId,
         range: &QueryRange,
         symbols: &[String],
-    ) -> anyhow::Result<Vec<Vec<u8>>> {
+    ) -> anyhow::Result<Vec<HotRow>> {
         let start_micros = system_time_to_micros(range.start);
         let end_micros = system_time_to_micros(range.end);
 
@@ -285,7 +285,7 @@ impl HotColumnStore for InMemoryHotColumnStore {
         tenant: &TenantId,
         symbols: &[String],
         at: SystemTime,
-    ) -> anyhow::Result<Vec<Vec<u8>>> {
+    ) -> anyhow::Result<Vec<HotRow>> {
         let micros = system_time_to_micros(at);
         let guard = self.inner.read().await;
         let Some(tenant_store) = guard.get(tenant) else {
@@ -322,7 +322,7 @@ impl HotColumnStore for InMemoryHotColumnStore {
         tenant: &TenantId,
         symbols: &[String],
         at: SystemTime,
-    ) -> anyhow::Result<Vec<Vec<u8>>> {
+    ) -> anyhow::Result<Vec<HotRow>> {
         // For hot data, ASOF behaves like last_by on the requested timestamp.
         self.last_by(tenant, symbols, at).await
     }

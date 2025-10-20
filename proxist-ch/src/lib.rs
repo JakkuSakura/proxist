@@ -22,6 +22,7 @@ pub struct ClickhouseConfig {
     pub timeout_secs: u64,
     pub max_retries: usize,
     pub retry_backoff_ms: u64,
+    pub query_timeout_secs: Option<u64>,
 }
 
 impl Default for ClickhouseConfig {
@@ -36,6 +37,7 @@ impl Default for ClickhouseConfig {
             timeout_secs: 5,
             max_retries: 3,
             retry_backoff_ms: 200,
+            query_timeout_secs: None,
         }
     }
 }
@@ -199,4 +201,141 @@ fn system_time_to_micros(ts: SystemTime) -> i64 {
             let dur = err.duration();
             -(dur.as_micros() as i64)
         })
+}
+
+#[derive(Clone)]
+pub struct ClickhouseHttpClient {
+    client: Client,
+    config: ClickhouseConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClickhouseQueryRow {
+    pub symbol: String,
+    pub ts_micros: i64,
+    pub payload_base64: String,
+}
+
+impl ClickhouseHttpClient {
+    pub fn new(config: ClickhouseConfig) -> anyhow::Result<Self> {
+        let timeout = config.query_timeout_secs.unwrap_or(config.timeout_secs);
+        let client = Client::builder()
+            .timeout(Duration::from_secs(timeout))
+            .build()
+            .context("build ClickHouse query client")?;
+        Ok(Self { client, config })
+    }
+
+    fn url(&self) -> String {
+        format!(
+            "{}/?database={}",
+            self.config.endpoint.trim_end_matches('/'),
+            self.config.database
+        )
+    }
+
+    fn escape(value: &str) -> String {
+        value.replace('\'', "\\'")
+    }
+
+    async fn execute(&self, sql: String) -> anyhow::Result<Vec<ClickhouseQueryRow>> {
+        let mut request = self.client.post(self.url()).body(sql);
+        if let Some(username) = &self.config.username {
+            request = request.basic_auth(username, self.config.password.as_ref());
+        }
+        let response = request.send().await.context("send ClickHouse query")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unavailable>".into());
+            return Err(anyhow!(
+                "clickhouse query failed: status={} body={}",
+                status,
+                body
+            ));
+        }
+        let body = response.text().await.context("read ClickHouse query body")?;
+        let mut rows = Vec::new();
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            rows.push(serde_json::from_str(trimmed).context("parse ClickHouse query row")?);
+        }
+        Ok(rows)
+    }
+
+    pub async fn fetch_last_by(
+        &self,
+        tenant: &str,
+        symbols: &[String],
+        ts_micros: i64,
+    ) -> anyhow::Result<Vec<ClickhouseQueryRow>> {
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+        let symbol_list = symbols
+            .iter()
+            .map(|sym| format!("'{}'", Self::escape(sym)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT symbol, ts_micros, payload_base64 \
+             FROM {table} \
+             WHERE tenant = '{tenant}' \
+               AND symbol IN ({symbols}) \
+               AND ts_micros <= {ts} \
+             ORDER BY symbol, ts_micros DESC \
+             LIMIT 1 BY symbol \
+             FORMAT JSONEachRow",
+            table = self.config.table,
+            tenant = Self::escape(tenant),
+            symbols = symbol_list,
+            ts = ts_micros
+        );
+        self.execute(sql).await
+    }
+
+    pub async fn fetch_range(
+        &self,
+        tenant: &str,
+        symbols: &[String],
+        start_micros: i64,
+        end_micros: i64,
+    ) -> anyhow::Result<Vec<ClickhouseQueryRow>> {
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+        let symbol_list = symbols
+            .iter()
+            .map(|sym| format!("'{}'", Self::escape(sym)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT symbol, ts_micros, payload_base64 \
+             FROM {table} \
+             WHERE tenant = '{tenant}' \
+               AND symbol IN ({symbols}) \
+               AND ts_micros BETWEEN {start} AND {end} \
+             ORDER BY ts_micros ASC \
+             FORMAT JSONEachRow",
+            table = self.config.table,
+            tenant = Self::escape(tenant),
+            symbols = symbol_list,
+            start = start_micros,
+            end = end_micros
+        );
+        self.execute(sql).await
+    }
+
+    pub fn target(&self) -> ClickhouseTarget {
+        ClickhouseTarget {
+            endpoint: self.config.endpoint.clone(),
+            database: self.config.database.clone(),
+            table: self.config.table.clone(),
+        }
+    }
 }

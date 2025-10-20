@@ -5,7 +5,7 @@ use std::sync::{
 
 use anyhow::Result;
 use proxist_api::{ClickhouseStatus, IngestBatchRequest};
-use proxist_ch::{ClickhouseSink, ClickhouseTarget};
+use proxist_ch::{ClickhouseHttpClient, ClickhouseSink, ClickhouseTarget};
 use proxist_core::metadata::TenantId;
 use proxist_core::MetadataStore;
 use proxist_mem::HotColumnStore;
@@ -20,6 +20,7 @@ pub struct IngestService {
     hot_store: Arc<dyn HotColumnStore>,
     clickhouse: Option<Arc<dyn ClickhouseSink>>,
     clickhouse_target: Option<ClickhouseTarget>,
+    clickhouse_client: Option<Arc<ClickhouseHttpClient>>,
     last_flush_micros: AtomicI64,
     clickhouse_error: Mutex<Option<String>>,
 }
@@ -29,11 +30,11 @@ impl IngestService {
         metadata: SqliteMetadataStore,
         wal: Arc<dyn WalWriter>,
         hot_store: Arc<dyn HotColumnStore>,
-        clickhouse: Option<(Arc<dyn ClickhouseSink>, ClickhouseTarget)>,
+        clickhouse: Option<(Arc<dyn ClickhouseSink>, ClickhouseTarget, Arc<ClickhouseHttpClient>)>,
     ) -> Self {
-        let (clickhouse_sink, target) = match clickhouse {
-            Some((sink, target)) => (Some(sink), Some(target)),
-            None => (None, None),
+        let (clickhouse_sink, target, client) = match clickhouse {
+            Some((sink, target, client)) => (Some(sink), Some(target), Some(client)),
+            None => (None, None, None),
         };
         Self {
             metadata,
@@ -41,6 +42,7 @@ impl IngestService {
             hot_store,
             clickhouse: clickhouse_sink,
             clickhouse_target: target,
+            clickhouse_client: client,
             last_flush_micros: AtomicI64::new(-1),
             clickhouse_error: Mutex::new(None),
         }
@@ -116,6 +118,16 @@ impl IngestService {
                 endpoint: t.endpoint.clone(),
                 database: t.database.clone(),
                 table: t.table.clone(),
+            })
+            .or_else(|| {
+                self.clickhouse_client.as_ref().map(|client| {
+                    let t = client.target();
+                    proxist_api::ClickhouseTarget {
+                        endpoint: t.endpoint,
+                        database: t.database,
+                        table: t.table,
+                    }
+                })
             });
 
         let last_error = self
@@ -129,6 +141,15 @@ impl IngestService {
             target,
             last_flush,
             last_error,
+        }
+    }
+
+    pub fn last_persisted_timestamp(&self) -> Option<std::time::SystemTime> {
+        let micros = self.last_flush_micros.load(Ordering::SeqCst);
+        if micros >= 0 {
+            Some(micros_to_system_time(micros))
+        } else {
+            None
         }
     }
 }
@@ -176,6 +197,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use proxist_api::IngestTick;
+    use proxist_ch::{ClickhouseConfig, ClickhouseHttpClient};
     use proxist_core::query::QueryRange;
     use proxist_mem::SeamBoundaryRow;
     use proxist_wal::InMemoryWal;
@@ -210,7 +232,7 @@ mod tests {
             _tenant: &TenantId,
             _range: &QueryRange,
             _symbols: &[String],
-        ) -> anyhow::Result<Vec<Vec<u8>>> {
+        ) -> anyhow::Result<Vec<proxist_mem::HotRow>> {
             Ok(Vec::new())
         }
 
@@ -234,7 +256,7 @@ mod tests {
             tenant: &TenantId,
             symbols: &[String],
             at: std::time::SystemTime,
-        ) -> anyhow::Result<Vec<Vec<u8>>> {
+        ) -> anyhow::Result<Vec<proxist_mem::HotRow>> {
             let rows = self.rows.lock().await;
             let mut result = Vec::new();
             for symbol in symbols {
@@ -246,8 +268,12 @@ mod tests {
                         }
                     }
                 }
-                if let Some((_, payload)) = best {
-                    result.push(payload);
+                if let Some((ts, payload)) = best {
+                    result.push(proxist_mem::HotRow {
+                        symbol: symbol.clone(),
+                        timestamp: ts,
+                        payload,
+                    });
                 }
             }
             Ok(result)
@@ -258,7 +284,7 @@ mod tests {
             tenant: &TenantId,
             symbols: &[String],
             at: std::time::SystemTime,
-        ) -> anyhow::Result<Vec<Vec<u8>>> {
+        ) -> anyhow::Result<Vec<proxist_mem::HotRow>> {
             self.last_by(tenant, symbols, at).await
         }
     }
@@ -293,12 +319,13 @@ mod tests {
         let hot_store_arc: Arc<dyn HotColumnStore> = Arc::new(hot_store.clone());
         let mock_sink = MockClickhouseSink::default();
         let target = mock_sink.target();
+        let clickhouse_client = Arc::new(ClickhouseHttpClient::new(ClickhouseConfig::default())?);
 
         let service = IngestService::new(
             metadata.clone(),
             wal,
             hot_store_arc,
-            Some((Arc::new(mock_sink.clone()), target.clone())),
+            Some((Arc::new(mock_sink.clone()), target.clone(), Arc::clone(&clickhouse_client))),
         );
 
         let now = std::time::SystemTime::now();

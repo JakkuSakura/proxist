@@ -5,9 +5,10 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -17,7 +18,7 @@ use axum::{
 };
 use ingest::IngestService;
 use proxist_api::{IngestBatchRequest, QueryRequest, QueryResponse, StatusResponse};
-use proxist_ch::{ClickhouseConfig, ClickhouseHttpSink, ClickhouseSink};
+use proxist_ch::{ClickhouseConfig, ClickhouseHttpClient, ClickhouseHttpSink, ClickhouseQueryRow, ClickhouseSink};
 use proxist_core::{
     metadata::ClusterMetadata, query::QueryOperation, MetadataStore, ShardAssignment, ShardHealth,
     ShardPersistenceTracker,
@@ -112,6 +113,9 @@ fn load_clickhouse_config() -> Option<ClickhouseConfig> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
+    let query_timeout_secs = std::env::var("PROXIST_CLICKHOUSE_QUERY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok());
 
     Some(ClickhouseConfig {
         endpoint,
@@ -123,6 +127,7 @@ fn load_clickhouse_config() -> Option<ClickhouseConfig> {
         timeout_secs,
         max_retries,
         retry_backoff_ms,
+        query_timeout_secs,
     })
 }
 
@@ -132,6 +137,43 @@ struct ProxistDaemon {
     metadata_store: SqliteMetadataStore,
     hot_store: Arc<dyn HotColumnStore>,
     ingest_service: Arc<IngestService>,
+    clickhouse_client: Option<Arc<ClickhouseHttpClient>>,
+}
+
+fn hot_row_to_query_row(row: proxist_mem::HotRow) -> proxist_api::QueryRow {
+    proxist_api::QueryRow {
+        symbol: row.symbol,
+        timestamp: row.timestamp,
+        payload: ByteBuf::from(row.payload),
+    }
+}
+
+fn clickhouse_row_to_query_row(row: ClickhouseQueryRow) -> anyhow::Result<proxist_api::QueryRow> {
+    let payload = BASE64_STANDARD
+        .decode(row.payload_base64.as_bytes())
+        .context("decode ClickHouse payload")?;
+    Ok(proxist_api::QueryRow {
+        symbol: row.symbol,
+        timestamp: micros_to_system_time(row.ts_micros),
+        payload: ByteBuf::from(payload),
+    })
+}
+
+fn system_time_to_micros(ts: SystemTime) -> i64 {
+    ts.duration_since(UNIX_EPOCH)
+        .map(|dur| dur.as_micros() as i64)
+        .unwrap_or_else(|err| {
+            let dur = err.duration();
+            -(dur.as_micros() as i64)
+        })
+}
+
+fn micros_to_system_time(micros: i64) -> SystemTime {
+    if micros >= 0 {
+        UNIX_EPOCH + Duration::from_micros(micros as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_micros((-micros) as u64)
+    }
 }
 
 impl ProxistDaemon {
@@ -151,31 +193,41 @@ impl ProxistDaemon {
             }
         };
 
-        let clickhouse_pair = config.clickhouse.clone().and_then(|cfg| {
-            ClickhouseHttpSink::new(cfg.clone())
-                .map(|sink| {
-                    let target = sink.target();
-                    (Arc::new(sink) as Arc<dyn ClickhouseSink>, target)
-                })
-                .map_err(|err| {
-                    tracing::error!(error = %err, "failed to initialize ClickHouse sink");
-                    err
-                })
-                .ok()
+        let clickhouse_bundle = config.clickhouse.clone().and_then(|cfg| {
+            let sink = ClickhouseHttpSink::new(cfg.clone())
+                .map(|sink| Arc::new(sink) as Arc<dyn ClickhouseSink>);
+            let client = ClickhouseHttpClient::new(cfg.clone())
+                .map(|client| Arc::new(client));
+            match (sink, client) {
+                (Ok(sink), Ok(client)) => {
+                    let target = client.target();
+                    Some((sink, target, client))
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    tracing::error!(error = %err, "failed to initialize ClickHouse components");
+                    None
+                }
+            }
+        });
+
+        let ingest_clickhouse = clickhouse_bundle.as_ref().map(|(sink, target, client)| {
+            (Arc::clone(sink), target.clone(), Arc::clone(client))
         });
 
         let ingest_service = Arc::new(IngestService::new(
             metadata_store.clone(),
             wal.clone(),
             hot_store.clone(),
-            clickhouse_pair.clone(),
+            ingest_clickhouse,
         ));
+        let clickhouse_client = clickhouse_bundle.map(|(_, _, client)| client);
         Ok(Self {
             config,
             metadata_cache: cache,
             metadata_store,
             hot_store,
             ingest_service,
+            clickhouse_client,
         })
     }
 
@@ -232,6 +284,7 @@ impl ProxistDaemon {
             metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
             hot_store: Arc<dyn HotColumnStore>,
             ingest: Arc<IngestService>,
+            clickhouse_client: Option<Arc<ClickhouseHttpClient>>,
         }
 
         let state = AppState {
@@ -239,6 +292,7 @@ impl ProxistDaemon {
             metadata_cache: Arc::clone(&self.metadata_cache),
             hot_store: Arc::clone(&self.hot_store),
             ingest: Arc::clone(&self.ingest_service),
+            clickhouse_client: self.clickhouse_client.clone(),
         };
 
         async fn status_handler(
@@ -286,66 +340,98 @@ impl ProxistDaemon {
             State(state): State<AppState>,
             Json(request): Json<QueryRequest>,
         ) -> Result<Json<QueryResponse>, AppError> {
-            let mut rows = match request.op {
-                QueryOperation::Range => {
-                    state
-                        .hot_store
-                        .scan_range(&request.tenant, &request.range, &request.symbols)
-                        .await?
-                }
-                QueryOperation::LastBy => {
-                    state
-                        .hot_store
-                        .last_by(&request.tenant, &request.symbols, request.range.end)
-                        .await?
-                }
-                QueryOperation::AsOf => {
-                    state
-                        .hot_store
-                        .asof(&request.tenant, &request.symbols, request.range.end)
-                        .await?
-                }
+            let hot_rows = match request.op {
+                QueryOperation::Range => state
+                    .hot_store
+                    .scan_range(&request.tenant, &request.range, &request.symbols)
+                    .await?,
+                QueryOperation::LastBy => state
+                    .hot_store
+                    .last_by(&request.tenant, &request.symbols, request.range.end)
+                    .await?,
+                QueryOperation::AsOf => state
+                    .hot_store
+                    .asof(&request.tenant, &request.symbols, request.range.end)
+                    .await?,
             };
 
-            if request.include_cold
-                && matches!(request.op, QueryOperation::LastBy | QueryOperation::AsOf)
-                && !request.symbols.is_empty()
-            {
-                let mut map: HashMap<String, proxist_mem::HotRow> = rows
-                    .into_iter()
-                    .map(|row| (row.symbol.clone(), row))
-                    .collect();
+            let mut query_rows: Vec<proxist_api::QueryRow> = hot_rows
+                .iter()
+                .map(|row| hot_row_to_query_row(row.clone()))
+                .collect();
 
-                let seam_rows = state
-                    .hot_store
-                    .seam_rows(&request.tenant, &request.range)
-                    .await?;
+            if request.include_cold {
+                if let (Some(client), Some(persisted_at)) = (
+                    &state.clickhouse_client,
+                    state.ingest.last_persisted_timestamp(),
+                ) {
+                    let end_limit_micros = std::cmp::min(
+                        system_time_to_micros(request.range.end),
+                        system_time_to_micros(persisted_at),
+                    );
+                    if request.op == QueryOperation::Range {
+                        if !request.symbols.is_empty() && end_limit_micros >= system_time_to_micros(request.range.start) {
+                            let ch_rows = client
+                                .fetch_range(
+                                    &request.tenant,
+                                    &request.symbols,
+                                    system_time_to_micros(request.range.start),
+                                    end_limit_micros,
+                                )
+                                .await?
+                                .into_iter()
+                                .map(clickhouse_row_to_query_row)
+                                .collect::<anyhow::Result<Vec<_>>>()?;
+                            query_rows.extend(ch_rows);
+                            query_rows.sort_by_key(|row| system_time_to_micros(row.timestamp));
+                        }
+                    } else {
+                        if !request.symbols.is_empty() {
+                            let mut map: HashMap<String, proxist_api::QueryRow> = query_rows
+                                .into_iter()
+                                .map(|row| (row.symbol.clone(), row))
+                                .collect();
 
-                for seam in seam_rows {
-                    if request.symbols.contains(&seam.symbol) && !map.contains_key(&seam.symbol) {
-                        map.insert(
-                            seam.symbol.clone(),
-                            proxist_mem::HotRow {
-                                symbol: seam.symbol.clone(),
-                                timestamp: seam.timestamp,
-                                payload: seam.payload,
-                            },
-                        );
+                            let ch_rows = client
+                                .fetch_last_by(&request.tenant, &request.symbols, end_limit_micros)
+                                .await?
+                                .into_iter()
+                                .map(clickhouse_row_to_query_row)
+                                .collect::<anyhow::Result<Vec<_>>>()?;
+
+                            for row in ch_rows {
+                                map.entry(row.symbol.clone()).or_insert(row);
+                            }
+
+                            // Seam fallback to bridge boundary
+                            if map.len() < request.symbols.len() {
+                                let seam_rows = state
+                                    .hot_store
+                                    .seam_rows(&request.tenant, &request.range)
+                                    .await?;
+                                for seam in seam_rows {
+                                    if request.symbols.contains(&seam.symbol)
+                                        && !map.contains_key(&seam.symbol)
+                                    {
+                                        map.insert(
+                                            seam.symbol.clone(),
+                                            proxist_api::QueryRow {
+                                                symbol: seam.symbol,
+                                                timestamp: seam.timestamp,
+                                                payload: ByteBuf::from(seam.payload),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+
+                            query_rows = map.into_values().collect();
+                        }
                     }
                 }
-
-                rows = map.into_values().collect();
             }
 
-            let encoded = rows
-                .into_iter()
-                .map(|row| proxist_api::QueryRow {
-                    symbol: row.symbol,
-                    timestamp: row.timestamp,
-                    payload: ByteBuf::from(row.payload),
-                })
-                .collect();
-            Ok(Json(QueryResponse { rows: encoded }))
+            Ok(Json(QueryResponse { rows: query_rows }))
         }
 
         async fn health_handler(
