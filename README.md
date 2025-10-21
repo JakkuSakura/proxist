@@ -54,10 +54,10 @@ Simple seam check:
 
 ```bash
 pxctl hot-summary --database proxist
-tenant  symbol  shard_id     memory_rows  memory_first_micros  memory_last_micros  durable_through_micros  wal_high_micros
-alpha   AAPL    alpha::AAPL  4            1704103200000000     1704103203000000    1704103203000000        1704103203000000
-alpha   MSFT    alpha::MSFT  2            1704103201000000     1704103204000000    1704103204000000        1704103204000000
-beta    GOOG    beta::GOOG   2            1704103203000000     1704103205000000    1704103205000000        1704103205000000
+group_key  entity_key  route_key     memory_rows  memory_first_micros  memory_last_micros  durable_through_micros  wal_high_micros
+alpha   AAPL        alpha::AAPL    4            1704103200000000     1704103203000000    1704103203000000        1704103203000000
+alpha   MSFT        alpha::MSFT    2            1704103201000000     1704103204000000    1704103204000000        1704103204000000
+beta    GOOG        beta::GOOG     2            1704103203000000     1704103205000000    1704103205000000        1704103205000000
 ```
 - Integration harness (`scripts/run_clickhouse_tests.sh`) launches ClickHouse with Docker Compose and runs `cargo test`.
 - Set `PROXIST_WAL_DIR` to enable disk-backed WAL persistence and replay; otherwise the daemon falls back to in-memory WALs for dev.

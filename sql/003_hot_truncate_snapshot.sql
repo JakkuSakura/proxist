@@ -12,7 +12,8 @@ GROUP BY tenant, symbol
 ORDER BY tenant, symbol
 FORMAT TSVWithNames;
 
-SELECT tenant, symbol, shard_id, memory_rows, memory_first_micros, memory_last_micros, durable_through_micros, wal_high_micros
+-- Surface proxist's ingest summary view with neutral column names.
+SELECT group_key, entity_key, route_key, memory_rows, memory_first_micros, memory_last_micros, durable_through_micros, wal_high_micros
 FROM proxist.__system_ingest_summary
-ORDER BY tenant, symbol
+ORDER BY group_key, entity_key
 FORMAT TSVWithNames;

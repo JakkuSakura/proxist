@@ -81,9 +81,9 @@ enum Commands {
     },
 }
 
-const INGEST_SUMMARY_SQL: &str = "SELECT tenant, symbol, shard_id, memory_rows, memory_first_micros, memory_last_micros, durable_through_micros, wal_high_micros \
+const INGEST_SUMMARY_SQL: &str = "SELECT group_key, entity_key, route_key, memory_rows, memory_first_micros, memory_last_micros, durable_through_micros, wal_high_micros \
 FROM proxist.__system_ingest_summary \
-ORDER BY tenant, symbol \
+ORDER BY group_key, entity_key \
 FORMAT TSVWithNames";
 
 fn main() -> anyhow::Result<()> {
@@ -311,9 +311,9 @@ fn micros_to_system_time(micros: i64) -> std::time::SystemTime {
 
 #[derive(Debug, Clone, Serialize)]
 struct IngestSummaryRow {
-    tenant: String,
-    symbol: String,
-    shard_id: Option<String>,
+    group_key: String,
+    entity_key: String,
+    route_key: Option<String>,
     memory_rows: u64,
     memory_first_micros: Option<i64>,
     memory_last_micros: Option<i64>,
@@ -354,9 +354,9 @@ fn parse_ingest_summary_tsv(text: &str) -> anyhow::Result<Vec<IngestSummaryRow>>
         .ok_or_else(|| anyhow!("summary response did not include a header row"))?;
     let headers: Vec<&str> = header_line.split('\t').collect();
     let expected_neutral = [
-        "tenant",
-        "symbol",
-        "shard_id",
+        "group_key",
+        "entity_key",
+        "route_key",
         "memory_rows",
         "memory_first_micros",
         "memory_last_micros",
@@ -404,9 +404,9 @@ fn parse_ingest_summary_tsv(text: &str) -> anyhow::Result<Vec<IngestSummaryRow>>
             );
         }
         rows.push(IngestSummaryRow {
-            tenant: columns[0].to_string(),
-            symbol: columns[1].to_string(),
-            shard_id: parse_string_value(columns[2]),
+            group_key: columns[0].to_string(),
+            entity_key: columns[1].to_string(),
+            route_key: parse_string_value(columns[2]),
             memory_rows: columns[3].parse::<u64>().map_err(|err| {
                 anyhow!(
                     "failed to parse summary row count value {:?}: {}",
@@ -450,9 +450,9 @@ fn parse_opt_i64(value: &str) -> anyhow::Result<Option<i64>> {
 
 fn render_ingest_summary_table(rows: &[IngestSummaryRow]) {
     let headers = [
-        "tenant",
-        "symbol",
-        "shard_id",
+        "group_key",
+        "entity_key",
+        "route_key",
         "memory_rows",
         "memory_first_micros",
         "memory_last_micros",
@@ -465,9 +465,9 @@ fn render_ingest_summary_table(rows: &[IngestSummaryRow]) {
         .iter()
         .map(|row| {
             [
-                row.tenant.clone(),
-                row.symbol.clone(),
-                row.shard_id.clone().unwrap_or_else(|| "-".into()),
+                row.group_key.clone(),
+                row.entity_key.clone(),
+                row.route_key.clone().unwrap_or_else(|| "-".into()),
                 row.memory_rows.to_string(),
                 format_opt_i64(row.memory_first_micros),
                 format_opt_i64(row.memory_last_micros),

@@ -314,6 +314,7 @@ fn match_system_summary_query(sql: &str) -> Option<SystemSummaryView> {
     }
 
     let normalized = lower.replace('"', "").replace('`', "");
+    info!(query = %lower, normalized = %normalized, "inspecting system summary query");
     if normalized.contains("system.proxist_hot_summary") {
         Some(SystemSummaryView::Legacy)
     } else if normalized.contains("system.proxist_ingest_summary")
@@ -349,6 +350,7 @@ fn render_system_summary(
     format: OutputFormat,
     view: SystemSummaryView,
 ) -> String {
+    info!(?view, row_count = rows.len(), "rendering system summary");
     let headers: [&str; 8] = match view {
         SystemSummaryView::Legacy => [
             "tenant",
@@ -361,9 +363,9 @@ fn render_system_summary(
             "wal_high_micros",
         ],
         SystemSummaryView::Neutral => [
-            "tenant",
-            "symbol",
-            "shard_id",
+            "group_key",
+            "entity_key",
+            "route_key",
             "memory_rows",
             "memory_first_micros",
             "memory_last_micros",
@@ -1253,5 +1255,28 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod system_summary_tests {
+    use super::*;
+
+    #[test]
+    fn neutral_alias_detects_ingest_summary() {
+        let sql = "SELECT group_key, entity_key FROM proxist.__system_ingest_summary";
+        match match_system_summary_query(sql) {
+            Some(SystemSummaryView::Neutral) => {}
+            other => panic!("expected neutral view, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn legacy_alias_detects_hot_summary() {
+        let sql = "SELECT * FROM system.proxist_hot_summary";
+        match match_system_summary_query(sql) {
+            Some(SystemSummaryView::Legacy) => {}
+            other => panic!("expected legacy view, got {:?}", other),
+        }
     }
 }

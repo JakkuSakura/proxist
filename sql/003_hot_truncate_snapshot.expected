@@ -2,7 +2,7 @@ tenant	symbol	total_rows	first_ts_micros	last_ts_micros
 alpha	AAPL	4	1704103200000000	1704103203000000
 alpha	MSFT	2	1704103201000000	1704103204000000
 beta	GOOG	2	1704103203000000	1704103205000000
-tenant	symbol	shard_id	memory_rows	memory_first_micros	memory_last_micros	durable_through_micros	wal_high_micros
+group_key	entity_key	route_key	memory_rows	memory_first_micros	memory_last_micros	durable_through_micros	wal_high_micros
 alpha	AAPL	alpha::AAPL	4	1704103200000000	1704103203000000	1704103203000000	1704103203000000
 alpha	MSFT	alpha::MSFT	2	1704103201000000	1704103204000000	1704103204000000	1704103204000000
 beta	GOOG	beta::GOOG	2	1704103203000000	1704103205000000	1704103205000000	1704103205000000
