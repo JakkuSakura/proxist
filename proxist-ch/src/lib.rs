@@ -277,6 +277,26 @@ impl ClickhouseHttpClient {
         Ok(rows)
     }
 
+    pub async fn execute_raw(&self, sql: &str) -> anyhow::Result<String> {
+        let mut request = self.client.post(self.url()).body(sql.to_string());
+        if let Some(username) = &self.config.username {
+            request = request.basic_auth(username, self.config.password.as_ref());
+        }
+        let response = request.send().await.context("send raw ClickHouse query")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unavailable>".into());
+            anyhow::bail!("clickhouse query failed: status={} body={}", status, body);
+        }
+        response
+            .text()
+            .await
+            .context("read raw ClickHouse query response")
+    }
+
     pub async fn fetch_last_by(
         &self,
         tenant: &str,

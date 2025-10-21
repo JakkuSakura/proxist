@@ -10,16 +10,16 @@ CLICKHOUSE_HTTP="http://127.0.0.1:18123"
 TABLE_NAME="ticks"
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "docker is required to run the SQL tests." >&2
+  echo "docker is required to run benchmarks." >&2
   exit 1
 fi
 
 if ! command -v clickhouse-client >/dev/null 2>&1; then
-  echo "clickhouse-client must be installed to run the SQL tests." >&2
+  echo "clickhouse-client must be installed to run benchmarks." >&2
   exit 1
 fi
 
-echo "Starting ClickHouse via docker compose..."
+echo "Starting ClickHouse for benchmarks..."
 "${COMPOSE_CMD[@]}" up -d clickhouse >/dev/null
 
 METADATA_DB="$(mktemp)"
@@ -38,12 +38,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Waiting for ClickHouse to become ready..."
 until "${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "SELECT 1" >/dev/null 2>&1; do
   sleep 1
 done
 
-echo "Starting proxistd..."
+echo "Starting proxistd (release build) for benchmarks..."
 (
   cd "${ROOT_DIR}" && \
   PROXIST_METADATA_SQLITE_PATH="${METADATA_DB}" \
@@ -51,7 +50,7 @@ echo "Starting proxistd..."
   PROXIST_CLICKHOUSE_ENDPOINT="${CLICKHOUSE_HTTP}" \
   PROXIST_CLICKHOUSE_DATABASE="proxist" \
   PROXIST_CLICKHOUSE_TABLE="${TABLE_NAME}" \
-  cargo run --quiet --bin proxistd
+  cargo run --quiet --release --bin proxistd
 ) >"${PROXIST_LOG}" 2>&1 &
 PROXIST_PID=$!
 
@@ -72,39 +71,23 @@ for _ in {1..60}; do
   fi
 done
 
-echo "proxistd is ready."
+echo "Preparing benchmark dataset through proxist..."
+SETUP_SQL="
+DROP TABLE IF EXISTS ticks;
+CREATE TABLE ticks (
+    tenant String,
+    shard_id String,
+    symbol String,
+    ts_micros Int64,
+    payload_base64 String,
+    seq UInt64
+) ENGINE = MergeTree ORDER BY (tenant, symbol, ts_micros);
+INSERT INTO ticks SELECT 'alpha', 'alpha-shard', concat('SYM', toString(number % 10)), toUnixTimestamp64Micro(toDateTime64('2024-01-01 09:30:00', 6) + number * 0.000001), toString(number), number FROM numbers(500000);
+"
 
-STATUS=0
-TMP_OUTPUT="$(mktemp)"
-CLIENT_CMD=(clickhouse-client --protocol http --host 127.0.0.1 --port "${PROXIST_PORT}" --database proxist --send_logs_level=none)
+clickhouse-client --protocol http --host 127.0.0.1 --port "${PROXIST_PORT}" --database proxist --send_logs_level=none --multiquery <<<"${SETUP_SQL}" >/dev/null
 
-for sql_file in "${ROOT_DIR}"/sql/*.sql; do
-  [[ -e "$sql_file" ]] || continue
-  base="$(basename "${sql_file}" .sql)"
-  expected_file="${ROOT_DIR}/sql/${base}.expected"
+QUERY="SELECT symbol, count(), any(seq) FROM ticks GROUP BY symbol"
 
-  echo "Executing SQL script: ${base}"
-  if ! "${CLIENT_CMD[@]}" --multiquery <"${sql_file}" \
-    | tr -d '\r' \
-    | awk '{ if ($0 == "Ok." || $0 == "") next; print $0 }' >"${TMP_OUTPUT}"; then
-    echo "  ❌ execution failed for ${sql_file}" >&2
-    STATUS=1
-    continue
-  fi
-
-  if [[ -f "${expected_file}" ]]; then
-    if ! diff -u "${expected_file}" "${TMP_OUTPUT}"; then
-      echo "  ❌ output mismatch for ${base}" >&2
-      STATUS=1
-    else
-      echo "  ✅ output matches expected results"
-    fi
-  else
-    echo "  ⚠️  no expected file for ${base}; raw output:"
-    cat "${TMP_OUTPUT}"
-  fi
-
-done
-
-rm -f "${TMP_OUTPUT}"
-exit "${STATUS}"
+echo "Running clickhouse benchmark via proxist (5 iterations)..."
+clickhouse benchmark --protocol http --host 127.0.0.1 --port "${PROXIST_PORT}" --database proxist --query "${QUERY}" --iterations 5

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 
 use anyhow::bail;
 use clap::{Parser, Subcommand};
@@ -60,6 +61,15 @@ enum Commands {
     Ingest {
         #[arg(long)]
         file: String,
+    },
+    /// Execute raw SQL via proxist's ClickHouse-compatible endpoint.
+    Sql {
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long, default_value = "proxist")]
+        database: String,
     },
 }
 
@@ -200,6 +210,30 @@ fn main() -> anyhow::Result<()> {
                     .error_for_status()?;
                 Ok::<(), anyhow::Error>(())
             })?;
+        }
+        Commands::Sql {
+            file,
+            query,
+            database,
+        } => {
+            let sql = match (file, query) {
+                (Some(path), None) => fs::read_to_string(&path)?,
+                (None, Some(q)) => q,
+                (Some(_), Some(_)) => bail!("specify either --file or --query, not both"),
+                (None, None) => bail!("either --file or --query must be provided"),
+            };
+
+            let url = format!("{}/?database={}", endpoint, database);
+            let response_text = rt.block_on(async {
+                let response = apply_auth(client.post(&url).body(sql), token.as_deref())
+                    .header("Content-Type", "text/plain")
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                Ok::<String, anyhow::Error>(response.text().await?)
+            })?;
+
+            print!("{}", response_text);
         }
     }
 

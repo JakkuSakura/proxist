@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use async_trait::async_trait;
 use proxist_core::metadata::{
     ClusterMetadata, MetadataStore, ShardAssignment, ShardHealth, TenantId,
 };
@@ -64,6 +65,14 @@ impl SqliteMetadataStore {
             sqlx::query(stmt).execute(&self.pool).await?;
         }
         Ok(())
+    }
+
+    fn encode_timestamp(ts: Option<SystemTime>) -> Option<i64> {
+        ts.and_then(|time| {
+            time.duration_since(UNIX_EPOCH)
+                .map(|dur| dur.as_micros() as i64)
+                .ok()
+        })
     }
 }
 

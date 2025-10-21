@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::State,
     http::{header, Request, StatusCode},
     middleware::{self, Next},
@@ -18,10 +18,11 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use chrono::NaiveDateTime;
 use ingest::IngestService;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use proxist_api::{
-    DiagnosticsBundle, IngestBatchRequest, QueryRequest, QueryResponse, StatusResponse,
+    DiagnosticsBundle, IngestBatchRequest, IngestTick, QueryRequest, QueryResponse, StatusResponse,
     SymbolDictionarySpec,
 };
 use proxist_ch::{
@@ -36,6 +37,11 @@ use proxist_metadata_sqlite::SqliteMetadataStore;
 use proxist_wal::{FileWal, InMemoryWal, WalConfig, WalRecord, WalWriter};
 use serde_bytes::ByteBuf;
 use serde_json::json;
+use sqlparser::{
+    ast::{Expr, FunctionArg, FunctionArgExpr, Ident, SetExpr, Statement, Value},
+    dialect::ClickHouseDialect,
+    parser::Parser,
+};
 use tokio::signal;
 use tracing::{error, info, instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -171,12 +177,198 @@ struct ProxistDaemon {
     metrics_handle: Option<PrometheusHandle>,
 }
 
+#[derive(Clone)]
+struct AppState {
+    metadata: SqliteMetadataStore,
+    metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
+    hot_store: Arc<dyn HotColumnStore>,
+    ingest: Arc<IngestService>,
+    metrics: Option<PrometheusHandle>,
+    api_token: Option<String>,
+}
+
 fn hot_row_to_query_row(row: proxist_mem::HotRow) -> proxist_api::QueryRow {
     proxist_api::QueryRow {
         symbol: row.symbol,
         timestamp: row.timestamp,
         payload: ByteBuf::from(row.payload),
     }
+}
+
+fn split_sql_statements(input: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_char: Option<char> = None;
+
+    for ch in input.chars() {
+        match ch {
+            '\'' if !in_double && !matches!(prev_char, Some('\\')) => {
+                in_single = !in_single;
+                current.push(ch);
+            }
+            '"' if !in_single && !matches!(prev_char, Some('\\')) => {
+                in_double = !in_double;
+                current.push(ch);
+            }
+            ';' if !in_single && !in_double => {
+                if !current.trim().is_empty() {
+                    statements.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+        prev_char = Some(ch);
+    }
+
+    if !current.trim().is_empty() {
+        statements.push(current.trim().to_string());
+    }
+
+    statements
+}
+
+async fn forward_sql_to_clickhouse(state: &AppState, sql: &str) -> Result<String, AppError> {
+    let client = state
+        .ingest
+        .clickhouse_client()
+        .ok_or_else(|| AppError(anyhow!("ClickHouse client not configured")))?;
+    let text = client.execute_raw(sql).await?;
+    Ok(text)
+}
+
+fn build_ingest_ticks(
+    columns: &[Ident],
+    values: sqlparser::ast::Values,
+    seq_counter: &mut u64,
+) -> anyhow::Result<Vec<IngestTick>> {
+    let column_names: Vec<String> = if columns.is_empty() {
+        vec!["tenant", "symbol", "ts", "seq"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    } else {
+        columns
+            .iter()
+            .map(|c| c.value.to_lowercase())
+            .collect()
+    };
+
+    let mut ticks = Vec::new();
+    for row in values.rows {
+        if row.len() != column_names.len() {
+            anyhow::bail!(
+                "column/value count mismatch: expected {} values, got {}",
+                column_names.len(),
+                row.len()
+            );
+        }
+
+        let mut tenant: Option<String> = None;
+        let mut symbol: Option<String> = None;
+        let mut timestamp: Option<SystemTime> = None;
+        let mut seq: Option<u64> = None;
+
+        for (col, expr) in column_names.iter().zip(row.iter()) {
+            match col.as_str() {
+                "tenant" => tenant = Some(expr_to_string(expr)?),
+                "symbol" => symbol = Some(expr_to_string(expr)?),
+                "ts" | "timestamp" => timestamp = Some(expr_to_timestamp(expr)?),
+                "ts_micros" => timestamp = Some(expr_to_timestamp(expr)?),
+                "seq" => seq = Some(expr_to_u64(expr)?),
+                other => anyhow::bail!("unsupported column in INSERT: {other}"),
+            }
+        }
+
+        let tenant = tenant.ok_or_else(|| anyhow!("tenant column required"))?;
+        let symbol = symbol.ok_or_else(|| anyhow!("symbol column required"))?;
+        let timestamp = timestamp.ok_or_else(|| anyhow!("timestamp column required"))?;
+        let seq = seq.unwrap_or_else(|| {
+            let current = *seq_counter;
+            *seq_counter += 1;
+            current
+        });
+
+        ticks.push(IngestTick {
+            tenant,
+            symbol,
+            timestamp,
+            payload: ByteBuf::from(Vec::new()),
+            seq,
+        });
+    }
+
+    Ok(ticks)
+}
+
+fn expr_to_string(expr: &Expr) -> anyhow::Result<String> {
+    match expr {
+        Expr::Value(Value::SingleQuotedString(s)) => Ok(s.clone()),
+        Expr::Identifier(ident) => Ok(ident.value.clone()),
+        _ => Err(anyhow!("expected string literal")),
+    }
+}
+
+fn expr_to_u64(expr: &Expr) -> anyhow::Result<u64> {
+    match expr {
+        Expr::Value(Value::Number(num, _)) => num
+            .parse::<u64>()
+            .map_err(|err| anyhow!("invalid integer literal: {err}")),
+        _ => Err(anyhow!("expected numeric literal for seq")),
+    }
+}
+
+fn expr_to_timestamp(expr: &Expr) -> anyhow::Result<SystemTime> {
+    match expr {
+        Expr::Function(func) => {
+            let name = func.name.to_string().to_lowercase();
+            if name == "todatetime64" || name == "todatetime" {
+                if func.args.is_empty() {
+                    anyhow::bail!("toDateTime requires arguments");
+                }
+                let first = match &func.args[0] {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => inner,
+                    _ => anyhow::bail!("unsupported function argument"),
+                };
+                let text = expr_to_string(first)?;
+                parse_datetime_string(&text)
+            } else {
+                anyhow::bail!("unsupported function {name}")
+            }
+        }
+        Expr::Value(Value::SingleQuotedString(text)) => parse_datetime_string(text),
+        Expr::Value(Value::Number(num, _)) => {
+            let micros: i64 = num
+                .parse()
+                .map_err(|err| anyhow!("invalid microsecond value: {err}"))?;
+            if micros >= 0 {
+                Ok(SystemTime::UNIX_EPOCH + Duration::from_micros(micros as u64))
+            } else {
+                Ok(SystemTime::UNIX_EPOCH - Duration::from_micros((-micros) as u64))
+            }
+        }
+        _ => Err(anyhow!("unsupported timestamp expression")),
+    }
+}
+
+fn parse_datetime_string(text: &str) -> anyhow::Result<SystemTime> {
+    let naive = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S"))
+        .map_err(|err| anyhow!("failed to parse datetime: {err}"))?;
+    let datetime: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc);
+    let seconds = datetime.timestamp();
+    let nanos = datetime.timestamp_subsec_nanos();
+    if seconds < 0 {
+        anyhow::bail!("timestamps before UNIX epoch are not supported")
+    }
+    Ok(SystemTime::UNIX_EPOCH
+        + Duration::from_secs(seconds as u64)
+        + Duration::from_nanos(nanos as u64))
 }
 
 fn query_operation_label(op: &QueryOperation) -> &'static str {
@@ -321,16 +513,6 @@ impl ProxistDaemon {
     }
 
     async fn serve_http(&self) -> anyhow::Result<()> {
-        #[derive(Clone)]
-        struct AppState {
-            metadata: SqliteMetadataStore,
-            metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
-            hot_store: Arc<dyn HotColumnStore>,
-            ingest: Arc<IngestService>,
-            metrics: Option<PrometheusHandle>,
-            api_token: Option<String>,
-        }
-
         let state = AppState {
             metadata: self.metadata_store.clone(),
             metadata_cache: Arc::clone(&self.metadata_cache),
@@ -435,6 +617,75 @@ impl ProxistDaemon {
                 metrics,
             };
             Ok(Json(bundle))
+        }
+
+        async fn clickhouse_sql_handler(
+            State(state): State<AppState>,
+            body: Bytes,
+        ) -> Result<Response, AppError> {
+            let sql_text = String::from_utf8(body.to_vec())?.trim().to_string();
+            if sql_text.is_empty() {
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/plain; charset=UTF-8")
+                    .body(Body::from(String::new()))
+                    .unwrap());
+            }
+
+            let dialect = ClickHouseDialect {};
+            let mut outputs = Vec::new();
+            let mut seq_counter: u64 = 0;
+
+            for stmt_text in split_sql_statements(&sql_text) {
+                let parsed = Parser::parse_sql(&dialect, &stmt_text)
+                    .map_err(|err| AppError(anyhow!("failed to parse SQL: {err}")))?;
+                if parsed.is_empty() {
+                    continue;
+                }
+                if parsed.len() != 1 {
+                    return Err(AppError(anyhow!(
+                        "multiple statements detected; please separate with semicolons"
+                    )));
+                }
+
+                match parsed.into_iter().next().unwrap() {
+                    Statement::Insert { columns, source, .. } => {
+                        if let Some(query) = source {
+                            match *query.body {
+                                SetExpr::Values(values) => {
+                                    let ticks =
+                                        build_ingest_ticks(&columns, values, &mut seq_counter)?;
+                                    if !ticks.is_empty() {
+                                        state
+                                            .ingest
+                                            .ingest(IngestBatchRequest { ticks })
+                                            .await?;
+                                    }
+                                    outputs.push("Ok.\n".to_string());
+                                }
+                                _ => {
+                                    let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                                    outputs.push(raw);
+                                }
+                            }
+                        } else {
+                            let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                            outputs.push(raw);
+                        }
+                    }
+                    _ => {
+                        let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                        outputs.push(raw);
+                    }
+                }
+            }
+
+            let body = outputs.join("");
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/plain; charset=UTF-8")
+                .body(Body::from(body))
+                .unwrap())
         }
 
         async fn auth_middleware(
@@ -658,6 +909,7 @@ impl ProxistDaemon {
         let auth_token = state.api_token.clone();
 
         let app = Router::new()
+            .route("/", post(clickhouse_sql_handler))
             .route("/status", get(status_handler))
             .route("/ingest", post(ingest_handler))
             .route("/query", post(query_handler))
