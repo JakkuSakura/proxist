@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use clap::{Parser, Subcommand};
 use proxist_api::{
     ControlCommand, DiagnosticsBundle, IngestBatchRequest, QueryRequest, QueryResponse,
@@ -12,6 +12,7 @@ use proxist_core::{
     query::{QueryOperation, QueryRange},
 };
 use reqwest::{Client, RequestBuilder};
+use serde::Serialize;
 use tokio::runtime::Runtime;
 use tracing::info;
 
@@ -71,7 +72,19 @@ enum Commands {
         #[arg(long, default_value = "proxist")]
         database: String,
     },
+    /// Display proxist's hot vs cold seam summary.
+    HotSummary {
+        #[arg(long, default_value = "proxist")]
+        database: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
+
+const HOT_SUMMARY_SQL: &str = "SELECT tenant, symbol, shard_id, hot_rows, hot_first_micros, hot_last_micros, persisted_through_micros, wal_high_micros \
+FROM system.proxist_hot_summary \
+ORDER BY tenant, symbol \
+FORMAT TSVWithNames";
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -223,17 +236,27 @@ fn main() -> anyhow::Result<()> {
                 (None, None) => bail!("either --file or --query must be provided"),
             };
 
-            let url = format!("{}/?database={}", endpoint, database);
-            let response_text = rt.block_on(async {
-                let response = apply_auth(client.post(&url).body(sql), token.as_deref())
-                    .header("Content-Type", "text/plain")
-                    .send()
-                    .await?
-                    .error_for_status()?;
-                Ok::<String, anyhow::Error>(response.text().await?)
-            })?;
-
+            let response_text =
+                execute_sql(&rt, &client, &endpoint, &database, token.as_deref(), &sql)?;
             print!("{}", response_text);
+        }
+        Commands::HotSummary { database, json } => {
+            let response_text = execute_sql(
+                &rt,
+                &client,
+                &endpoint,
+                &database,
+                token.as_deref(),
+                HOT_SUMMARY_SQL,
+            )?;
+            let rows = parse_hot_summary_tsv(&response_text)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if rows.is_empty() {
+                println!("No hot rows tracked.");
+            } else {
+                render_hot_summary_table(&rows);
+            }
         }
     }
 
@@ -284,6 +307,187 @@ fn micros_to_system_time(micros: i64) -> std::time::SystemTime {
     } else {
         std::time::UNIX_EPOCH - std::time::Duration::from_micros((-micros) as u64)
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HotSummaryRow {
+    tenant: String,
+    symbol: String,
+    shard_id: Option<String>,
+    hot_rows: u64,
+    hot_first_micros: Option<i64>,
+    hot_last_micros: Option<i64>,
+    persisted_through_micros: Option<i64>,
+    wal_high_micros: Option<i64>,
+}
+
+fn execute_sql(
+    rt: &Runtime,
+    client: &Client,
+    endpoint: &str,
+    database: &str,
+    token: Option<&str>,
+    sql: &str,
+) -> anyhow::Result<String> {
+    let url = format!("{}/?database={}", endpoint, database);
+    let payload = sql.to_owned();
+    let response_text = rt.block_on(async {
+        let response = apply_auth(
+            client
+                .post(&url)
+                .body(payload)
+                .header("Content-Type", "text/plain"),
+            token,
+        )
+        .send()
+        .await?
+        .error_for_status()?;
+        Ok::<String, anyhow::Error>(response.text().await?)
+    })?;
+    Ok(response_text)
+}
+
+fn parse_hot_summary_tsv(text: &str) -> anyhow::Result<Vec<HotSummaryRow>> {
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let header_line = lines
+        .next()
+        .ok_or_else(|| anyhow!("hot summary response did not include a header row"))?;
+    let headers: Vec<&str> = header_line.split('\t').collect();
+    let expected = [
+        "tenant",
+        "symbol",
+        "shard_id",
+        "hot_rows",
+        "hot_first_micros",
+        "hot_last_micros",
+        "persisted_through_micros",
+        "wal_high_micros",
+    ];
+    if headers.as_slice() != expected.as_slice() {
+        bail!(
+            "unexpected hot summary header {:?}; expected {:?}",
+            headers,
+            expected
+        );
+    }
+
+    let mut rows = Vec::new();
+    for line in lines {
+        let columns: Vec<&str> = line.split('\t').collect();
+        if columns.len() != expected.len() {
+            bail!(
+                "expected {} columns in hot summary row, got {}: {}",
+                expected.len(),
+                columns.len(),
+                line
+            );
+        }
+        rows.push(HotSummaryRow {
+            tenant: columns[0].to_string(),
+            symbol: columns[1].to_string(),
+            shard_id: parse_string_value(columns[2]),
+            hot_rows: columns[3].parse::<u64>().map_err(|err| {
+                anyhow!("failed to parse hot_rows value {:?}: {}", columns[3], err)
+            })?,
+            hot_first_micros: parse_opt_i64(columns[4])?,
+            hot_last_micros: parse_opt_i64(columns[5])?,
+            persisted_through_micros: parse_opt_i64(columns[6])?,
+            wal_high_micros: parse_opt_i64(columns[7])?,
+        });
+    }
+
+    Ok(rows)
+}
+
+fn parse_string_value(value: &str) -> Option<String> {
+    if value == "\\N" || value.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn parse_opt_i64(value: &str) -> anyhow::Result<Option<i64>> {
+    if value == "\\N" || value.eq_ignore_ascii_case("null") {
+        Ok(None)
+    } else {
+        Ok(Some(value.parse::<i64>().map_err(|err| {
+            anyhow!("failed to parse integer {value:?}: {err}")
+        })?))
+    }
+}
+
+fn render_hot_summary_table(rows: &[HotSummaryRow]) {
+    let headers = [
+        "tenant",
+        "symbol",
+        "shard_id",
+        "hot_rows",
+        "hot_first_micros",
+        "hot_last_micros",
+        "persisted_through_micros",
+        "wal_high_micros",
+    ];
+    let align_right = [false, false, false, true, true, true, true, true];
+
+    let formatted_rows: Vec<[String; 8]> = rows
+        .iter()
+        .map(|row| {
+            [
+                row.tenant.clone(),
+                row.symbol.clone(),
+                row.shard_id.clone().unwrap_or_else(|| "-".into()),
+                row.hot_rows.to_string(),
+                format_opt_i64(row.hot_first_micros),
+                format_opt_i64(row.hot_last_micros),
+                format_opt_i64(row.persisted_through_micros),
+                format_opt_i64(row.wal_high_micros),
+            ]
+        })
+        .collect();
+
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in &formatted_rows {
+        for (idx, value) in row.iter().enumerate() {
+            widths[idx] = widths[idx].max(value.len());
+        }
+    }
+
+    let header_line = headers
+        .iter()
+        .enumerate()
+        .map(|(idx, header)| {
+            if align_right[idx] {
+                format!("{:>width$}", header, width = widths[idx])
+            } else {
+                format!("{:<width$}", header, width = widths[idx])
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("{}", header_line);
+
+    for row in formatted_rows {
+        let line = row
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| {
+                if align_right[idx] {
+                    format!("{:>width$}", value, width = widths[idx])
+                } else {
+                    format!("{:<width$}", value, width = widths[idx])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        println!("{}", line);
+    }
+}
+
+fn format_opt_i64(value: Option<i64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn fetch_status(
