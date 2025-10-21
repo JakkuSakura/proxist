@@ -41,6 +41,15 @@ pub struct HotRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct HotSymbolSummary {
+    pub tenant: TenantId,
+    pub symbol: String,
+    pub rows: u64,
+    pub first_timestamp: Option<SystemTime>,
+    pub last_timestamp: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
 struct Row {
     timestamp: SystemTime,
     micros: i64,
@@ -117,6 +126,8 @@ pub trait HotColumnStore: Send + Sync {
         symbols: &[String],
         at: SystemTime,
     ) -> anyhow::Result<Vec<HotRow>>;
+
+    async fn hot_summary(&self) -> anyhow::Result<Vec<HotSymbolSummary>>;
 }
 
 #[async_trait]
@@ -325,6 +336,39 @@ impl HotColumnStore for InMemoryHotColumnStore {
     ) -> anyhow::Result<Vec<HotRow>> {
         // For hot data, ASOF behaves like last_by on the requested timestamp.
         self.last_by(tenant, symbols, at).await
+    }
+
+    async fn hot_summary(&self) -> anyhow::Result<Vec<HotSymbolSummary>> {
+        let guard = self.inner.read().await;
+        let mut summaries = Vec::new();
+
+        for (tenant, tenant_store) in guard.iter() {
+            for (symbol, symbol_store) in tenant_store.symbols.iter() {
+                if symbol_store.rows.is_empty() {
+                    summaries.push(HotSymbolSummary {
+                        tenant: tenant.clone(),
+                        symbol: symbol.clone(),
+                        rows: 0,
+                        first_timestamp: None,
+                        last_timestamp: None,
+                    });
+                    continue;
+                }
+
+                let first = symbol_store.rows.first().map(|row| row.timestamp);
+                let last = symbol_store.rows.last().map(|row| row.timestamp);
+
+                summaries.push(HotSymbolSummary {
+                    tenant: tenant.clone(),
+                    symbol: symbol.clone(),
+                    rows: symbol_store.rows.len() as u64,
+                    first_timestamp: first,
+                    last_timestamp: last,
+                });
+            }
+        }
+
+        Ok(summaries)
     }
 }
 

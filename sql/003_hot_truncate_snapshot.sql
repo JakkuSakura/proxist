@@ -1,38 +1,19 @@
--- Reset tables
-DROP TABLE IF EXISTS proxist.hot_ticks;
-DROP TABLE IF EXISTS proxist.ticks_persist;
+-- Append a few more ticks through proxist to exercise the hot seam.
+INSERT INTO ticks (tenant, shard_id, symbol, ts, seq) VALUES
+('alpha', 'alpha-shard', 'AAPL', toDateTime64('2024-01-01 10:00:02', 6), 3),
+('alpha', 'alpha-shard', 'AAPL', toDateTime64('2024-01-01 10:00:03', 6), 4),
+('alpha', 'alpha-shard', 'MSFT', toDateTime64('2024-01-01 10:00:04', 6), 5),
+('beta', 'beta-shard', 'GOOG', toDateTime64('2024-01-01 10:00:05', 6), 2);
 
-CREATE TABLE proxist.hot_ticks
-(
-    tenant String,
-    symbol String,
-    ts DateTime64(6),
-    px Float64
-) ENGINE = Memory;
+-- Show the merged ticks view proxist serves back.
+SELECT tenant, symbol, count() AS total_rows, min(ts_micros) AS first_ts_micros, max(ts_micros) AS last_ts_micros
+FROM ticks
+GROUP BY tenant, symbol
+ORDER BY tenant, symbol
+FORMAT TSVWithNames;
 
-CREATE TABLE proxist.ticks_persist
-(
-    tenant String,
-    symbol String,
-    ts DateTime64(6),
-    px Float64
-) ENGINE = MergeTree
-ORDER BY (tenant, symbol, ts);
-
--- Seed and persist
-INSERT INTO proxist.hot_ticks VALUES ('alpha', 'AAPL', toDateTime64('2024-01-01 09:30:00', 6), 100.00);
-INSERT INTO proxist.hot_ticks VALUES ('alpha', 'AAPL', toDateTime64('2024-01-01 09:30:01', 6), 100.50);
-INSERT INTO proxist.hot_ticks VALUES ('alpha', 'MSFT', toDateTime64('2024-01-01 09:30:02', 6), 99.75);
-
-INSERT INTO proxist.ticks_persist SELECT * FROM proxist.hot_ticks;
-
--- Clear the hot cache to simulate snapshot rollover
-TRUNCATE TABLE proxist.hot_ticks;
-
-SELECT 'hot' AS layer, count() AS rows
-FROM proxist.hot_ticks
-UNION ALL
-SELECT 'persisted' AS layer, count() AS rows
-FROM proxist.ticks_persist
-ORDER BY layer
+-- Surface proxist's notion of what remains hot versus what has flushed cold.
+SELECT tenant, symbol, shard_id, hot_rows, hot_first_micros, hot_last_micros, persisted_through_micros, wal_high_micros
+FROM system.proxist_hot_summary
+ORDER BY tenant, symbol
 FORMAT TSVWithNames;

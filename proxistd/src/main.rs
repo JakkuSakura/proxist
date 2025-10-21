@@ -19,7 +19,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::NaiveDateTime;
-use ingest::IngestService;
+use ingest::{HotColdSummaryRow, IngestService};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use proxist_api::{
     DiagnosticsBundle, IngestBatchRequest, IngestTick, QueryRequest, QueryResponse, StatusResponse,
@@ -264,6 +264,106 @@ fn ensure_engine_clause(sql: &str, engine: &str) -> String {
         } else {
             format!("{} ENGINE = {}", base, engine)
         }
+    }
+}
+
+fn strip_leading_sql_comments(mut sql: &str) -> &str {
+    loop {
+        let trimmed = sql.trim_start();
+        if trimmed.is_empty() {
+            return trimmed;
+        }
+        if trimmed.starts_with("--") {
+            if let Some(line_end) = trimmed.find('\n') {
+                sql = &trimmed[line_end + 1..];
+                continue;
+            } else {
+                return "";
+            }
+        }
+        if trimmed.starts_with("/*") {
+            if let Some(end_idx) = trimmed.find("*/") {
+                sql = &trimmed[end_idx + 2..];
+                continue;
+            } else {
+                return "";
+            }
+        }
+        return trimmed;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Default,
+    TabSeparated,
+    TabSeparatedWithNames,
+}
+
+fn is_hot_summary_query(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("select") {
+        return false;
+    }
+    lower.contains("system.proxist_hot_summary")
+}
+
+fn detect_output_format(sql: &str) -> OutputFormat {
+    let lower = sql.to_ascii_lowercase();
+    if let Some(idx) = lower.rfind("format") {
+        let mut remainder = sql[idx + "format".len()..].trim_start();
+        if let Some(semicolon_idx) = remainder.find(';') {
+            remainder = &remainder[..semicolon_idx];
+        }
+        if let Some(token) = remainder.split_whitespace().find(|part| !part.is_empty()) {
+            let upper = token.to_ascii_uppercase();
+            return match upper.as_str() {
+                "TSVWITHNAMES" | "TABSEPARATEDWITHNAMES" => OutputFormat::TabSeparatedWithNames,
+                "TSV" | "TABSEPARATED" => OutputFormat::TabSeparated,
+                _ => OutputFormat::Default,
+            };
+        }
+    }
+    OutputFormat::Default
+}
+
+fn render_hot_summary(rows: &[HotColdSummaryRow], format: OutputFormat) -> String {
+    let mut output = String::new();
+    if matches!(format, OutputFormat::TabSeparatedWithNames) {
+        output.push_str("tenant\tsymbol\tshard_id\thot_rows\thot_first_micros\thot_last_micros\tpersisted_through_micros\twal_high_micros\n");
+    }
+
+    for row in rows {
+        output.push_str(&row.tenant);
+        output.push('\t');
+        output.push_str(&row.symbol);
+        output.push('\t');
+        if let Some(shard) = &row.shard_id {
+            output.push_str(shard);
+        } else {
+            output.push_str("\\N");
+        }
+        output.push('\t');
+        output.push_str(&row.hot_rows.to_string());
+        output.push('\t');
+        push_opt_micros(&mut output, row.hot_first);
+        output.push('\t');
+        push_opt_micros(&mut output, row.hot_last);
+        output.push('\t');
+        push_opt_micros(&mut output, row.persisted_through);
+        output.push('\t');
+        push_opt_micros(&mut output, row.wal_high);
+        output.push('\n');
+    }
+
+    output
+}
+
+fn push_opt_micros(buf: &mut String, value: Option<SystemTime>) {
+    match value {
+        Some(ts) => buf.push_str(&system_time_to_micros(ts).to_string()),
+        None => buf.push_str("\\N"),
     }
 }
 
@@ -696,21 +796,25 @@ impl ProxistDaemon {
                 .map(|t| t.to_ascii_lowercase());
 
             for stmt_text in split_sql_statements(&sql_text) {
-                let trimmed = stmt_text.trim_start();
-                if trimmed.to_ascii_lowercase().starts_with("create") {
-                    let mut parsed = Parser::parse_sql(&dialect, &stmt_text)
+                let normalized = strip_leading_sql_comments(&stmt_text);
+                if normalized.is_empty() {
+                    continue;
+                }
+
+                if normalized.to_ascii_lowercase().starts_with("create") {
+                    let mut parsed = Parser::parse_sql(&dialect, normalized)
                         .map_err(|err| AppError(anyhow!("failed to parse SQL: {err}")))?;
                     if parsed.is_empty() {
                         continue;
                     }
                     if parsed.len() != 1 {
-                        let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                        let raw = forward_sql_to_clickhouse(&state, normalized).await?;
                         outputs.push(raw);
                         continue;
                     }
                     let mut stmt = parsed.remove(0);
                     if let Statement::CreateTable { engine, .. } = &mut stmt {
-                        let mut forwarded = stmt_text.to_string();
+                        let mut forwarded = normalized.to_string();
                         if let Some(e) = engine {
                             if e.eq_ignore_ascii_case("mixedmergetree") {
                                 forwarded =
@@ -723,18 +827,25 @@ impl ProxistDaemon {
                         outputs.push(raw);
                         continue;
                     }
-                    let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                    let raw = forward_sql_to_clickhouse(&state, normalized).await?;
                     outputs.push(raw);
                     continue;
                 }
 
-                if !trimmed.to_ascii_lowercase().starts_with("insert") {
-                    let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                if !normalized.to_ascii_lowercase().starts_with("insert") {
+                    if is_hot_summary_query(normalized) {
+                        let format = detect_output_format(normalized);
+                        let summary = state.ingest.hot_cold_summary().await?;
+                        let rendered = render_hot_summary(&summary, format);
+                        outputs.push(rendered);
+                        continue;
+                    }
+                    let raw = forward_sql_to_clickhouse(&state, normalized).await?;
                     outputs.push(raw);
                     continue;
                 }
 
-                let parsed = Parser::parse_sql(&dialect, &stmt_text)
+                let parsed = Parser::parse_sql(&dialect, normalized)
                     .map_err(|err| AppError(anyhow!("failed to parse SQL: {err}")))?;
                 if parsed.is_empty() {
                     continue;
@@ -753,9 +864,18 @@ impl ProxistDaemon {
                         ..
                     } => {
                         let table_name_lower = table_name.to_string().to_ascii_lowercase();
+                        tracing::debug!(
+                            table = %table_name_lower,
+                            ?ingest_table,
+                            "processing INSERT statement"
+                        );
                         if let Some(expected) = ingest_table.as_ref() {
                             if &table_name_lower != expected {
-                                let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                                tracing::debug!(
+                                    expected = %expected,
+                                    "forwarding INSERT to ClickHouse"
+                                );
+                                let raw = forward_sql_to_clickhouse(&state, normalized).await?;
                                 outputs.push(raw);
                                 continue;
                             }
@@ -771,17 +891,17 @@ impl ProxistDaemon {
                                     outputs.push("Ok.\n".to_string());
                                 }
                                 _ => {
-                                    let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                                    let raw = forward_sql_to_clickhouse(&state, normalized).await?;
                                     outputs.push(raw);
                                 }
                             }
                         } else {
-                            let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                            let raw = forward_sql_to_clickhouse(&state, normalized).await?;
                             outputs.push(raw);
                         }
                     }
                     _ => {
-                        let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                        let raw = forward_sql_to_clickhouse(&state, normalized).await?;
                         outputs.push(raw);
                     }
                 }

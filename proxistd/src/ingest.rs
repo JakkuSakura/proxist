@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicI64, Ordering},
         Arc,
@@ -14,7 +14,7 @@ use proxist_core::{
     metadata::{ShardHealth, TenantId},
     MetadataStore, PersistenceBatch, PersistenceTransition, ShardPersistenceTracker,
 };
-use proxist_mem::HotColumnStore;
+use proxist_mem::{HotColumnStore, HotSymbolSummary};
 use proxist_metadata_sqlite::SqliteMetadataStore;
 use proxist_wal::{WalRecord, WalSegment, WalWriter};
 use serde_bytes::ByteBuf;
@@ -30,6 +30,19 @@ pub struct IngestService {
     last_flush_micros: AtomicI64,
     clickhouse_error: Mutex<Option<String>>,
     persistence_trackers: Mutex<HashMap<String, ShardPersistenceTracker>>,
+    symbol_shards: Mutex<HashMap<(TenantId, String), String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HotColdSummaryRow {
+    pub tenant: TenantId,
+    pub symbol: String,
+    pub shard_id: Option<String>,
+    pub hot_rows: u64,
+    pub hot_first: Option<SystemTime>,
+    pub hot_last: Option<SystemTime>,
+    pub persisted_through: Option<SystemTime>,
+    pub wal_high: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +141,7 @@ impl IngestService {
             last_flush_micros: AtomicI64::new(-1),
             clickhouse_error: Mutex::new(None),
             persistence_trackers: Mutex::new(HashMap::new()),
+            symbol_shards: Mutex::new(HashMap::new()),
         }
     }
 
@@ -252,6 +266,11 @@ impl IngestService {
             self.metadata
                 .alloc_symbol(&tick.tenant, &tick.symbol)
                 .await?;
+
+            {
+                let mut map = self.symbol_shards.lock().await;
+                map.insert((tick.tenant.clone(), tick.symbol.clone()), shard_id.clone());
+            }
 
             let record = WalRecord {
                 tenant: tick.tenant.clone(),
@@ -412,6 +431,71 @@ impl IngestService {
     pub fn clickhouse_table(&self) -> Option<String> {
         self.clickhouse_target.as_ref().map(|t| t.table.clone())
     }
+
+    pub async fn hot_cold_summary(&self) -> anyhow::Result<Vec<HotColdSummaryRow>> {
+        let hot_stats = self.hot_store.hot_summary().await?;
+        let mut hot_map: HashMap<(TenantId, String), HotSymbolSummary> =
+            HashMap::with_capacity(hot_stats.len());
+        for entry in hot_stats {
+            hot_map.insert((entry.tenant.clone(), entry.symbol.clone()), entry);
+        }
+
+        let tracker_map = {
+            let guard = self.persistence_trackers.lock().await;
+            guard.clone()
+        };
+
+        let symbol_map = {
+            let guard = self.symbol_shards.lock().await;
+            guard.clone()
+        };
+
+        if hot_map.is_empty() && symbol_map.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut keys: Vec<(TenantId, String)> = hot_map.keys().cloned().collect();
+        let mut seen: HashSet<(TenantId, String)> = keys.iter().cloned().collect();
+        for key in symbol_map.keys() {
+            if seen.insert(key.clone()) {
+                keys.push(key.clone());
+            }
+        }
+
+        keys.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut rows = Vec::with_capacity(keys.len());
+        for key in keys {
+            let shard_id = symbol_map.get(&key).cloned();
+            let hot_entry = hot_map.get(&key);
+            let tenant = key.0;
+            let symbol = key.1;
+
+            let (hot_rows, hot_first, hot_last) = match hot_entry {
+                Some(entry) => (entry.rows, entry.first_timestamp, entry.last_timestamp),
+                None => (0, None, None),
+            };
+
+            let (persisted, wal_high) = shard_id
+                .as_ref()
+                .and_then(|shard| tracker_map.get(shard))
+                .map(|tracker| (tracker.watermark.persisted, tracker.watermark.wal_high))
+                .unwrap_or((None, None));
+
+            rows.push(HotColdSummaryRow {
+                tenant,
+                symbol,
+                shard_id,
+                hot_rows,
+                hot_first,
+                hot_last,
+                persisted_through: persisted,
+                wal_high,
+            });
+        }
+
+        Ok(rows)
+    }
 }
 
 async fn resolve_shard(
@@ -461,6 +545,7 @@ mod tests {
     use proxist_core::{metadata::ShardAssignment, query::QueryRange};
     use proxist_mem::{InMemoryHotColumnStore, MemConfig, SeamBoundaryRow};
     use proxist_wal::{InMemoryWal, WalRecord, WalSegment};
+    use std::collections::HashMap;
     use tempfile::{NamedTempFile, TempDir};
     use tokio::sync::Mutex;
 
@@ -546,6 +631,49 @@ mod tests {
             at: std::time::SystemTime,
         ) -> anyhow::Result<Vec<proxist_mem::HotRow>> {
             self.last_by(tenant, symbols, at).await
+        }
+
+        async fn hot_summary(&self) -> anyhow::Result<Vec<proxist_mem::HotSymbolSummary>> {
+            let rows = self.rows.lock().await;
+            let mut grouped: HashMap<
+                (TenantId, String),
+                (
+                    u64,
+                    Option<std::time::SystemTime>,
+                    Option<std::time::SystemTime>,
+                ),
+            > = HashMap::new();
+            for (tenant, symbol, ts, _) in rows.iter() {
+                let entry = grouped
+                    .entry((tenant.clone(), symbol.clone()))
+                    .or_insert((0, None, None));
+                entry.0 += 1;
+                entry.1 = Some(match entry.1 {
+                    Some(existing) if *ts < existing => *ts,
+                    Some(existing) => existing,
+                    None => *ts,
+                });
+                entry.2 = Some(match entry.2 {
+                    Some(existing) if *ts > existing => *ts,
+                    Some(existing) => existing,
+                    None => *ts,
+                });
+            }
+
+            let summaries = grouped
+                .into_iter()
+                .map(
+                    |((tenant, symbol), (count, first, last))| proxist_mem::HotSymbolSummary {
+                        tenant,
+                        symbol,
+                        rows: count,
+                        first_timestamp: first,
+                        last_timestamp: last,
+                    },
+                )
+                .collect();
+
+            Ok(summaries)
         }
     }
 
