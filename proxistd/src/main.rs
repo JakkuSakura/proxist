@@ -252,10 +252,7 @@ fn build_ingest_ticks(
             .map(String::from)
             .collect()
     } else {
-        columns
-            .iter()
-            .map(|c| c.value.to_lowercase())
-            .collect()
+        columns.iter().map(|c| c.value.to_lowercase()).collect()
     };
 
     let mut ticks = Vec::new();
@@ -272,14 +269,17 @@ fn build_ingest_ticks(
         let mut symbol: Option<String> = None;
         let mut timestamp: Option<SystemTime> = None;
         let mut seq: Option<u64> = None;
+        let mut payload_bytes: Option<Vec<u8>> = None;
 
         for (col, expr) in column_names.iter().zip(row.iter()) {
             match col.as_str() {
                 "tenant" => tenant = Some(expr_to_string(expr)?),
                 "symbol" => symbol = Some(expr_to_string(expr)?),
-                "ts" | "timestamp" => timestamp = Some(expr_to_timestamp(expr)?),
-                "ts_micros" => timestamp = Some(expr_to_timestamp(expr)?),
+                "shard_id" | "table" => {}
+                "ts" | "timestamp" | "ts_micros" => timestamp = Some(expr_to_timestamp(expr)?),
                 "seq" => seq = Some(expr_to_u64(expr)?),
+                "payload" => payload_bytes = Some(expr_to_bytes(expr)?),
+                "payload_base64" => payload_bytes = Some(expr_to_base64_bytes(expr)?),
                 other => anyhow::bail!("unsupported column in INSERT: {other}"),
             }
         }
@@ -297,7 +297,7 @@ fn build_ingest_ticks(
             tenant,
             symbol,
             timestamp,
-            payload: ByteBuf::from(Vec::new()),
+            payload: ByteBuf::from(payload_bytes.unwrap_or_default()),
             seq,
         });
     }
@@ -311,6 +311,17 @@ fn expr_to_string(expr: &Expr) -> anyhow::Result<String> {
         Expr::Identifier(ident) => Ok(ident.value.clone()),
         _ => Err(anyhow!("expected string literal")),
     }
+}
+
+fn expr_to_bytes(expr: &Expr) -> anyhow::Result<Vec<u8>> {
+    Ok(expr_to_string(expr)?.into_bytes())
+}
+
+fn expr_to_base64_bytes(expr: &Expr) -> anyhow::Result<Vec<u8>> {
+    let text = expr_to_string(expr)?;
+    BASE64_STANDARD
+        .decode(text.as_bytes())
+        .map_err(|err| anyhow!("invalid base64 payload: {err}"))
 }
 
 fn expr_to_u64(expr: &Expr) -> anyhow::Result<u64> {
@@ -336,6 +347,15 @@ fn expr_to_timestamp(expr: &Expr) -> anyhow::Result<SystemTime> {
                 };
                 let text = expr_to_string(first)?;
                 parse_datetime_string(&text)
+            } else if name == "tounixtimestamp" || name == "tounixtimestamp64micro" {
+                if func.args.is_empty() {
+                    anyhow::bail!("toUnixTimestamp requires arguments");
+                }
+                let first = match &func.args[0] {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => inner,
+                    _ => anyhow::bail!("unsupported function argument"),
+                };
+                expr_to_timestamp(first)
             } else {
                 anyhow::bail!("unsupported function {name}")
             }
@@ -635,8 +655,19 @@ impl ProxistDaemon {
             let dialect = ClickHouseDialect {};
             let mut outputs = Vec::new();
             let mut seq_counter: u64 = 0;
+            let ingest_table = state
+                .ingest
+                .clickhouse_table()
+                .map(|t| t.to_ascii_lowercase());
 
             for stmt_text in split_sql_statements(&sql_text) {
+                let trimmed = stmt_text.trim_start();
+                if !trimmed.to_ascii_lowercase().starts_with("insert") {
+                    let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                    outputs.push(raw);
+                    continue;
+                }
+
                 let parsed = Parser::parse_sql(&dialect, &stmt_text)
                     .map_err(|err| AppError(anyhow!("failed to parse SQL: {err}")))?;
                 if parsed.is_empty() {
@@ -649,17 +680,27 @@ impl ProxistDaemon {
                 }
 
                 match parsed.into_iter().next().unwrap() {
-                    Statement::Insert { columns, source, .. } => {
+                    Statement::Insert {
+                        table_name,
+                        columns,
+                        source,
+                        ..
+                    } => {
+                        let table_name_lower = table_name.to_string().to_ascii_lowercase();
+                        if let Some(expected) = ingest_table.as_ref() {
+                            if &table_name_lower != expected {
+                                let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                                outputs.push(raw);
+                                continue;
+                            }
+                        }
                         if let Some(query) = source {
                             match *query.body {
                                 SetExpr::Values(values) => {
                                     let ticks =
                                         build_ingest_ticks(&columns, values, &mut seq_counter)?;
                                     if !ticks.is_empty() {
-                                        state
-                                            .ingest
-                                            .ingest(IngestBatchRequest { ticks })
-                                            .await?;
+                                        state.ingest.ingest(IngestBatchRequest { ticks }).await?;
                                     }
                                     outputs.push("Ok.\n".to_string());
                                 }

@@ -6,16 +6,9 @@ COMPOSE_FILE="${ROOT_DIR}/container-compose.yaml"
 COMPOSE_CMD=(docker compose -f "${COMPOSE_FILE}")
 PROXIST_PORT="${PROXIST_PORT:-18124}"
 PROXIST_ADDR="127.0.0.1:${PROXIST_PORT}"
-CLICKHOUSE_HTTP="http://127.0.0.1:18123"
-TABLE_NAME="ticks"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required to run the SQL tests." >&2
-  exit 1
-fi
-
-if ! command -v clickhouse-client >/dev/null 2>&1; then
-  echo "clickhouse-client must be installed to run the SQL tests." >&2
   exit 1
 fi
 
@@ -38,7 +31,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Waiting for ClickHouse to become ready..."
 until "${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "SELECT 1" >/dev/null 2>&1; do
   sleep 1
 done
@@ -48,9 +40,9 @@ echo "Starting proxistd..."
   cd "${ROOT_DIR}" && \
   PROXIST_METADATA_SQLITE_PATH="${METADATA_DB}" \
   PROXIST_HTTP_ADDR="${PROXIST_ADDR}" \
-  PROXIST_CLICKHOUSE_ENDPOINT="${CLICKHOUSE_HTTP}" \
+  PROXIST_CLICKHOUSE_ENDPOINT="http://127.0.0.1:18123" \
   PROXIST_CLICKHOUSE_DATABASE="proxist" \
-  PROXIST_CLICKHOUSE_TABLE="${TABLE_NAME}" \
+  PROXIST_CLICKHOUSE_TABLE="ticks" \
   cargo run --quiet --bin proxistd
 ) >"${PROXIST_LOG}" 2>&1 &
 PROXIST_PID=$!
@@ -76,7 +68,7 @@ echo "proxistd is ready."
 
 STATUS=0
 TMP_OUTPUT="$(mktemp)"
-CLIENT_CMD=(clickhouse-client --protocol http --host 127.0.0.1 --port "${PROXIST_PORT}" --database proxist --send_logs_level=none)
+RAW_OUTPUT="$(mktemp)"
 
 for sql_file in "${ROOT_DIR}"/sql/*.sql; do
   [[ -e "$sql_file" ]] || continue
@@ -84,13 +76,20 @@ for sql_file in "${ROOT_DIR}"/sql/*.sql; do
   expected_file="${ROOT_DIR}/sql/${base}.expected"
 
   echo "Executing SQL script: ${base}"
-  if ! "${CLIENT_CMD[@]}" --multiquery <"${sql_file}" \
-    | tr -d '\r' \
-    | awk '{ if ($0 == "Ok." || $0 == "") next; print $0 }' >"${TMP_OUTPUT}"; then
-    echo "  ❌ execution failed for ${sql_file}" >&2
+  HTTP_STATUS=$(curl -sS -o "${RAW_OUTPUT}" -w '%{http_code}' \
+    -H 'Content-Type: text/plain' \
+    --data-binary @"${sql_file}" \
+    "http://${PROXIST_ADDR}/?database=proxist")
+
+  if [[ "${HTTP_STATUS}" != "200" ]]; then
+    echo "  ❌ execution failed for ${sql_file} (HTTP ${HTTP_STATUS})" >&2
+    cat "${RAW_OUTPUT}" >&2
     STATUS=1
     continue
   fi
+
+  tr -d '\r' <"${RAW_OUTPUT}" |
+    awk '{ if ($0 == "Ok." || $0 == "") next; print $0 }' >"${TMP_OUTPUT}"
 
   if [[ -f "${expected_file}" ]]; then
     if ! diff -u "${expected_file}" "${TMP_OUTPUT}"; then
@@ -106,5 +105,5 @@ for sql_file in "${ROOT_DIR}"/sql/*.sql; do
 
 done
 
-rm -f "${TMP_OUTPUT}"
+rm -f "${TMP_OUTPUT}" "${RAW_OUTPUT}"
 exit "${STATUS}"

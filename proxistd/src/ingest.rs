@@ -189,6 +189,7 @@ impl IngestService {
                 tracker.apply(PersistenceTransition::Publish {
                     batch_id: plan.batch.id.clone(),
                 })?;
+                tracker.apply(PersistenceTransition::Reset)?;
                 publish.push((plan.shard_id.clone(), tracker.clone()));
             }
         }
@@ -406,6 +407,10 @@ impl IngestService {
 
     pub fn clickhouse_client(&self) -> Option<Arc<ClickhouseHttpClient>> {
         self.clickhouse_client.as_ref().map(Arc::clone)
+    }
+
+    pub fn clickhouse_table(&self) -> Option<String> {
+        self.clickhouse_target.as_ref().map(|t| t.table.clone())
     }
 }
 
