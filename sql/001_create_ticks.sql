@@ -7,7 +7,7 @@ CREATE TABLE ticks
     ts_micros Int64,
     payload_base64 String,
     seq UInt64
-) ENGINE = MergeTree
+) ENGINE = MixedMergeTree
 ORDER BY (tenant, symbol, ts_micros);
 
 SELECT 'ready' FORMAT TabSeparated;

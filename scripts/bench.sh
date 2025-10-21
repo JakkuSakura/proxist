@@ -74,7 +74,7 @@ CREATE TABLE ticks (
     ts_micros Int64,
     payload_base64 String,
     seq UInt64
-) ENGINE = MergeTree ORDER BY (tenant, symbol, ts_micros);
+) ENGINE = MixedMergeTree ORDER BY (tenant, symbol, ts_micros);
 INSERT INTO ticks SELECT 'alpha', 'alpha-shard', concat('SYM', toString(number % 10)), toUnixTimestamp64Micro(toDateTime64('2024-01-01 09:30:00', 6) + number * 0.000001), toString(number), number FROM numbers(500000);
 "
 HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \

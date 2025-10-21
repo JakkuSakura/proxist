@@ -232,6 +232,41 @@ fn split_sql_statements(input: &str) -> Vec<String> {
     statements
 }
 
+fn replace_engine_case_insensitive(sql: &str, new_engine: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if let Some(pos) = lower.find("mixedmergetree") {
+        let end = pos + "mixedmergetree".len();
+        let mut result = String::with_capacity(sql.len() + new_engine.len());
+        result.push_str(&sql[..pos]);
+        result.push_str(new_engine);
+        result.push_str(&sql[end..]);
+        result
+    } else {
+        sql.to_string()
+    }
+}
+
+fn ensure_engine_clause(sql: &str, engine: &str) -> String {
+    if sql.to_ascii_lowercase().contains("engine") {
+        return sql.to_string();
+    }
+
+    let lower = sql.to_ascii_lowercase();
+    if let Some(order_pos) = lower.find("order by") {
+        let (before, after) = sql.split_at(order_pos);
+        format!("{} ENGINE = {} {}", before.trim_end(), engine, after)
+    } else {
+        let trimmed = sql.trim_end();
+        let has_semicolon = trimmed.ends_with(';');
+        let base = trimmed.trim_end_matches(';').trim_end();
+        if has_semicolon {
+            format!("{} ENGINE = {};", base, engine)
+        } else {
+            format!("{} ENGINE = {}", base, engine)
+        }
+    }
+}
+
 async fn forward_sql_to_clickhouse(state: &AppState, sql: &str) -> Result<String, AppError> {
     let client = state
         .ingest
@@ -662,6 +697,37 @@ impl ProxistDaemon {
 
             for stmt_text in split_sql_statements(&sql_text) {
                 let trimmed = stmt_text.trim_start();
+                if trimmed.to_ascii_lowercase().starts_with("create") {
+                    let mut parsed = Parser::parse_sql(&dialect, &stmt_text)
+                        .map_err(|err| AppError(anyhow!("failed to parse SQL: {err}")))?;
+                    if parsed.is_empty() {
+                        continue;
+                    }
+                    if parsed.len() != 1 {
+                        let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                        outputs.push(raw);
+                        continue;
+                    }
+                    let mut stmt = parsed.remove(0);
+                    if let Statement::CreateTable { engine, .. } = &mut stmt {
+                        let mut forwarded = stmt_text.to_string();
+                        if let Some(e) = engine {
+                            if e.eq_ignore_ascii_case("mixedmergetree") {
+                                forwarded =
+                                    replace_engine_case_insensitive(&forwarded, "MergeTree");
+                            }
+                        } else {
+                            forwarded = ensure_engine_clause(&forwarded, "MergeTree");
+                        }
+                        let raw = forward_sql_to_clickhouse(&state, &forwarded).await?;
+                        outputs.push(raw);
+                        continue;
+                    }
+                    let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
+                    outputs.push(raw);
+                    continue;
+                }
+
                 if !trimmed.to_ascii_lowercase().starts_with("insert") {
                     let raw = forward_sql_to_clickhouse(&state, &stmt_text).await?;
                     outputs.push(raw);
