@@ -61,7 +61,7 @@ During recovery, the node loads the latest snapshot, replays WAL entries newer t
 - **Authoritative Store** — Raft-backed or transactional KV containing tenants, schemas, shard assignments, symbol dictionaries, snapshots, watermarks, WAL manifests, secrets, and RBAC policy.
 - **Placement & Scale** — control loop places shards on available nodes based on resource hints (CPU, RAM, NVMe), tracks leases/heartbeats, and orchestrates rebalancing or failover.
 - **Lifecycle Automation** — rolling upgrades, snapshot scheduling, WAL compaction, and ClickHouse lag remediation run as state machines driven by metadata events.
-- **Operator Interfaces** — `pxctl` issues declarative specs (clusters, tables, tenants). Control plane computes diffs, applies configs, and reports status with structured events.
+- **Operator Interfaces** — `pxctl` issues declarative specs (clusters, tables, tenants) and surfaces seam health (`pxctl hot-summary`). Control plane computes diffs, applies configs, and reports status with structured events.
 - **Audit & Versioning** — every change is revisioned; CLI can diff historical specs, roll back, or generate change plans for review.
 
 ## Deployment Model
