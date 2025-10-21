@@ -453,10 +453,10 @@ mod tests {
     use async_trait::async_trait;
     use proxist_api::IngestTick;
     use proxist_ch::{ClickhouseConfig, ClickhouseHttpClient};
-    use proxist_core::query::QueryRange;
-    use proxist_mem::SeamBoundaryRow;
-    use proxist_wal::InMemoryWal;
-    use tempfile::NamedTempFile;
+    use proxist_core::{metadata::ShardAssignment, query::QueryRange};
+    use proxist_mem::{InMemoryHotColumnStore, MemConfig, SeamBoundaryRow};
+    use proxist_wal::{InMemoryWal, WalRecord, WalSegment};
+    use tempfile::{NamedTempFile, TempDir};
     use tokio::sync::Mutex;
 
     #[derive(Default, Clone)]
@@ -545,14 +545,19 @@ mod tests {
     }
 
     #[derive(Default, Clone)]
-    struct MockClickhouseSink {
-        flushed: Arc<Mutex<Vec<usize>>>,
+    struct RecordingClickhouseSink {
+        flushed_counts: Arc<Mutex<Vec<usize>>>,
+        flushed_records: Arc<Mutex<Vec<WalRecord>>>,
     }
 
     #[async_trait]
-    impl ClickhouseSink for MockClickhouseSink {
-        async fn flush_segment(&self, segment: &proxist_wal::WalSegment) -> anyhow::Result<()> {
-            self.flushed.lock().await.push(segment.records.len());
+    impl ClickhouseSink for RecordingClickhouseSink {
+        async fn flush_segment(&self, segment: &WalSegment) -> anyhow::Result<()> {
+            self.flushed_counts.lock().await.push(segment.records.len());
+            self.flushed_records
+                .lock()
+                .await
+                .extend(segment.records.iter().cloned());
             Ok(())
         }
 
@@ -565,6 +570,16 @@ mod tests {
         }
     }
 
+    impl RecordingClickhouseSink {
+        async fn counts(&self) -> Vec<usize> {
+            self.flushed_counts.lock().await.clone()
+        }
+
+        async fn records(&self) -> Vec<WalRecord> {
+            self.flushed_records.lock().await.clone()
+        }
+    }
+
     #[tokio::test]
     async fn ingest_pipeline_wal_clickhouse_and_memory() -> anyhow::Result<()> {
         let temp = NamedTempFile::new()?;
@@ -572,7 +587,7 @@ mod tests {
         let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
         let hot_store = TestHotStore::default();
         let hot_store_arc: Arc<dyn HotColumnStore> = Arc::new(hot_store.clone());
-        let mock_sink = MockClickhouseSink::default();
+        let mock_sink = RecordingClickhouseSink::default();
         let target = mock_sink.target();
         let clickhouse_client = Arc::new(ClickhouseHttpClient::new(ClickhouseConfig::default())?);
 
@@ -605,7 +620,7 @@ mod tests {
         assert_eq!(rows[0].0, "alpha");
         assert_eq!(rows[0].1, "AAPL");
 
-        let flushed = mock_sink.flushed.lock().await.clone();
+        let flushed = mock_sink.counts().await;
         assert_eq!(flushed, vec![1]);
 
         let status = service.clickhouse_status();
@@ -613,6 +628,108 @@ mod tests {
         assert_eq!(status.target.unwrap().table, target.table);
         assert!(status.last_flush.is_some());
         assert!(status.last_error.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_and_query_hot_data_with_persisted_segments() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("meta.db");
+        let metadata = SqliteMetadataStore::connect(db_path.to_str().unwrap()).await?;
+        metadata
+            .put_shard_assignment(ShardAssignment {
+                shard_id: "alpha-shard".into(),
+                tenant_id: "alpha".into(),
+                node_id: "node-a".into(),
+                symbol_range: ("A".into(), "Z".into()),
+            })
+            .await?;
+
+        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
+        let hot_store = Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let hot_store_trait: Arc<dyn HotColumnStore> = hot_store.clone();
+
+        let recording_sink = RecordingClickhouseSink::default();
+        let target = recording_sink.target();
+        let clickhouse_client = Arc::new(ClickhouseHttpClient::new(ClickhouseConfig::default())?);
+
+        let service = IngestService::new(
+            metadata.clone(),
+            wal,
+            hot_store_trait,
+            Some((
+                Arc::new(recording_sink.clone()),
+                target.clone(),
+                Arc::clone(&clickhouse_client),
+            )),
+        );
+
+        let base = std::time::SystemTime::now();
+        let tick_range = QueryRange::new(
+            base - std::time::Duration::from_secs(5),
+            base + std::time::Duration::from_secs(5),
+        );
+
+        let batch = IngestBatchRequest {
+            ticks: vec![
+                IngestTick {
+                    tenant: "alpha".into(),
+                    symbol: "AAPL".into(),
+                    timestamp: base - std::time::Duration::from_secs(1),
+                    payload: ByteBuf::from(vec![1, 2, 3]),
+                    seq: 10,
+                },
+                IngestTick {
+                    tenant: "alpha".into(),
+                    symbol: "AAPL".into(),
+                    timestamp: base,
+                    payload: ByteBuf::from(vec![4, 5, 6]),
+                    seq: 11,
+                },
+            ],
+        };
+
+        service.ingest(batch).await?;
+
+        // Hot store should have both rows available via range query.
+        let hot_rows = hot_store
+            .scan_range(&"alpha".into(), &tick_range, &["AAPL".into()])
+            .await?;
+        assert_eq!(hot_rows.len(), 2);
+        assert_eq!(hot_rows[0].payload, vec![1, 2, 3]);
+        assert_eq!(hot_rows[1].payload, vec![4, 5, 6]);
+
+        // Symbol dictionary should reflect allocation persisted via SQL.
+        let metadata_snapshot = metadata.get_cluster_metadata().await?;
+        assert_eq!(
+            metadata_snapshot
+                .symbol_dictionaries
+                .get("alpha")
+                .cloned()
+                .unwrap_or_default(),
+            vec!["AAPL".to_string()]
+        );
+
+        // ClickHouse sink captured a single flush with both rows.
+        let counts = recording_sink.counts().await;
+        assert_eq!(counts, vec![2]);
+        let records = recording_sink.records().await;
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|rec| rec.symbol == "AAPL"));
+
+        // Shard health is recorded with persistence metadata.
+        let health = metadata.list_shard_health().await?;
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].shard_id, "alpha-shard");
+        assert!(health[0].watermark.persisted.is_some());
+        assert_eq!(health[0].watermark.persisted, health[0].watermark.wal_high);
+
+        let status = service.clickhouse_status();
+        assert!(status.enabled);
+        assert!(status.last_flush.is_some());
+        assert!(status.last_error.is_none());
+        assert_eq!(status.target.unwrap().table, target.table);
 
         Ok(())
     }
