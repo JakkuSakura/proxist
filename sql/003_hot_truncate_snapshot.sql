@@ -12,8 +12,7 @@ GROUP BY tenant, symbol
 ORDER BY tenant, symbol
 FORMAT TSVWithNames;
 
--- Surface proxist's notion of what remains hot versus what has flushed cold.
-SELECT tenant, symbol, shard_id, hot_rows, hot_first_micros, hot_last_micros, persisted_through_micros, wal_high_micros
-FROM system.proxist_hot_summary
+SELECT tenant, symbol, shard_id, memory_rows, memory_first_micros, memory_last_micros, durable_through_micros, wal_high_micros
+FROM proxist.__system_ingest_summary
 ORDER BY tenant, symbol
 FORMAT TSVWithNames;

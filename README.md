@@ -47,17 +47,17 @@ For the full design matrix, see `docs/design-goals.md`.
 - Ingest pipeline appends to an in-memory WAL, writes into the hot column store, and optionally flushes batches to ClickHouse via JSONEachRow.
 - Metadata lives in SQLite with shard assignments, symbol dictionaries, and shard health snapshots surfaced through `/status`.
 - `pxctl` CLI drives status, ingest, query, seam inspection, and assignment workflows over REST (e.g., `pxctl query --tenant alpha --symbols AAPL --op last_by --end-micros …`).
-- `pxctl hot-summary` surfaces proxist’s hot/cold seam, returning per-symbol hot row counts and persistence watermarks (add `--json` for machine consumption).
+- `pxctl hot-summary` surfaces proxist’s seam state, returning per-symbol in-memory row counts and persistence watermarks (add `--json` for machine consumption).
 - `pxctl` queries support `range`, `last_by`, and `asof`, with optional `--include-cold` to merge ClickHouse history across the persistence watermark.
 
 Simple seam check:
 
 ```bash
 pxctl hot-summary --database proxist
-tenant  symbol  shard_id     hot_rows  hot_first_micros  hot_last_micros  persisted_through_micros  wal_high_micros
-alpha   AAPL    alpha::AAPL  4         1704103200000000  1704103203000000 1704103203000000           1704103203000000
-alpha   MSFT    alpha::MSFT  2         1704103201000000  1704103204000000 1704103204000000           1704103204000000
-beta    GOOG    beta::GOOG   2         1704103203000000  1704103205000000 1704103205000000           1704103205000000
+tenant  symbol  shard_id     memory_rows  memory_first_micros  memory_last_micros  durable_through_micros  wal_high_micros
+alpha   AAPL    alpha::AAPL  4            1704103200000000     1704103203000000    1704103203000000        1704103203000000
+alpha   MSFT    alpha::MSFT  2            1704103201000000     1704103204000000    1704103204000000        1704103204000000
+beta    GOOG    beta::GOOG   2            1704103203000000     1704103205000000    1704103205000000        1704103205000000
 ```
 - Integration harness (`scripts/run_clickhouse_tests.sh`) launches ClickHouse with Docker Compose and runs `cargo test`.
 - Set `PROXIST_WAL_DIR` to enable disk-backed WAL persistence and replay; otherwise the daemon falls back to in-memory WALs for dev.

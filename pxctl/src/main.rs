@@ -81,8 +81,8 @@ enum Commands {
     },
 }
 
-const HOT_SUMMARY_SQL: &str = "SELECT tenant, symbol, shard_id, hot_rows, hot_first_micros, hot_last_micros, persisted_through_micros, wal_high_micros \
-FROM system.proxist_hot_summary \
+const INGEST_SUMMARY_SQL: &str = "SELECT tenant, symbol, shard_id, memory_rows, memory_first_micros, memory_last_micros, durable_through_micros, wal_high_micros \
+FROM proxist.__system_ingest_summary \
 ORDER BY tenant, symbol \
 FORMAT TSVWithNames";
 
@@ -247,15 +247,15 @@ fn main() -> anyhow::Result<()> {
                 &endpoint,
                 &database,
                 token.as_deref(),
-                HOT_SUMMARY_SQL,
+                INGEST_SUMMARY_SQL,
             )?;
-            let rows = parse_hot_summary_tsv(&response_text)?;
+            let rows = parse_ingest_summary_tsv(&response_text)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else if rows.is_empty() {
-                println!("No hot rows tracked.");
+                println!("No in-memory rows tracked.");
             } else {
-                render_hot_summary_table(&rows);
+                render_ingest_summary_table(&rows);
             }
         }
     }
@@ -310,14 +310,14 @@ fn micros_to_system_time(micros: i64) -> std::time::SystemTime {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct HotSummaryRow {
+struct IngestSummaryRow {
     tenant: String,
     symbol: String,
     shard_id: Option<String>,
-    hot_rows: u64,
-    hot_first_micros: Option<i64>,
-    hot_last_micros: Option<i64>,
-    persisted_through_micros: Option<i64>,
+    memory_rows: u64,
+    memory_first_micros: Option<i64>,
+    memory_last_micros: Option<i64>,
+    durable_through_micros: Option<i64>,
     wal_high_micros: Option<i64>,
 }
 
@@ -347,13 +347,23 @@ fn execute_sql(
     Ok(response_text)
 }
 
-fn parse_hot_summary_tsv(text: &str) -> anyhow::Result<Vec<HotSummaryRow>> {
+fn parse_ingest_summary_tsv(text: &str) -> anyhow::Result<Vec<IngestSummaryRow>> {
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
     let header_line = lines
         .next()
-        .ok_or_else(|| anyhow!("hot summary response did not include a header row"))?;
+        .ok_or_else(|| anyhow!("summary response did not include a header row"))?;
     let headers: Vec<&str> = header_line.split('\t').collect();
-    let expected = [
+    let expected_neutral = [
+        "tenant",
+        "symbol",
+        "shard_id",
+        "memory_rows",
+        "memory_first_micros",
+        "memory_last_micros",
+        "durable_through_micros",
+        "wal_high_micros",
+    ];
+    let expected_legacy = [
         "tenant",
         "symbol",
         "shard_id",
@@ -363,37 +373,58 @@ fn parse_hot_summary_tsv(text: &str) -> anyhow::Result<Vec<HotSummaryRow>> {
         "persisted_through_micros",
         "wal_high_micros",
     ];
-    if headers.as_slice() != expected.as_slice() {
-        bail!(
-            "unexpected hot summary header {:?}; expected {:?}",
-            headers,
-            expected
-        );
+    #[derive(Clone, Copy)]
+    enum HeaderKind {
+        Neutral,
+        Legacy,
     }
+
+    let (header_kind, expected_len) = if headers.as_slice() == expected_neutral.as_slice() {
+        (HeaderKind::Neutral, expected_neutral.len())
+    } else if headers.as_slice() == expected_legacy.as_slice() {
+        (HeaderKind::Legacy, expected_legacy.len())
+    } else {
+        bail!(
+            "unexpected summary header {:?}; expected {:?} or {:?}",
+            headers,
+            expected_neutral,
+            expected_legacy
+        );
+    };
 
     let mut rows = Vec::new();
     for line in lines {
         let columns: Vec<&str> = line.split('\t').collect();
-        if columns.len() != expected.len() {
+        if columns.len() != expected_len {
             bail!(
-                "expected {} columns in hot summary row, got {}: {}",
-                expected.len(),
+                "expected {} columns in summary row, got {}: {}",
+                expected_len,
                 columns.len(),
                 line
             );
         }
-        rows.push(HotSummaryRow {
+        rows.push(IngestSummaryRow {
             tenant: columns[0].to_string(),
             symbol: columns[1].to_string(),
             shard_id: parse_string_value(columns[2]),
-            hot_rows: columns[3].parse::<u64>().map_err(|err| {
-                anyhow!("failed to parse hot_rows value {:?}: {}", columns[3], err)
+            memory_rows: columns[3].parse::<u64>().map_err(|err| {
+                anyhow!(
+                    "failed to parse summary row count value {:?}: {}",
+                    columns[3],
+                    err
+                )
             })?,
-            hot_first_micros: parse_opt_i64(columns[4])?,
-            hot_last_micros: parse_opt_i64(columns[5])?,
-            persisted_through_micros: parse_opt_i64(columns[6])?,
+            memory_first_micros: parse_opt_i64(columns[4])?,
+            memory_last_micros: parse_opt_i64(columns[5])?,
+            durable_through_micros: parse_opt_i64(columns[6])?,
             wal_high_micros: parse_opt_i64(columns[7])?,
         });
+    }
+
+    if matches!(header_kind, HeaderKind::Legacy) {
+        tracing::warn!(
+            "observed legacy proxist summary header; consider upgrading proxistd for neutral naming"
+        );
     }
 
     Ok(rows)
@@ -417,15 +448,15 @@ fn parse_opt_i64(value: &str) -> anyhow::Result<Option<i64>> {
     }
 }
 
-fn render_hot_summary_table(rows: &[HotSummaryRow]) {
+fn render_ingest_summary_table(rows: &[IngestSummaryRow]) {
     let headers = [
         "tenant",
         "symbol",
         "shard_id",
-        "hot_rows",
-        "hot_first_micros",
-        "hot_last_micros",
-        "persisted_through_micros",
+        "memory_rows",
+        "memory_first_micros",
+        "memory_last_micros",
+        "durable_through_micros",
         "wal_high_micros",
     ];
     let align_right = [false, false, false, true, true, true, true, true];
@@ -437,10 +468,10 @@ fn render_hot_summary_table(rows: &[HotSummaryRow]) {
                 row.tenant.clone(),
                 row.symbol.clone(),
                 row.shard_id.clone().unwrap_or_else(|| "-".into()),
-                row.hot_rows.to_string(),
-                format_opt_i64(row.hot_first_micros),
-                format_opt_i64(row.hot_last_micros),
-                format_opt_i64(row.persisted_through_micros),
+                row.memory_rows.to_string(),
+                format_opt_i64(row.memory_first_micros),
+                format_opt_i64(row.memory_last_micros),
+                format_opt_i64(row.durable_through_micros),
                 format_opt_i64(row.wal_high_micros),
             ]
         })

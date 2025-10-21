@@ -300,13 +300,29 @@ enum OutputFormat {
     TabSeparatedWithNames,
 }
 
-fn is_hot_summary_query(sql: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemSummaryView {
+    Legacy,
+    Neutral,
+}
+
+fn match_system_summary_query(sql: &str) -> Option<SystemSummaryView> {
     let trimmed = sql.trim_start();
     let lower = trimmed.to_ascii_lowercase();
     if !lower.starts_with("select") {
-        return false;
+        return None;
     }
-    lower.contains("system.proxist_hot_summary")
+
+    let normalized = lower.replace('"', "").replace('`', "");
+    if normalized.contains("system.proxist_hot_summary") {
+        Some(SystemSummaryView::Legacy)
+    } else if normalized.contains("system.proxist_ingest_summary")
+        || normalized.contains("proxist.__system_ingest_summary")
+    {
+        Some(SystemSummaryView::Neutral)
+    } else {
+        None
+    }
 }
 
 fn detect_output_format(sql: &str) -> OutputFormat {
@@ -328,42 +344,76 @@ fn detect_output_format(sql: &str) -> OutputFormat {
     OutputFormat::Default
 }
 
-fn render_hot_summary(rows: &[HotColdSummaryRow], format: OutputFormat) -> String {
+fn render_system_summary(
+    rows: &[HotColdSummaryRow],
+    format: OutputFormat,
+    view: SystemSummaryView,
+) -> String {
+    let headers: [&str; 8] = match view {
+        SystemSummaryView::Legacy => [
+            "tenant",
+            "symbol",
+            "shard_id",
+            "hot_rows",
+            "hot_first_micros",
+            "hot_last_micros",
+            "persisted_through_micros",
+            "wal_high_micros",
+        ],
+        SystemSummaryView::Neutral => [
+            "tenant",
+            "symbol",
+            "shard_id",
+            "memory_rows",
+            "memory_first_micros",
+            "memory_last_micros",
+            "durable_through_micros",
+            "wal_high_micros",
+        ],
+    };
+
     let mut output = String::new();
     if matches!(format, OutputFormat::TabSeparatedWithNames) {
-        output.push_str("tenant\tsymbol\tshard_id\thot_rows\thot_first_micros\thot_last_micros\tpersisted_through_micros\twal_high_micros\n");
+        output.push_str(&headers.join("\t"));
+        output.push('\n');
     }
 
     for row in rows {
-        output.push_str(&row.tenant);
-        output.push('\t');
-        output.push_str(&row.symbol);
-        output.push('\t');
-        if let Some(shard) = &row.shard_id {
-            output.push_str(shard);
-        } else {
-            output.push_str("\\N");
-        }
-        output.push('\t');
-        output.push_str(&row.hot_rows.to_string());
-        output.push('\t');
-        push_opt_micros(&mut output, row.hot_first);
-        output.push('\t');
-        push_opt_micros(&mut output, row.hot_last);
-        output.push('\t');
-        push_opt_micros(&mut output, row.persisted_through);
-        output.push('\t');
-        push_opt_micros(&mut output, row.wal_high);
+        let shard = row.shard_id.as_ref().map(|s| s.as_str()).unwrap_or("\\N");
+        let values: [String; 8] = match view {
+            SystemSummaryView::Legacy => [
+                row.tenant.clone(),
+                row.symbol.clone(),
+                shard.to_string(),
+                row.hot_rows.to_string(),
+                format_opt_micros(row.hot_first),
+                format_opt_micros(row.hot_last),
+                format_opt_micros(row.persisted_through),
+                format_opt_micros(row.wal_high),
+            ],
+            SystemSummaryView::Neutral => [
+                row.tenant.clone(),
+                row.symbol.clone(),
+                shard.to_string(),
+                row.hot_rows.to_string(),
+                format_opt_micros(row.hot_first),
+                format_opt_micros(row.hot_last),
+                format_opt_micros(row.persisted_through),
+                format_opt_micros(row.wal_high),
+            ],
+        };
+
+        output.push_str(&values.join("\t"));
         output.push('\n');
     }
 
     output
 }
 
-fn push_opt_micros(buf: &mut String, value: Option<SystemTime>) {
+fn format_opt_micros(value: Option<SystemTime>) -> String {
     match value {
-        Some(ts) => buf.push_str(&system_time_to_micros(ts).to_string()),
-        None => buf.push_str("\\N"),
+        Some(ts) => system_time_to_micros(ts).to_string(),
+        None => "\\N".to_string(),
     }
 }
 
@@ -833,10 +883,10 @@ impl ProxistDaemon {
                 }
 
                 if !normalized.to_ascii_lowercase().starts_with("insert") {
-                    if is_hot_summary_query(normalized) {
+                    if let Some(view) = match_system_summary_query(normalized) {
                         let format = detect_output_format(normalized);
                         let summary = state.ingest.hot_cold_summary().await?;
-                        let rendered = render_hot_summary(&summary, format);
+                        let rendered = render_system_summary(&summary, format, view);
                         outputs.push(rendered);
                         continue;
                     }
