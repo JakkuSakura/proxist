@@ -197,6 +197,74 @@ struct AppState {
     api_token: Option<String>,
 }
 
+#[derive(Debug)]
+struct AppError(anyhow::Error);
+
+impl<E> From<E> for AppError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        AppError(err.into())
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        error!(error = ?self.0, "HTTP request failed");
+        let payload = Json(json!({ "error": self.0.to_string() }));
+        (StatusCode::INTERNAL_SERVER_ERROR, payload).into_response()
+    }
+}
+
+async fn compose_status(state: &AppState) -> Result<StatusResponse, AppError> {
+    let metadata = state.metadata_cache.lock().await.clone();
+    let shard_health = state.metadata.list_shard_health().await?;
+    let clickhouse = state.ingest.clickhouse_status();
+    Ok(StatusResponse {
+        metadata,
+        shard_health,
+        clickhouse,
+    })
+}
+
+async fn compose_diagnostics(state: &AppState) -> Result<DiagnosticsBundle, AppError> {
+    let status = compose_status(state).await?;
+    let metrics = state.metrics.as_ref().map(|handle| handle.render());
+    let hot_summary = state
+        .ingest
+        .hot_cold_summary()
+        .await?
+        .into_iter()
+        .map(convert_summary_row)
+        .collect();
+    let persistence = state.ingest.tracker_snapshot().await;
+    Ok(DiagnosticsBundle {
+        captured_at: SystemTime::now(),
+        status,
+        metrics,
+        persistence,
+        hot_summary,
+    })
+}
+
+fn convert_summary_row(row: HotColdSummaryRow) -> proxist_api::DiagnosticsHotSummaryRow {
+    proxist_api::DiagnosticsHotSummaryRow {
+        tenant: row.tenant,
+        symbol: row.symbol,
+        shard_id: row.shard_id,
+        hot_rows: row.hot_rows,
+        hot_first_micros: option_time_to_micros(row.hot_first),
+        hot_last_micros: option_time_to_micros(row.hot_last),
+        persisted_through_micros: option_time_to_micros(row.persisted_through),
+        wal_high_micros: option_time_to_micros(row.wal_high),
+    }
+}
+
+fn option_time_to_micros(ts: Option<SystemTime>) -> Option<i64> {
+    ts.map(system_time_to_micros)
+}
+
 fn hot_row_to_query_row(row: proxist_mem::HotRow) -> proxist_api::QueryRow {
     proxist_api::QueryRow {
         symbol: row.symbol,
@@ -786,17 +854,6 @@ impl ProxistDaemon {
             api_token: self.config.api_token.clone(),
         };
 
-        async fn compose_status(state: &AppState) -> Result<StatusResponse, AppError> {
-            let metadata = state.metadata_cache.lock().await.clone();
-            let shard_health = state.metadata.list_shard_health().await?;
-            let clickhouse = state.ingest.clickhouse_status();
-            Ok(StatusResponse {
-                metadata,
-                shard_health,
-                clickhouse,
-            })
-        }
-
         async fn status_handler(
             State(state): State<AppState>,
         ) -> Result<Json<StatusResponse>, AppError> {
@@ -873,13 +930,7 @@ impl ProxistDaemon {
         async fn diagnostics_handler(
             State(state): State<AppState>,
         ) -> Result<Json<DiagnosticsBundle>, AppError> {
-            let status = compose_status(&state).await?;
-            let metrics = state.metrics.as_ref().map(|handle| handle.render());
-            let bundle = DiagnosticsBundle {
-                captured_at: SystemTime::now(),
-                status,
-                metrics,
-            };
+            let bundle = compose_diagnostics(&state).await?;
             Ok(Json(bundle))
         }
 
@@ -1367,26 +1418,6 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
     Ok(QueryResponse { rows })
 }
 
-#[derive(Debug)]
-struct AppError(anyhow::Error);
-
-impl<E> From<E> for AppError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(err: E) -> Self {
-        AppError(err.into())
-    }
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        error!(error = ?self.0, "HTTP request failed");
-        let payload = Json(json!({ "error": self.0.to_string() }));
-        (StatusCode::INTERNAL_SERVER_ERROR, payload).into_response()
-    }
-}
-
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -1438,7 +1469,7 @@ mod system_summary_tests {
 mod wal_bootstrap_tests {
     use super::*;
     use proxist_api::{IngestBatchRequest, IngestTick};
-    use proxist_core::query::QueryRange;
+    use proxist_core::query::{QueryOperation, QueryRange};
     use serde_bytes::ByteBuf;
     use std::time::{Duration, UNIX_EPOCH};
     use tempfile::{tempdir, NamedTempFile};
@@ -1595,6 +1626,59 @@ mod wal_bootstrap_tests {
         assert_eq!(row.timestamp, ts);
         assert_eq!(row.payload.as_ref(), &[1]);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn diagnostics_bundle_includes_hot_summary() -> anyhow::Result<()> {
+        let metadata_file = NamedTempFile::new()?;
+        let metadata_path = metadata_file.path().to_str().unwrap().to_string();
+        let metadata = SqliteMetadataStore::connect(&metadata_path).await?;
+        metadata
+            .put_shard_assignment(ShardAssignment {
+                shard_id: "alpha-shard".into(),
+                tenant_id: "alpha".into(),
+                node_id: "node-a".into(),
+                symbol_range: ("A".into(), "Z".into()),
+            })
+            .await?;
+
+        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
+        let hot_store = Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let service = IngestService::new(metadata.clone(), wal, hot_store.clone(), None);
+        let snapshot = metadata.get_cluster_metadata().await?;
+        service.apply_metadata(&snapshot).await?;
+
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_millis(500);
+        service
+            .ingest(IngestBatchRequest {
+                ticks: vec![IngestTick {
+                    tenant: "alpha".into(),
+                    symbol: "AAPL".into(),
+                    timestamp: ts,
+                    payload: ByteBuf::from(vec![7]),
+                    seq: 1,
+                }],
+            })
+            .await?;
+
+        let state = AppState {
+            metadata: metadata.clone(),
+            metadata_cache: Arc::new(tokio::sync::Mutex::new(snapshot)),
+            hot_store,
+            ingest: Arc::new(service),
+            metrics: None,
+            api_token: None,
+        };
+
+        let bundle = compose_diagnostics(&state).await.map_err(|err| err.0)?;
+        assert!(!bundle.hot_summary.is_empty());
+        let row = &bundle.hot_summary[0];
+        assert_eq!(row.tenant, "alpha");
+        assert_eq!(row.symbol, "AAPL");
+        assert_eq!(row.hot_rows, 1);
+        assert_eq!(row.hot_last_micros, Some(system_time_to_micros(ts)));
+        assert!(bundle.persistence.iter().any(|tracker| tracker.shard_id == "alpha-shard"));
         Ok(())
     }
 }

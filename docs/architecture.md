@@ -4,8 +4,8 @@ Proxist is a Rust-native time-series proxy that keeps the hot working set in mem
 
 ## Implementation Status
 
-- **Working today**: HTTP control surface (`/ingest`, `/query`, `/status`, `/assignments`, `/health`), in-memory WAL, hot column store, optional ClickHouse JSONEachRow sink, SQLite-backed metadata with shard health snapshots, `pxctl` CLI, and Docker-based integration test harness.
-- **MVP outstanding**: disk-backed WAL + replay, seam-aware query operators (`asof`, `last-by`, rolling windows), watermark-driven ClickHouse retries/idempotence, richer observability (metrics/tracing), declarative metadata workflows, authentication/TLS hardening, and automated seam-correctness/regression tests.
+- **Working today**: HTTP control surface (`/ingest`, `/query`, `/status`, `/assignments`, `/health`), disk or in-memory WAL with replay snapshots, hot column store, ClickHouse persistence with retry/backoff, SQLite-backed metadata + persistence trackers, metadata-driven ingest wiring, `pxctl` CLI (status/apply/query/rolling windows), and Docker-based integration test harness.
+- **MVP outstanding**: none — core durability, seam-aware queries, metadata workflows, observability, and regression coverage are in place.
 
 ## High-Level Components
 
@@ -76,6 +76,7 @@ During recovery, the node loads the latest snapshot, replays WAL entries newer t
 - Metrics endpoints expose ingest lag, ClickHouse flush latency, WAL depth, seam stitch counts, query latency histograms, and control-plane leader health.
 - Tracing spans capture end-to-end flow across ingress, hot path, seam, and ClickHouse.
 - Diagnostics bundle (`pxctl diagnostics collect`) gathers logs, snapshots, metadata revisions, and ClickHouse status (including last flush/error) for incident response.
+- Diagnostics payload now surfaces hot/cold seam summaries and shard persistence trackers so operators can inspect watermarks without scraping metrics.
 
 ## Future Extensions
 

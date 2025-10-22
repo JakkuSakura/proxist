@@ -6,6 +6,7 @@ pub use proxist_core::metadata::{ShardAssignment, ShardHealth};
 use proxist_core::{
     metadata::TenantId,
     query::{QueryRange, RollingWindowConfig},
+    ShardPersistenceTracker,
 };
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -66,6 +67,22 @@ pub struct DiagnosticsBundle {
     pub captured_at: SystemTime,
     pub status: StatusResponse,
     pub metrics: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persistence: Vec<ShardPersistenceTracker>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hot_summary: Vec<DiagnosticsHotSummaryRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticsHotSummaryRow {
+    pub tenant: String,
+    pub symbol: String,
+    pub shard_id: Option<String>,
+    pub hot_rows: u64,
+    pub hot_first_micros: Option<i64>,
+    pub hot_last_micros: Option<i64>,
+    pub persisted_through_micros: Option<i64>,
+    pub wal_high_micros: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

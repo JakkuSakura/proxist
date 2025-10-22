@@ -5,7 +5,7 @@
 - pxctl TSV parser tests cover both neutral and legacy summary headers.
 - Ingest service unit test validates hot summary counts per symbol.
 - Proxist daemon WAL bootstrap test verifies disk replay restores the hot column store.
-- Query executor seam test validates `last_by` with `include_cold` returns persisted rows via seam caches when ClickHouse is unavailable.
+- Query executor seam + diagnostics tests cover `last_by --include-cold` stitching and ensure the diagnostics bundle surfaces seam state.
 
 This file sketches the next wave of coverage we want to add. The goal is to move
 from the current “happy-path e2e smoke” to a matrix that exercises the new

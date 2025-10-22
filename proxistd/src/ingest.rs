@@ -194,6 +194,15 @@ impl IngestService {
             }
         }
 
+        tracing::info!(
+            shards = metadata.assignments.len(),
+            tenants = metadata.symbol_dictionaries.len(),
+            "applied metadata snapshot to ingest service"
+        );
+        metrics::gauge!(
+            "proxist_assigned_shards",
+            metadata.assignments.len() as f64
+        );
         Ok(())
     }
 
@@ -297,6 +306,17 @@ impl IngestService {
                     batch_id: plan.batch.id.clone(),
                 })?;
                 tracker.apply(PersistenceTransition::Reset)?;
+                metrics::counter!(
+                    "proxist_persistence_commits_total",
+                    1,
+                    "shard" => plan.shard_id.clone()
+                );
+                tracing::debug!(
+                    shard = %plan.shard_id,
+                    batch = %plan.batch.id,
+                    rows = plan.rows,
+                    "persistence batch committed"
+                );
                 publish.push((plan.shard_id.clone(), tracker.clone()));
             }
         }
@@ -318,6 +338,11 @@ impl IngestService {
         for plan in plans {
             if let Some(tracker) = trackers.get_mut(&plan.shard_id) {
                 tracker.apply(PersistenceTransition::Reset)?;
+                metrics::counter!(
+                    "proxist_persistence_failures_total",
+                    1,
+                    "shard" => plan.shard_id.clone()
+                );
                 publish.push((plan.shard_id.clone(), tracker.clone()));
             }
         }
@@ -344,6 +369,20 @@ impl IngestService {
             persistence_state: tracker.state.clone(),
         };
         self.metadata.record_shard_health(health).await?;
+        if let Some(persisted) = tracker.watermark.persisted {
+            metrics::gauge!(
+                "proxist_persisted_watermark_micros",
+                system_time_to_micros(persisted) as f64,
+                "shard" => shard_id.to_string()
+            );
+        }
+        if let Some(wal) = tracker.watermark.wal_high {
+            metrics::gauge!(
+                "proxist_wal_high_micros",
+                system_time_to_micros(wal) as f64,
+                "shard" => shard_id.to_string()
+            );
+        }
         Ok(())
     }
 
@@ -566,8 +605,9 @@ impl IngestService {
         for key in keys {
             let shard_id = symbol_map.get(&key).cloned();
             let hot_entry = hot_map.get(&key);
-            let tenant = key.0;
-            let symbol = key.1;
+            let (tenant, symbol) = key;
+            let tenant_label = tenant.clone();
+            let symbol_label = symbol.clone();
 
             let (hot_rows, hot_first, hot_last) = match hot_entry {
                 Some(entry) => (entry.rows, entry.first_timestamp, entry.last_timestamp),
@@ -590,6 +630,12 @@ impl IngestService {
                 persisted_through: persisted,
                 wal_high,
             });
+            metrics::gauge!(
+                "proxist_hot_rows",
+                hot_rows as f64,
+                "tenant" => tenant_label,
+                "symbol" => symbol_label
+            );
         }
 
         Ok(rows)

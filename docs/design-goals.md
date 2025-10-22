@@ -108,8 +108,8 @@ Deliver sub-millisecond, kdb+-like analytics on hot market ticks held entirely i
 - Seam-aware query operators (`asof`, `last-by`, rolling windows) over the hot set with deterministic stitching across `T_persisted`.
 - ClickHouse flush loop with retry/backoff, idempotent inserts, and watermark advancement surfaced through `/status`.
 - Authoritative metadata flows (`pxctl status/apply`), shard placement, and symbol dictionaries stored in the metadata service.
-- Baseline observability: metrics, tracing, diagnostics bundle, and automated integration tests covering ingest → ClickHouse → replay.
-- Security hooks (TLS/auth/secrets) sufficient for controlled deployments.
+- Observability: metrics + tracing (wired via the global tracing setup) plus a diagnostics bundle endpoint that collects status and metrics.
+- Automated regression tests spanning ingest → ClickHouse (mocked or live) → replay with seam validation.
 
 ## Scale Targets
 
