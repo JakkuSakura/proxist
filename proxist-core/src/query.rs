@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,31 @@ pub enum QueryOperation {
     Range,
     LastBy,
     AsOf,
+    RollingWindow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RollingWindowConfig {
+    /// Length of the rolling window in microseconds.
+    pub length_micros: u64,
+    #[serde(default = "default_rolling_aggregation")]
+    pub aggregation: RollingAggregation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RollingAggregation {
+    Count,
+}
+
+impl RollingWindowConfig {
+    pub fn window(&self) -> Duration {
+        Duration::from_micros(self.length_micros)
+    }
+}
+
+const fn default_rolling_aggregation() -> RollingAggregation {
+    RollingAggregation::Count
 }
 
 #[async_trait]

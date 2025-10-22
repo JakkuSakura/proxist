@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use axum::{
     body::{Body, Bytes},
     extract::State,
@@ -29,8 +29,9 @@ use proxist_ch::{
     ClickhouseConfig, ClickhouseHttpClient, ClickhouseHttpSink, ClickhouseQueryRow, ClickhouseSink,
 };
 use proxist_core::{
-    metadata::ClusterMetadata, query::QueryOperation, MetadataStore, ShardAssignment, ShardHealth,
-    ShardPersistenceTracker,
+    metadata::ClusterMetadata,
+    query::{QueryOperation, RollingAggregation},
+    MetadataStore, ShardAssignment, ShardHealth,
 };
 use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
 use proxist_metadata_sqlite::SqliteMetadataStore;
@@ -96,8 +97,17 @@ impl DaemonConfig {
             .unwrap_or_else(|_| "127.0.0.1:8080".into())
             .parse()?;
         let clickhouse = load_clickhouse_config();
-        let api_token = std::env::var("PROXIST_API_TOKEN").ok();
-
+        let api_token = if let Ok(token_path) = std::env::var("PROXIST_API_TOKEN_FILE") {
+            let contents = std::fs::read_to_string(&token_path)
+                .with_context(|| format!("read API token file at {}", token_path))?;
+            let trimmed = contents.trim();
+            if trimmed.is_empty() {
+                bail!("PROXIST_API_TOKEN_FILE points to an empty token");
+            }
+            Some(trimmed.to_string())
+        } else {
+            std::env::var("PROXIST_API_TOKEN").ok()
+        };
         Ok(Self {
             metadata_path,
             http_addr,
@@ -618,6 +628,7 @@ fn query_operation_label(op: &QueryOperation) -> &'static str {
         QueryOperation::Range => "range",
         QueryOperation::LastBy => "last_by",
         QueryOperation::AsOf => "asof",
+        QueryOperation::RollingWindow => "rolling_window",
     }
 }
 
@@ -648,6 +659,7 @@ fn micros_to_system_time(micros: i64) -> SystemTime {
         UNIX_EPOCH - Duration::from_micros((-micros) as u64)
     }
 }
+
 
 impl ProxistDaemon {
     async fn new(
@@ -725,32 +737,42 @@ impl ProxistDaemon {
         info!("control loop started");
         loop {
             let snapshot = self.metadata_store.get_cluster_metadata().await?;
+            self.ingest_service
+                .apply_metadata(&snapshot)
+                .await
+                .context("apply metadata snapshot to ingest service")?;
             {
                 let mut cache = self.metadata_cache.lock().await;
-                *cache = snapshot;
+                *cache = snapshot.clone();
             }
 
-            info!(path = %self.config.metadata_path, "metadata snapshot refreshed");
+            let assigned = snapshot.assignments.len();
+            let total_symbols: usize = snapshot
+                .symbol_dictionaries
+                .values()
+                .map(|symbols| symbols.len())
+                .sum();
+            info!(
+                path = %self.config.metadata_path,
+                assignments = assigned,
+                symbols = total_symbols,
+                "metadata snapshot refreshed"
+            );
 
-            // TODO: hook in metadata-driven ingest and shard supervision.
+            let tracker_snapshot = self.ingest_service.tracker_snapshot().await;
+            for tracker in tracker_snapshot {
+                let health = ShardHealth {
+                    shard_id: tracker.shard_id.clone(),
+                    is_leader: true,
+                    wal_backlog_bytes: 0,
+                    clickhouse_lag_ms: 0,
+                    watermark: tracker.watermark,
+                    persistence_state: tracker.state.clone(),
+                };
+                self.metadata_store.record_shard_health(health).await?;
+            }
+
             tokio::time::sleep(Duration::from_secs(5)).await;
-
-            // Example seam tracker update.
-            let mut tracker = ShardPersistenceTracker::new("shard-0");
-            tracker
-                .apply(proxist_core::PersistenceTransition::Reset)
-                .context("reset tracker")?;
-
-            let health = ShardHealth {
-                shard_id: "shard-0".to_string(),
-                is_leader: true,
-                wal_backlog_bytes: 0,
-                clickhouse_lag_ms: 0,
-                watermark: tracker.watermark,
-                persistence_state: tracker.state.clone(),
-            };
-
-            self.metadata_store.record_shard_health(health).await?;
         }
     }
 
@@ -1033,9 +1055,8 @@ impl ProxistDaemon {
             State(state): State<AppState>,
             Json(request): Json<QueryRequest>,
         ) -> Result<Json<QueryResponse>, AppError> {
-            let op_kind = request.op.clone();
-            let persisted_at = state.ingest.last_persisted_timestamp();
             let include_cold = request.include_cold;
+            let op_kind = request.op.clone();
             let span = tracing::info_span!(
                 "query",
                 op = ?op_kind,
@@ -1045,155 +1066,7 @@ impl ProxistDaemon {
             let _guard = span.enter();
             let start = Instant::now();
 
-            let mut hot_rows = match &op_kind {
-                QueryOperation::Range => {
-                    state
-                        .hot_store
-                        .scan_range(&request.tenant, &request.range, &request.symbols)
-                        .await?
-                }
-                QueryOperation::LastBy => {
-                    state
-                        .hot_store
-                        .last_by(&request.tenant, &request.symbols, request.range.end)
-                        .await?
-                }
-                QueryOperation::AsOf => {
-                    state
-                        .hot_store
-                        .asof(&request.tenant, &request.symbols, request.range.end)
-                        .await?
-                }
-            };
-
-            if include_cold {
-                if let Some(persisted) = persisted_at {
-                    hot_rows.retain(|row| row.timestamp > persisted);
-                }
-            }
-
-            let rows = match &op_kind {
-                QueryOperation::Range => {
-                    let mut rows: Vec<proxist_api::QueryRow> =
-                        hot_rows.into_iter().map(hot_row_to_query_row).collect();
-
-                    if include_cold {
-                        if let Some(client) = state.ingest.clickhouse_client() {
-                            let cold_end = persisted_at
-                                .map(|persisted| std::cmp::min(persisted, request.range.end))
-                                .unwrap_or(request.range.end);
-
-                            if !request.symbols.is_empty() && cold_end >= request.range.start {
-                                let cold_rows = client
-                                    .fetch_range(
-                                        &request.tenant,
-                                        &request.symbols,
-                                        system_time_to_micros(request.range.start),
-                                        system_time_to_micros(cold_end),
-                                    )
-                                    .await?
-                                    .into_iter()
-                                    .map(clickhouse_row_to_query_row)
-                                    .collect::<anyhow::Result<Vec<_>>>()?;
-
-                                rows.extend(cold_rows);
-                            }
-                        }
-                    }
-
-                    rows.sort_by_key(|row| {
-                        (system_time_to_micros(row.timestamp), row.symbol.clone())
-                    });
-                    rows.dedup_by(|a, b| {
-                        a.symbol == b.symbol
-                            && a.timestamp == b.timestamp
-                            && a.payload.as_ref() == b.payload.as_ref()
-                    });
-
-                    Ok::<_, AppError>(rows)
-                }
-                QueryOperation::LastBy | QueryOperation::AsOf => {
-                    let mut map: HashMap<String, proxist_api::QueryRow> = HashMap::new();
-
-                    let mut upsert =
-                        |row: proxist_api::QueryRow| match map.entry(row.symbol.clone()) {
-                            std::collections::hash_map::Entry::Vacant(slot) => {
-                                slot.insert(row);
-                            }
-                            std::collections::hash_map::Entry::Occupied(mut slot) => {
-                                if system_time_to_micros(row.timestamp)
-                                    > system_time_to_micros(slot.get().timestamp)
-                                {
-                                    slot.insert(row);
-                                }
-                            }
-                        };
-
-                    for row in hot_rows {
-                        upsert(hot_row_to_query_row(row));
-                    }
-
-                    if include_cold {
-                        if let Some(client) = state.ingest.clickhouse_client() {
-                            let cutoff = persisted_at
-                                .map(|persisted| std::cmp::min(persisted, request.range.end))
-                                .unwrap_or(request.range.end);
-
-                            if !request.symbols.is_empty() {
-                                let cold_rows = client
-                                    .fetch_last_by(
-                                        &request.tenant,
-                                        &request.symbols,
-                                        system_time_to_micros(cutoff),
-                                    )
-                                    .await?
-                                    .into_iter()
-                                    .map(clickhouse_row_to_query_row)
-                                    .collect::<anyhow::Result<Vec<_>>>()?;
-
-                                for row in cold_rows {
-                                    upsert(row);
-                                }
-                            }
-                        }
-
-                        if let Some(seam_ts) = persisted_at {
-                            let seam_rows = state
-                                .hot_store
-                                .seam_rows_at(&request.tenant, seam_ts)
-                                .await?;
-                            for seam in seam_rows {
-                                if !request.symbols.is_empty()
-                                    && !request.symbols.contains(&seam.symbol)
-                                {
-                                    continue;
-                                }
-                                if seam.timestamp > request.range.end {
-                                    continue;
-                                }
-                                upsert(proxist_api::QueryRow {
-                                    symbol: seam.symbol,
-                                    timestamp: seam.timestamp,
-                                    payload: ByteBuf::from(seam.payload),
-                                });
-                            }
-                        }
-                    }
-
-                    let mut rows: Vec<proxist_api::QueryRow> = if request.symbols.is_empty() {
-                        map.into_values().collect()
-                    } else {
-                        request
-                            .symbols
-                            .iter()
-                            .filter_map(|symbol| map.get(symbol).cloned())
-                            .collect()
-                    };
-                    rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-
-                    Ok::<_, AppError>(rows)
-                }
-            }?;
+            let response = execute_query(&state, request).await?;
 
             let op_label = query_operation_label(&op_kind);
             let include_cold_label = if include_cold { "true" } else { "false" };
@@ -1209,7 +1082,7 @@ impl ProxistDaemon {
                 "op" => op_label
             );
 
-            Ok(Json(QueryResponse { rows }))
+            Ok(Json(response))
         }
 
         async fn health_handler(
@@ -1247,6 +1120,251 @@ impl ProxistDaemon {
             .await?;
         Ok(())
     }
+}
+
+async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryResponse, AppError> {
+    let op_kind = request.op.clone();
+    let persisted_at = state.ingest.last_persisted_timestamp();
+    let include_cold = request.include_cold;
+
+    let rows = match &op_kind {
+        QueryOperation::Range => {
+            let mut hot_rows = state
+                .hot_store
+                .scan_range(&request.tenant, &request.range, &request.symbols)
+                .await?;
+            if include_cold {
+                if let Some(persisted) = persisted_at {
+                    hot_rows.retain(|row| row.timestamp > persisted);
+                }
+            }
+            let mut rows: Vec<proxist_api::QueryRow> =
+                hot_rows.into_iter().map(hot_row_to_query_row).collect();
+
+            if include_cold {
+                if let Some(client) = state.ingest.clickhouse_client() {
+                    let cold_end = persisted_at
+                        .map(|persisted| std::cmp::min(persisted, request.range.end))
+                        .unwrap_or(request.range.end);
+
+                    if !request.symbols.is_empty() && cold_end >= request.range.start {
+                        let cold_rows = client
+                            .fetch_range(
+                                &request.tenant,
+                                &request.symbols,
+                                system_time_to_micros(request.range.start),
+                                system_time_to_micros(cold_end),
+                            )
+                            .await?
+                            .into_iter()
+                            .map(clickhouse_row_to_query_row)
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+
+                        rows.extend(cold_rows);
+                    }
+                }
+            }
+
+            rows.sort_by_key(|row| {
+                (system_time_to_micros(row.timestamp), row.symbol.clone())
+            });
+            rows.dedup_by(|a, b| {
+                a.symbol == b.symbol
+                    && a.timestamp == b.timestamp
+                    && a.payload.as_ref() == b.payload.as_ref()
+            });
+
+            Ok::<_, AppError>(rows)
+        }
+        QueryOperation::LastBy | QueryOperation::AsOf => {
+            let mut hot_rows = match op_kind {
+                QueryOperation::LastBy => state
+                    .hot_store
+                    .last_by(&request.tenant, &request.symbols, request.range.end)
+                    .await?,
+                QueryOperation::AsOf => state
+                    .hot_store
+                    .asof(&request.tenant, &request.symbols, request.range.end)
+                    .await?,
+                _ => unreachable!(),
+            };
+
+            if include_cold {
+                if let Some(persisted) = persisted_at {
+                    hot_rows.retain(|row| row.timestamp > persisted);
+                }
+            }
+
+            let mut map: HashMap<String, proxist_api::QueryRow> = HashMap::new();
+
+            let mut upsert =
+                |row: proxist_api::QueryRow| match map.entry(row.symbol.clone()) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(row);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if system_time_to_micros(row.timestamp)
+                            > system_time_to_micros(slot.get().timestamp)
+                        {
+                            slot.insert(row);
+                        }
+                    }
+                };
+
+            for row in hot_rows {
+                upsert(hot_row_to_query_row(row));
+            }
+
+            if include_cold {
+                if let Some(client) = state.ingest.clickhouse_client() {
+                    let cutoff = persisted_at
+                        .map(|persisted| std::cmp::min(persisted, request.range.end))
+                        .unwrap_or(request.range.end);
+
+                    if !request.symbols.is_empty() {
+                        let cold_rows = client
+                            .fetch_last_by(
+                                &request.tenant,
+                                &request.symbols,
+                                system_time_to_micros(cutoff),
+                            )
+                            .await?
+                            .into_iter()
+                            .map(clickhouse_row_to_query_row)
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+
+                        for row in cold_rows {
+                            upsert(row);
+                        }
+                    }
+                }
+
+                if let Some(seam_ts) = persisted_at {
+                    let seam_rows = state
+                        .hot_store
+                        .seam_rows_at(&request.tenant, seam_ts)
+                        .await?;
+                    for seam in seam_rows {
+                        if !request.symbols.is_empty()
+                            && !request.symbols.contains(&seam.symbol)
+                        {
+                            continue;
+                        }
+                        if seam.timestamp > request.range.end {
+                            continue;
+                        }
+                        upsert(proxist_api::QueryRow {
+                            symbol: seam.symbol,
+                            timestamp: seam.timestamp,
+                            payload: ByteBuf::from(seam.payload),
+                        });
+                    }
+                }
+            }
+
+            let mut rows: Vec<proxist_api::QueryRow> = if request.symbols.is_empty() {
+                map.into_values().collect()
+            } else {
+                request
+                    .symbols
+                    .iter()
+                    .filter_map(|symbol| map.get(symbol).cloned())
+                    .collect()
+            };
+            rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+
+            Ok::<_, AppError>(rows)
+        }
+        QueryOperation::RollingWindow => {
+            if request.symbols.is_empty() {
+                return Err(AppError(anyhow!(
+                    "rolling_window queries require at least one symbol"
+                )));
+            }
+            let config = request
+                .rolling
+                .clone()
+                .ok_or_else(|| {
+                    AppError(anyhow!(
+                        "rolling configuration is required for rolling_window queries"
+                    ))
+                })?;
+            if !matches!(config.aggregation, RollingAggregation::Count) {
+                return Err(AppError(anyhow!(
+                    "unsupported rolling aggregation: {:?}",
+                    config.aggregation
+                )));
+            }
+
+            let window = config.window();
+            let hot_lower_bound = if include_cold { persisted_at } else { None };
+            let mut counts: HashMap<String, u64> = HashMap::new();
+            for symbol in &request.symbols {
+                counts.entry(symbol.clone()).or_insert(0);
+            }
+
+            let hot_counts = state
+                .hot_store
+                .rolling_window(
+                    &request.tenant,
+                    &request.symbols,
+                    request.range.end,
+                    window,
+                    hot_lower_bound,
+                )
+                .await?;
+            for entry in hot_counts {
+                *counts.entry(entry.symbol).or_insert(0) += entry.count;
+            }
+
+            if include_cold {
+                if let (Some(client), Some(persisted)) =
+                    (state.ingest.clickhouse_client(), persisted_at)
+                {
+                    let cold_end = std::cmp::min(persisted, request.range.end);
+                    let window_start = request
+                        .range
+                        .end
+                        .checked_sub(window)
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    if cold_end >= window_start {
+                        let cold_rows = client
+                            .fetch_range(
+                                &request.tenant,
+                                &request.symbols,
+                                system_time_to_micros(window_start),
+                                system_time_to_micros(cold_end),
+                            )
+                            .await?;
+                        for row in cold_rows {
+                            *counts.entry(row.symbol.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+
+            let mut rows = Vec::with_capacity(counts.len().max(request.symbols.len()).max(1));
+            for symbol in request.symbols.clone() {
+                let count = *counts.get(&symbol).unwrap_or(&0);
+                let payload = serde_json::to_vec(&json!({
+                    "aggregation": "count",
+                    "window_micros": config.length_micros,
+                    "count": count,
+                }))
+                .map_err(|err| AppError(anyhow!(err)))?;
+                rows.push(proxist_api::QueryRow {
+                    symbol,
+                    timestamp: request.range.end,
+                    payload: ByteBuf::from(payload),
+                });
+            }
+            rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+
+            Ok::<_, AppError>(rows)
+        }
+    }?;
+
+    Ok(QueryResponse { rows })
 }
 
 #[derive(Debug)]
@@ -1323,7 +1441,7 @@ mod wal_bootstrap_tests {
     use proxist_core::query::QueryRange;
     use serde_bytes::ByteBuf;
     use std::time::{Duration, UNIX_EPOCH};
-    use tempfile::tempdir;
+    use tempfile::{tempdir, NamedTempFile};
 
     struct EnvVarGuard {
         key: &'static str,
@@ -1411,6 +1529,71 @@ mod wal_bootstrap_tests {
             .cloned()
             .unwrap_or_default();
         assert_eq!(symbols, vec!["AAPL".to_string()]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn last_by_include_cold_uses_seam_rows() -> anyhow::Result<()> {
+        let metadata_file = NamedTempFile::new()?;
+        let metadata_path = metadata_file.path().to_str().unwrap().to_string();
+        let metadata = SqliteMetadataStore::connect(&metadata_path).await?;
+        metadata
+            .put_shard_assignment(ShardAssignment {
+                shard_id: "alpha-shard".into(),
+                tenant_id: "alpha".into(),
+                node_id: "node-a".into(),
+                symbol_range: ("A".into(), "Z".into()),
+            })
+            .await?;
+
+        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
+        let hot_store = Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let hot_store_trait: Arc<dyn HotColumnStore> = hot_store.clone();
+        let service = IngestService::new(metadata.clone(), wal, hot_store_trait, None);
+
+        let snapshot = metadata.get_cluster_metadata().await?;
+        service.apply_metadata(&snapshot).await?;
+
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let batch = IngestBatchRequest {
+            ticks: vec![IngestTick {
+                tenant: "alpha".into(),
+                symbol: "AAPL".into(),
+                timestamp: ts,
+                payload: ByteBuf::from(vec![1]),
+                seq: 1,
+            }],
+        };
+        service.ingest(batch).await?;
+
+        let state = AppState {
+            metadata: metadata.clone(),
+            metadata_cache: Arc::new(tokio::sync::Mutex::new(snapshot)),
+            hot_store,
+            ingest: Arc::new(service),
+            metrics: None,
+            api_token: None,
+        };
+
+        let range = QueryRange::new(ts - Duration::from_millis(1), ts + Duration::from_secs(1));
+        let request = QueryRequest {
+            tenant: "alpha".into(),
+            symbols: vec!["AAPL".into()],
+            range,
+            include_cold: true,
+            op: QueryOperation::LastBy,
+            rolling: None,
+        };
+
+        let response = execute_query(&state, request)
+            .await
+            .map_err(|err| err.0)?;
+        assert_eq!(response.rows.len(), 1);
+        let row = &response.rows[0];
+        assert_eq!(row.symbol, "AAPL");
+        assert_eq!(row.timestamp, ts);
+        assert_eq!(row.payload.as_ref(), &[1]);
 
         Ok(())
     }

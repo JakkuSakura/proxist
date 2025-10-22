@@ -50,6 +50,13 @@ pub struct HotSymbolSummary {
 }
 
 #[derive(Debug, Clone)]
+pub struct RollingWindowRow {
+    pub symbol: String,
+    pub window_end: SystemTime,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone)]
 struct Row {
     timestamp: SystemTime,
     micros: i64,
@@ -128,6 +135,15 @@ pub trait HotColumnStore: Send + Sync {
     ) -> anyhow::Result<Vec<HotRow>>;
 
     async fn hot_summary(&self) -> anyhow::Result<Vec<HotSymbolSummary>>;
+
+    async fn rolling_window(
+        &self,
+        tenant: &TenantId,
+        symbols: &[String],
+        window_end: SystemTime,
+        window: Duration,
+        lower_bound: Option<SystemTime>,
+    ) -> anyhow::Result<Vec<RollingWindowRow>>;
 }
 
 #[async_trait]
@@ -370,6 +386,61 @@ impl HotColumnStore for InMemoryHotColumnStore {
 
         Ok(summaries)
     }
+
+    async fn rolling_window(
+        &self,
+        tenant: &TenantId,
+        symbols: &[String],
+        window_end: SystemTime,
+        window: Duration,
+        lower_bound: Option<SystemTime>,
+    ) -> anyhow::Result<Vec<RollingWindowRow>> {
+        let window_length = window.as_micros().min(i64::MAX as u128) as i64;
+        let end_micros = system_time_to_micros(window_end);
+        let start_micros = end_micros.saturating_sub(window_length);
+        let lower_bound_micros = lower_bound.map(system_time_to_micros);
+
+        let guard = self.inner.read().await;
+        let Some(tenant_store) = guard.get(tenant) else {
+            return Ok(Vec::new());
+        };
+
+        let mut results = Vec::new();
+        let emit_zero = !symbols.is_empty();
+        let symbol_keys: Vec<String> = if symbols.is_empty() {
+            tenant_store.symbols.keys().cloned().collect()
+        } else {
+            symbols.iter().cloned().collect()
+        };
+
+        for symbol in symbol_keys {
+            if let Some(store) = tenant_store.symbols.get(&symbol) {
+                let start_idx = store.rows.partition_point(|row| row.micros < start_micros);
+                let end_idx = store.rows.partition_point(|row| row.micros <= end_micros);
+                let slice = &store.rows[start_idx..end_idx];
+                let count = match lower_bound_micros {
+                    Some(bound) => slice.iter().filter(|row| row.micros > bound).count() as u64,
+                    None => slice.len() as u64,
+                };
+                if count > 0 || emit_zero {
+                    let row = RollingWindowRow {
+                        symbol,
+                        window_end,
+                        count,
+                    };
+                    results.push(row);
+                }
+            } else if emit_zero {
+                results.push(RollingWindowRow {
+                    symbol,
+                    window_end,
+                    count: 0,
+                });
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 fn find_last_le(rows: &[Row], micros: i64) -> Option<&Row> {
@@ -427,6 +498,37 @@ mod tests {
             .await?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].payload, b"r1".to_vec());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rolling_window_counts_rows_within_duration() -> anyhow::Result<()> {
+        let store = InMemoryHotColumnStore::new(MemConfig::default());
+        let tenant: TenantId = "tenant".into();
+        store
+            .append_row(&tenant, "AAPL", ts(1_000), b"r1")
+            .await?;
+        store
+            .append_row(&tenant, "AAPL", ts(2_000), b"r2")
+            .await?;
+        store
+            .append_row(&tenant, "AAPL", ts(4_000), b"r3")
+            .await?;
+
+        let window_end = ts(3_500);
+        let rows = store
+            .rolling_window(
+                &tenant,
+                &["AAPL".into()],
+                window_end,
+                Duration::from_millis(2_500),
+                None,
+            )
+            .await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 2);
+        assert_eq!(rows[0].symbol, "AAPL");
+        assert_eq!(rows[0].window_end, window_end);
         Ok(())
     }
 }

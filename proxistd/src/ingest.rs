@@ -11,7 +11,7 @@ use anyhow::Result;
 use proxist_api::{ClickhouseStatus, IngestBatchRequest};
 use proxist_ch::{ClickhouseHttpClient, ClickhouseSink, ClickhouseTarget};
 use proxist_core::{
-    metadata::{ShardHealth, TenantId},
+    metadata::{ClusterMetadata, ShardHealth, TenantId},
     MetadataStore, PersistenceBatch, PersistenceTransition, ShardPersistenceTracker,
 };
 use proxist_mem::{HotColumnStore, HotSymbolSummary};
@@ -28,9 +28,10 @@ pub struct IngestService {
     clickhouse_target: Option<ClickhouseTarget>,
     clickhouse_client: Option<Arc<ClickhouseHttpClient>>,
     last_flush_micros: AtomicI64,
-    clickhouse_error: Mutex<Option<String>>,
-    persistence_trackers: Mutex<HashMap<String, ShardPersistenceTracker>>,
-    symbol_shards: Mutex<HashMap<(TenantId, String), String>>,
+   clickhouse_error: Mutex<Option<String>>,
+   persistence_trackers: Mutex<HashMap<String, ShardPersistenceTracker>>,
+   symbol_shards: Mutex<HashMap<(TenantId, String), String>>,
+    tenant_assignments: Mutex<HashMap<TenantId, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,7 +143,99 @@ impl IngestService {
             clickhouse_error: Mutex::new(None),
             persistence_trackers: Mutex::new(HashMap::new()),
             symbol_shards: Mutex::new(HashMap::new()),
+            tenant_assignments: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub async fn apply_metadata(&self, metadata: &ClusterMetadata) -> anyhow::Result<()> {
+        {
+            let mut tenant_map = self.tenant_assignments.lock().await;
+            tenant_map.clear();
+            for assignment in &metadata.assignments {
+                tenant_map.insert(
+                    assignment.tenant_id.clone(),
+                    assignment.shard_id.clone(),
+                );
+            }
+        }
+
+        {
+            let mut symbol_map = self.symbol_shards.lock().await;
+            symbol_map.retain(|(tenant, symbol), _| {
+                metadata
+                    .symbol_dictionaries
+                    .get(tenant)
+                    .map_or(false, |symbols| symbols.contains(symbol))
+            });
+            for assignment in &metadata.assignments {
+                if let Some(symbols) = metadata.symbol_dictionaries.get(&assignment.tenant_id) {
+                    for symbol in symbols {
+                        symbol_map.insert(
+                            (assignment.tenant_id.clone(), symbol.clone()),
+                            assignment.shard_id.clone(),
+                        );
+                    }
+                }
+            }
+        }
+
+        {
+            let mut trackers = self.persistence_trackers.lock().await;
+            trackers.retain(|shard_id, _| {
+                metadata
+                    .assignments
+                    .iter()
+                    .any(|assignment| &assignment.shard_id == shard_id)
+            });
+            for assignment in &metadata.assignments {
+                trackers
+                    .entry(assignment.shard_id.clone())
+                    .or_insert_with(|| ShardPersistenceTracker::new(assignment.shard_id.clone()));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_shard(
+        &self,
+        tenant: &TenantId,
+        symbol: &str,
+    ) -> anyhow::Result<String> {
+        let key = (tenant.clone(), symbol.to_string());
+        if let Some(shard) = {
+            let map = self.symbol_shards.lock().await;
+            map.get(&key).cloned()
+        } {
+            return Ok(shard);
+        }
+
+        if let Some(shard) = {
+            let map = self.tenant_assignments.lock().await;
+            map.get(tenant).cloned()
+        } {
+            let mut symbol_map = self.symbol_shards.lock().await;
+            symbol_map.insert(key, shard.clone());
+            return Ok(shard);
+        }
+
+        let snapshot = self.metadata.get_cluster_metadata().await?;
+        self.apply_metadata(&snapshot).await?;
+        if let Some(assignment) = snapshot
+            .assignments
+            .iter()
+            .find(|assign| &assign.tenant_id == tenant)
+        {
+            let shard_id = assignment.shard_id.clone();
+            let mut symbol_map = self.symbol_shards.lock().await;
+            symbol_map.insert(
+                (tenant.clone(), symbol.to_string()),
+                shard_id.clone(),
+            );
+            return Ok(shard_id);
+        }
+
+        Ok(format!("{tenant}::{symbol}"))
     }
 
     fn plan_shard_batches(segment: &WalSegment) -> Vec<ShardBatchPlan> {
@@ -261,7 +354,7 @@ impl IngestService {
         let _guard = span.enter();
         metrics::counter!("proxist_ingest_requests_total", 1);
         for tick in &batch.ticks {
-            let shard_id = resolve_shard(&self.metadata, &tick.tenant, &tick.symbol).await?;
+            let shard_id = self.resolve_shard(&tick.tenant, &tick.symbol).await?;
 
             self.metadata
                 .alloc_symbol(&tick.tenant, &tick.symbol)
@@ -432,6 +525,11 @@ impl IngestService {
         self.clickhouse_target.as_ref().map(|t| t.table.clone())
     }
 
+    pub async fn tracker_snapshot(&self) -> Vec<ShardPersistenceTracker> {
+        let guard = self.persistence_trackers.lock().await;
+        guard.values().cloned().collect()
+    }
+
     pub async fn hot_cold_summary(&self) -> anyhow::Result<Vec<HotColdSummaryRow>> {
         let hot_stats = self.hot_store.hot_summary().await?;
         let mut hot_map: HashMap<(TenantId, String), HotSymbolSummary> =
@@ -496,23 +594,6 @@ impl IngestService {
 
         Ok(rows)
     }
-}
-
-async fn resolve_shard(
-    metadata: &SqliteMetadataStore,
-    tenant: &TenantId,
-    symbol: &str,
-) -> Result<String> {
-    let snapshot = metadata.get_cluster_metadata().await?;
-    if let Some(assignment) = snapshot
-        .assignments
-        .iter()
-        .find(|assign| &assign.tenant_id == tenant)
-    {
-        return Ok(assignment.shard_id.clone());
-    }
-
-    Ok(format!("{tenant}::{symbol}"))
 }
 
 fn payload_to_vec(buf: &ByteBuf) -> Vec<u8> {
@@ -675,6 +756,17 @@ mod tests {
                 .collect();
 
             Ok(summaries)
+        }
+
+        async fn rolling_window(
+            &self,
+            _tenant: &TenantId,
+            _symbols: &[String],
+            _window_end: std::time::SystemTime,
+            _window: Duration,
+            _lower_bound: Option<std::time::SystemTime>,
+        ) -> anyhow::Result<Vec<proxist_mem::RollingWindowRow>> {
+            Ok(Vec::new())
         }
     }
 
@@ -920,6 +1012,38 @@ mod tests {
         assert_eq!(map.get(&("alpha".into(), "MSFT".into())), Some(&1));
         assert_eq!(map.get(&("beta".into(), "GOOG".into())), Some(&1));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_application_populates_symbol_assignments() -> anyhow::Result<()> {
+        let temp = NamedTempFile::new()?;
+        let metadata = SqliteMetadataStore::connect(temp.path().to_str().unwrap()).await?;
+        metadata
+            .put_shard_assignment(ShardAssignment {
+                shard_id: "alpha-shard".into(),
+                tenant_id: "alpha".into(),
+                node_id: "node-a".into(),
+                symbol_range: ("A".into(), "Z".into()),
+            })
+            .await?;
+        metadata.alloc_symbol(&"alpha".into(), "AAPL").await?;
+
+        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
+        let hot_store: Arc<dyn HotColumnStore> =
+            Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let service = IngestService::new(metadata.clone(), wal, hot_store, None);
+
+        let snapshot = metadata.get_cluster_metadata().await?;
+        service.apply_metadata(&snapshot).await?;
+
+        let summary = service.hot_cold_summary().await?;
+        assert_eq!(summary.len(), 1);
+        let row = &summary[0];
+        assert_eq!(row.tenant, "alpha");
+        assert_eq!(row.symbol, "AAPL");
+        assert_eq!(row.shard_id.as_deref(), Some("alpha-shard"));
+        assert_eq!(row.hot_rows, 0);
         Ok(())
     }
 }

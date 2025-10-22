@@ -3,7 +3,10 @@
 use std::time::SystemTime;
 
 pub use proxist_core::metadata::{ShardAssignment, ShardHealth};
-use proxist_core::{metadata::TenantId, query::QueryRange};
+use proxist_core::{
+    metadata::TenantId,
+    query::{QueryRange, RollingWindowConfig},
+};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
@@ -30,6 +33,8 @@ pub struct QueryRequest {
     pub include_cold: bool,
     #[serde(default = "default_query_op")]
     pub op: proxist_core::query::QueryOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling: Option<RollingWindowConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

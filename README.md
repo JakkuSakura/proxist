@@ -64,6 +64,7 @@ beta    GOOG        beta::GOOG     4            1704103203000000     17041032050
 - Set `PROXIST_WAL_DIR` to enable disk-backed WAL persistence and replay; otherwise the daemon falls back to in-memory WALs for dev.
 - Disk WAL can emit snapshots + manifests so nodes can replay from the latest snapshot before scanning recent segments.
 - Hot query path supports `range`, `last_by`, and `asof` operations across the in-memory store; planners will stitch in ClickHouse results once persistence watermarking is complete.
+- Daemon bearer auth can be sourced from `PROXIST_API_TOKEN_FILE`, keeping tokens out of process environments.
 
 ## MVP Scope
 

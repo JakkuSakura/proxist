@@ -9,7 +9,7 @@ use proxist_api::{
 };
 use proxist_core::{
     metadata::ClusterMetadata,
-    query::{QueryOperation, QueryRange},
+    query::{QueryOperation, QueryRange, RollingAggregation, RollingWindowConfig},
 };
 use reqwest::{Client, RequestBuilder};
 use serde::Serialize;
@@ -57,6 +57,12 @@ enum Commands {
         end_micros: Option<i64>,
         #[arg(long, default_value = "range")]
         op: String,
+        #[arg(long, default_value_t = false)]
+        include_cold: bool,
+        #[arg(long)]
+        window_micros: Option<u64>,
+        #[arg(long, default_value = "count")]
+        window_agg: String,
     },
     /// Inject a test ingest batch described via JSON.
     Ingest {
@@ -192,12 +198,24 @@ fn main() -> anyhow::Result<()> {
             start_micros,
             end_micros,
             op,
+            include_cold,
+            window_micros,
+            window_agg,
         } => {
             let request = if let Some(path) = file {
                 let json = std::fs::read_to_string(&path)?;
                 serde_json::from_str::<QueryRequest>(&json)?
             } else {
-                build_query_request(tenant, symbols, start_micros, end_micros, op)?
+                build_query_request(
+                    tenant,
+                    symbols,
+                    start_micros,
+                    end_micros,
+                    op,
+                    include_cold,
+                    window_micros,
+                    window_agg,
+                )?
             };
             let url = format!("{}/query", endpoint);
             info!("submitting query to {}", url);
@@ -269,6 +287,9 @@ fn build_query_request(
     start_micros: Option<i64>,
     end_micros: Option<i64>,
     op: String,
+    include_cold: bool,
+    window_micros: Option<u64>,
+    window_agg: String,
 ) -> anyhow::Result<QueryRequest> {
     let tenant =
         tenant.ok_or_else(|| anyhow::anyhow!("tenant is required unless --file is provided"))?;
@@ -276,6 +297,7 @@ fn build_query_request(
         "range" => QueryOperation::Range,
         "last_by" => QueryOperation::LastBy,
         "asof" => QueryOperation::AsOf,
+        "rolling_window" => QueryOperation::RollingWindow,
         other => anyhow::bail!("unknown query op: {}", other),
     };
 
@@ -292,13 +314,39 @@ fn build_query_request(
         micros_to_system_time(end_micros),
     );
 
+    let rolling = if matches!(op, QueryOperation::RollingWindow) {
+        let length = window_micros
+            .ok_or_else(|| anyhow::anyhow!("--window-micros is required for rolling_window"))?;
+        if length == 0 {
+            anyhow::bail!("rolling window must be greater than zero microseconds");
+        }
+        let aggregation = parse_rolling_aggregation(&window_agg)?;
+        Some(RollingWindowConfig {
+            length_micros: length,
+            aggregation,
+        })
+    } else {
+        if window_micros.is_some() {
+            anyhow::bail!("--window-micros is only valid with rolling_window operation");
+        }
+        None
+    };
+
     Ok(QueryRequest {
         tenant,
         symbols,
         range,
-        include_cold: false,
+        include_cold,
         op,
+        rolling,
     })
+}
+
+fn parse_rolling_aggregation(name: &str) -> anyhow::Result<RollingAggregation> {
+    match name.to_ascii_lowercase().as_str() {
+        "count" => Ok(RollingAggregation::Count),
+        other => anyhow::bail!("unsupported rolling aggregation: {}", other),
+    }
 }
 
 fn micros_to_system_time(micros: i64) -> std::time::SystemTime {
