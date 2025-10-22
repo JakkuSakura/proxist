@@ -521,6 +521,41 @@ fn format_opt_i64(value: Option<i64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ingest_summary_tsv_neutral() {
+        let input = "group_key\tentity_key\troute_key\tmemory_rows\tmemory_first_micros\tmemory_last_micros\tdurable_through_micros\twal_high_micros
+alpha\tAAPL\talpha::AAPL\t8\t1704103200000000\t1704103203000000\t1704103203000000\t1704103203000000
+";
+        let rows = parse_ingest_summary_tsv(input).expect("parse neutral header");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.group_key, "alpha");
+        assert_eq!(row.entity_key, "AAPL");
+        assert_eq!(row.route_key.as_deref(), Some("alpha::AAPL"));
+        assert_eq!(row.memory_rows, 8);
+        assert_eq!(row.durable_through_micros, Some(1704103203000000));
+    }
+
+    #[test]
+    fn parse_ingest_summary_tsv_legacy() {
+        let input = "\
+tenant\tsymbol\tshard_id\thot_rows\thot_first_micros\thot_last_micros\tpersisted_through_micros\twal_high_micros
+beta\tGOOG\tbeta::GOOG\t4\t1704103203000000\t1704103205000000\t1704103205000000\t1704103205000000
+";
+        let rows = parse_ingest_summary_tsv(input).expect("parse legacy header");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.group_key, "beta");
+        assert_eq!(row.entity_key, "GOOG");
+        assert_eq!(row.route_key.as_deref(), Some("beta::GOOG"));
+        assert_eq!(row.memory_rows, 4);
+        assert_eq!(row.durable_through_micros, Some(1704103205000000));
+    }
+}
 fn fetch_status(
     rt: &Runtime,
     client: &Client,

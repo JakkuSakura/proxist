@@ -298,6 +298,7 @@ enum OutputFormat {
     Default,
     TabSeparated,
     TabSeparatedWithNames,
+    JsonEachRow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,7 +315,6 @@ fn match_system_summary_query(sql: &str) -> Option<SystemSummaryView> {
     }
 
     let normalized = lower.replace('"', "").replace('`', "");
-    info!(query = %lower, normalized = %normalized, "inspecting system summary query");
     if normalized.contains("system.proxist_hot_summary") {
         Some(SystemSummaryView::Legacy)
     } else if normalized.contains("system.proxist_ingest_summary")
@@ -338,6 +338,7 @@ fn detect_output_format(sql: &str) -> OutputFormat {
             return match upper.as_str() {
                 "TSVWITHNAMES" | "TABSEPARATEDWITHNAMES" => OutputFormat::TabSeparatedWithNames,
                 "TSV" | "TABSEPARATED" => OutputFormat::TabSeparated,
+                "JSONEACHROW" => OutputFormat::JsonEachRow,
                 _ => OutputFormat::Default,
             };
         }
@@ -350,7 +351,6 @@ fn render_system_summary(
     format: OutputFormat,
     view: SystemSummaryView,
 ) -> String {
-    info!(?view, row_count = rows.len(), "rendering system summary");
     let headers: [&str; 8] = match view {
         SystemSummaryView::Legacy => [
             "tenant",
@@ -373,6 +373,10 @@ fn render_system_summary(
             "wal_high_micros",
         ],
     };
+
+    if matches!(format, OutputFormat::JsonEachRow) {
+        return render_system_summary_json(rows, view);
+    }
 
     let mut output = String::new();
     if matches!(format, OutputFormat::TabSeparatedWithNames) {
@@ -417,6 +421,37 @@ fn format_opt_micros(value: Option<SystemTime>) -> String {
         Some(ts) => system_time_to_micros(ts).to_string(),
         None => "\\N".to_string(),
     }
+}
+
+fn render_system_summary_json(rows: &[HotColdSummaryRow], view: SystemSummaryView) -> String {
+    let mut output = String::new();
+    for row in rows {
+        let payload = match view {
+            SystemSummaryView::Legacy => serde_json::json!({
+                "tenant": row.tenant,
+                "symbol": row.symbol,
+                "shard_id": row.shard_id,
+                "hot_rows": row.hot_rows,
+                "hot_first_micros": row.hot_first.map(system_time_to_micros),
+                "hot_last_micros": row.hot_last.map(system_time_to_micros),
+                "persisted_through_micros": row.persisted_through.map(system_time_to_micros),
+                "wal_high_micros": row.wal_high.map(system_time_to_micros),
+            }),
+            SystemSummaryView::Neutral => serde_json::json!({
+                "group_key": row.tenant,
+                "entity_key": row.symbol,
+                "route_key": row.shard_id,
+                "memory_rows": row.hot_rows,
+                "memory_first_micros": row.hot_first.map(system_time_to_micros),
+                "memory_last_micros": row.hot_last.map(system_time_to_micros),
+                "durable_through_micros": row.persisted_through.map(system_time_to_micros),
+                "wal_high_micros": row.wal_high.map(system_time_to_micros),
+            }),
+        };
+        output.push_str(&payload.to_string());
+        output.push('\n');
+    }
+    output
 }
 
 async fn forward_sql_to_clickhouse(state: &AppState, sql: &str) -> Result<String, AppError> {

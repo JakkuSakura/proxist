@@ -70,10 +70,10 @@ STATUS=0
 TMP_OUTPUT="$(mktemp)"
 RAW_OUTPUT="$(mktemp)"
 
-for sql_file in "${ROOT_DIR}"/sql/*.sql; do
+for sql_file in "${ROOT_DIR}"/tests/sql/*.sql; do
   [[ -e "$sql_file" ]] || continue
   base="$(basename "${sql_file}" .sql)"
-  expected_file="${ROOT_DIR}/sql/${base}.expected"
+  expected_file="${ROOT_DIR}/tests/sql/${base}.expected"
 
   echo "Executing SQL script: ${base}"
   HTTP_STATUS=$(curl -sS -o "${RAW_OUTPUT}" -w '%{http_code}' \

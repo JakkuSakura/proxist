@@ -546,6 +546,7 @@ mod tests {
     use proxist_mem::{InMemoryHotColumnStore, MemConfig, SeamBoundaryRow};
     use proxist_wal::{InMemoryWal, WalRecord, WalSegment};
     use std::collections::HashMap;
+    use std::time::Duration;
     use tempfile::{NamedTempFile, TempDir};
     use tokio::sync::Mutex;
 
@@ -863,6 +864,61 @@ mod tests {
         assert!(status.last_flush.is_some());
         assert!(status.last_error.is_none());
         assert_eq!(status.target.unwrap().table, target.table);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hot_summary_matches_ingested_counts() -> anyhow::Result<()> {
+        let temp = NamedTempFile::new()?;
+        let metadata = SqliteMetadataStore::connect(temp.path().to_str().unwrap()).await?;
+        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
+        let hot_store: Arc<dyn HotColumnStore> =
+            Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let service = IngestService::new(metadata.clone(), wal, hot_store, None);
+
+        let ticks = vec![
+            IngestTick {
+                tenant: "alpha".into(),
+                symbol: "AAPL".into(),
+                timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(1),
+                payload: ByteBuf::from(vec![]),
+                seq: 1,
+            },
+            IngestTick {
+                tenant: "alpha".into(),
+                symbol: "MSFT".into(),
+                timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(2),
+                payload: ByteBuf::from(vec![]),
+                seq: 2,
+            },
+            IngestTick {
+                tenant: "alpha".into(),
+                symbol: "AAPL".into(),
+                timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(3),
+                payload: ByteBuf::from(vec![]),
+                seq: 3,
+            },
+            IngestTick {
+                tenant: "beta".into(),
+                symbol: "GOOG".into(),
+                timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(4),
+                payload: ByteBuf::from(vec![]),
+                seq: 1,
+            },
+        ];
+
+        service.ingest(IngestBatchRequest { ticks }).await?;
+        let summary = service.hot_cold_summary().await?;
+
+        let mut map = std::collections::HashMap::new();
+        for row in summary {
+            map.insert((row.tenant.clone(), row.symbol.clone()), row.hot_rows);
+        }
+
+        assert_eq!(map.get(&("alpha".into(), "AAPL".into())), Some(&2));
+        assert_eq!(map.get(&("alpha".into(), "MSFT".into())), Some(&1));
+        assert_eq!(map.get(&("beta".into(), "GOOG".into())), Some(&1));
 
         Ok(())
     }
