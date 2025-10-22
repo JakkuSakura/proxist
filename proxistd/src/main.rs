@@ -1315,3 +1315,103 @@ mod system_summary_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wal_bootstrap_tests {
+    use super::*;
+    use proxist_api::{IngestBatchRequest, IngestTick};
+    use proxist_core::query::QueryRange;
+    use serde_bytes::ByteBuf;
+    use std::time::{Duration, UNIX_EPOCH};
+    use tempfile::tempdir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.original {
+                std::env::set_var(self.key, prev);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn file_wal_replay_restores_hot_store() -> anyhow::Result<()> {
+        let wal_tempdir = tempdir()?;
+        let wal_path = wal_tempdir.path().canonicalize()?;
+        let _wal_guard = EnvVarGuard::set("PROXIST_WAL_DIR", wal_path.to_str().unwrap());
+
+        let metadata_dir = tempdir()?;
+        let metadata_path = metadata_dir.path().join("meta.db");
+        let metadata_path_str = metadata_path.to_str().unwrap().to_string();
+
+        let config = DaemonConfig {
+            metadata_path: metadata_path_str.clone(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            clickhouse: None,
+            api_token: None,
+        };
+
+        let metadata_store = SqliteMetadataStore::connect(&metadata_path_str).await?;
+        let daemon = ProxistDaemon::new(config.clone(), metadata_store, None).await?;
+
+        let base = UNIX_EPOCH + Duration::from_secs(1);
+        let batch = IngestBatchRequest {
+            ticks: vec![
+                IngestTick {
+                    tenant: "alpha".into(),
+                    symbol: "AAPL".into(),
+                    timestamp: base,
+                    payload: ByteBuf::from(vec![1, 2, 3]),
+                    seq: 42,
+                },
+                IngestTick {
+                    tenant: "alpha".into(),
+                    symbol: "AAPL".into(),
+                    timestamp: base + Duration::from_secs(1),
+                    payload: ByteBuf::from(vec![4, 5, 6]),
+                    seq: 43,
+                },
+            ],
+        };
+
+        daemon.ingest_service.ingest(batch).await?;
+        drop(daemon);
+
+        let restarted_metadata = SqliteMetadataStore::connect(&metadata_path_str).await?;
+        let restarted = ProxistDaemon::new(config.clone(), restarted_metadata, None).await?;
+
+        let tenant: proxist_core::metadata::TenantId = "alpha".into();
+        let range = QueryRange::new(base - Duration::from_secs(1), base + Duration::from_secs(3));
+        let rows = restarted
+            .hot_store
+            .scan_range(&tenant, &range, &["AAPL".into()])
+            .await?;
+        assert_eq!(rows.len(), 2, "expected replay to restore both rows");
+        assert_eq!(rows[0].payload, vec![1, 2, 3]);
+        assert_eq!(rows[1].payload, vec![4, 5, 6]);
+
+        let metadata_snapshot = restarted.metadata_store.get_cluster_metadata().await?;
+        let symbols = metadata_snapshot
+            .symbol_dictionaries
+            .get("alpha")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(symbols, vec!["AAPL".to_string()]);
+
+        Ok(())
+    }
+}

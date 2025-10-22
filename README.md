@@ -38,6 +38,7 @@ For the full design matrix, see `docs/design-goals.md`.
 ## Documentation
 
 - Architecture overview, state machines, and metadata responsibilities: `docs/architecture.md`.
+- Hot/cold seam semantics and aggregation strategy: `docs/hot-cold.md`.
 - Design goals and MVP acceptance criteria: `docs/design-goals.md`.
 - Roadmap, CLI ergonomics, and deployment guidance (in progress): `docs/roadmap.md`.
 
