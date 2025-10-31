@@ -34,8 +34,9 @@ use proxist_core::{
     MetadataStore, ShardAssignment, ShardHealth,
 };
 use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
+use proxist_exec::{ExecutorConfig, InMemoryScheduler, SqlExecutor};
 use proxist_metadata_sqlite::SqliteMetadataStore;
-use proxist_wal::{FileWal, InMemoryWal, WalConfig, WalRecord, WalWriter};
+// WAL removed: ingestion is immediately applied to hot store and persisted
 use serde_bytes::ByteBuf;
 use serde_json::json;
 use sqlparser::{
@@ -117,30 +118,11 @@ impl DaemonConfig {
     }
 }
 
-struct WalBootstrap {
-    writer: Arc<dyn WalWriter>,
-    records: Vec<WalRecord>,
-}
-
-async fn wal_from_env() -> anyhow::Result<Option<WalBootstrap>> {
-    if let Ok(dir) = env::var("PROXIST_WAL_DIR") {
-        let mut config = WalConfig::default();
-        config.directory = PathBuf::from(dir);
-        let wal = FileWal::open(config.clone()).await?;
-        let records = wal
-            .load_snapshot_and_replay()
-            .await
-            .context("load WAL snapshot and tail records")?;
-        let writer: Arc<dyn WalWriter> = Arc::new(wal);
-        return Ok(Some(WalBootstrap { writer, records }));
-    }
-    Ok(None)
-}
+// WAL bootstrap removed
 
 fn load_clickhouse_config() -> Option<ClickhouseConfig> {
     let endpoint = std::env::var("PROXIST_CLICKHOUSE_ENDPOINT").ok()?;
-    let database =
-        std::env::var("PROXIST_CLICKHOUSE_DATABASE").unwrap_or_else(|_| "proxist".into());
+    let database = std::env::var("PROXIST_CLICKHOUSE_DATABASE").unwrap_or_else(|_| "proxist".into());
     let table = std::env::var("PROXIST_CLICKHOUSE_TABLE").unwrap_or_else(|_| "ticks".into());
     let username = std::env::var("PROXIST_CLICKHOUSE_USER").ok();
     let password = std::env::var("PROXIST_CLICKHOUSE_PASSWORD").ok();
@@ -184,6 +166,7 @@ struct ProxistDaemon {
     metadata_store: SqliteMetadataStore,
     hot_store: Arc<dyn HotColumnStore>,
     ingest_service: Arc<IngestService>,
+    scheduler: Arc<InMemoryScheduler>,
     metrics_handle: Option<PrometheusHandle>,
 }
 
@@ -193,6 +176,7 @@ struct AppState {
     metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
     hot_store: Arc<dyn HotColumnStore>,
     ingest: Arc<IngestService>,
+    scheduler: Arc<InMemoryScheduler>,
     metrics: Option<PrometheusHandle>,
     api_token: Option<String>,
 }
@@ -532,13 +516,23 @@ fn render_system_summary_json(rows: &[HotColdSummaryRow], view: SystemSummaryVie
     output
 }
 
-async fn forward_sql_to_clickhouse(state: &AppState, sql: &str) -> Result<String, AppError> {
-    let client = state
-        .ingest
-        .clickhouse_client()
-        .ok_or_else(|| AppError(anyhow!("ClickHouse client not configured")))?;
-    let text = client.execute_raw(sql).await?;
-    Ok(text)
+fn render_rows_as_jsoneachrow(rows: Vec<serde_json::Map<String, serde_json::Value>>) -> String {
+    let mut out = String::new();
+    for row in rows {
+        out.push_str(&serde_json::Value::Object(row).to_string());
+        out.push('\n');
+    }
+    out
+}
+
+async fn forward_sql_to_scheduler(state: &AppState, sql: &str) -> Result<String, AppError> {
+    use proxist_exec::SqlResult;
+    let result = state.scheduler.execute(sql).await?;
+    let body = match result {
+        SqlResult::Text(s) => s,
+        SqlResult::Rows(rows) => render_rows_as_jsoneachrow(rows),
+    };
+    Ok(body)
 }
 
 fn build_ingest_ticks(
@@ -738,11 +732,7 @@ impl ProxistDaemon {
         let cache = Arc::new(tokio::sync::Mutex::new(ClusterMetadata::default()));
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let wal_bootstrap = wal_from_env().await?;
-        let (wal, replay_records): (Arc<dyn WalWriter>, Vec<WalRecord>) = match wal_bootstrap {
-            Some(b) => (b.writer, b.records),
-            None => (Arc::new(InMemoryWal::new()), Vec::new()),
-        };
+        let replay_records: Vec<proxist_core::ingest::IngestRecord> = Vec::new();
 
         let clickhouse_bundle = config.clickhouse.clone().and_then(|cfg| {
             let sink = ClickhouseHttpSink::new(cfg.clone())
@@ -766,17 +756,22 @@ impl ProxistDaemon {
 
         let ingest_service = Arc::new(IngestService::new(
             metadata_store.clone(),
-            wal.clone(),
             hot_store.clone(),
             ingest_clickhouse,
         ));
 
-        if !replay_records.is_empty() {
-            ingest_service
-                .warm_from_records(&replay_records)
-                .await
-                .context("replay WAL records into hot store")?;
-        }
+        // Build in-memory scheduler with SQLite + optional ClickHouse
+        let ch_client = clickhouse_bundle.as_ref().map(|(_, _, c)| Arc::clone(c));
+        let scheduler = InMemoryScheduler::new(
+            ExecutorConfig {
+                sqlite_path: Some(config.metadata_path.clone()),
+            },
+            ch_client.map(|c| (*c).clone()),
+        )
+        .await?;
+        let scheduler = Arc::new(scheduler);
+
+        // No WAL replay; ingest is applied directly
 
         Ok(Self {
             config,
@@ -784,6 +779,7 @@ impl ProxistDaemon {
             metadata_store,
             hot_store,
             ingest_service,
+            scheduler,
             metrics_handle,
         })
     }
@@ -850,6 +846,7 @@ impl ProxistDaemon {
             metadata_cache: Arc::clone(&self.metadata_cache),
             hot_store: Arc::clone(&self.hot_store),
             ingest: Arc::clone(&self.ingest_service),
+            scheduler: Arc::clone(&self.scheduler),
             metrics: self.metrics_handle.clone(),
             api_token: self.config.api_token.clone(),
         };
@@ -968,7 +965,7 @@ impl ProxistDaemon {
                         continue;
                     }
                     if parsed.len() != 1 {
-                        let raw = forward_sql_to_clickhouse(&state, normalized).await?;
+                        let raw = forward_sql_to_scheduler(&state, normalized).await?;
                         outputs.push(raw);
                         continue;
                     }
@@ -983,11 +980,11 @@ impl ProxistDaemon {
                         } else {
                             forwarded = ensure_engine_clause(&forwarded, "MergeTree");
                         }
-                        let raw = forward_sql_to_clickhouse(&state, &forwarded).await?;
+                        let raw = forward_sql_to_scheduler(&state, &forwarded).await?;
                         outputs.push(raw);
                         continue;
                     }
-                    let raw = forward_sql_to_clickhouse(&state, normalized).await?;
+                    let raw = forward_sql_to_scheduler(&state, normalized).await?;
                     outputs.push(raw);
                     continue;
                 }
@@ -1000,7 +997,7 @@ impl ProxistDaemon {
                         outputs.push(rendered);
                         continue;
                     }
-                    let raw = forward_sql_to_clickhouse(&state, normalized).await?;
+                    let raw = forward_sql_to_scheduler(&state, normalized).await?;
                     outputs.push(raw);
                     continue;
                 }
@@ -1035,7 +1032,7 @@ impl ProxistDaemon {
                                     expected = %expected,
                                     "forwarding INSERT to ClickHouse"
                                 );
-                                let raw = forward_sql_to_clickhouse(&state, normalized).await?;
+                                let raw = forward_sql_to_scheduler(&state, normalized).await?;
                                 outputs.push(raw);
                                 continue;
                             }
@@ -1051,17 +1048,17 @@ impl ProxistDaemon {
                                     outputs.push("Ok.\n".to_string());
                                 }
                                 _ => {
-                                    let raw = forward_sql_to_clickhouse(&state, normalized).await?;
+                                    let raw = forward_sql_to_scheduler(&state, normalized).await?;
                                     outputs.push(raw);
                                 }
                             }
                         } else {
-                            let raw = forward_sql_to_clickhouse(&state, normalized).await?;
+                            let raw = forward_sql_to_scheduler(&state, normalized).await?;
                             outputs.push(raw);
                         }
                     }
                     _ => {
-                        let raw = forward_sql_to_clickhouse(&state, normalized).await?;
+                        let raw = forward_sql_to_scheduler(&state, normalized).await?;
                         outputs.push(raw);
                     }
                 }
@@ -1466,103 +1463,13 @@ mod system_summary_tests {
 }
 
 #[cfg(test)]
-mod wal_bootstrap_tests {
+mod ingest_tests {
     use super::*;
     use proxist_api::{IngestBatchRequest, IngestTick};
     use proxist_core::query::{QueryOperation, QueryRange};
     use serde_bytes::ByteBuf;
     use std::time::{Duration, UNIX_EPOCH};
-    use tempfile::{tempdir, NamedTempFile};
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(prev) = &self.original {
-                std::env::set_var(self.key, prev);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn file_wal_replay_restores_hot_store() -> anyhow::Result<()> {
-        let wal_tempdir = tempdir()?;
-        let wal_path = wal_tempdir.path().canonicalize()?;
-        let _wal_guard = EnvVarGuard::set("PROXIST_WAL_DIR", wal_path.to_str().unwrap());
-
-        let metadata_dir = tempdir()?;
-        let metadata_path = metadata_dir.path().join("meta.db");
-        let metadata_path_str = metadata_path.to_str().unwrap().to_string();
-
-        let config = DaemonConfig {
-            metadata_path: metadata_path_str.clone(),
-            http_addr: "127.0.0.1:0".parse().unwrap(),
-            clickhouse: None,
-            api_token: None,
-        };
-
-        let metadata_store = SqliteMetadataStore::connect(&metadata_path_str).await?;
-        let daemon = ProxistDaemon::new(config.clone(), metadata_store, None).await?;
-
-        let base = UNIX_EPOCH + Duration::from_secs(1);
-        let batch = IngestBatchRequest {
-            ticks: vec![
-                IngestTick {
-                    tenant: "alpha".into(),
-                    symbol: "AAPL".into(),
-                    timestamp: base,
-                    payload: ByteBuf::from(vec![1, 2, 3]),
-                    seq: 42,
-                },
-                IngestTick {
-                    tenant: "alpha".into(),
-                    symbol: "AAPL".into(),
-                    timestamp: base + Duration::from_secs(1),
-                    payload: ByteBuf::from(vec![4, 5, 6]),
-                    seq: 43,
-                },
-            ],
-        };
-
-        daemon.ingest_service.ingest(batch).await?;
-        drop(daemon);
-
-        let restarted_metadata = SqliteMetadataStore::connect(&metadata_path_str).await?;
-        let restarted = ProxistDaemon::new(config.clone(), restarted_metadata, None).await?;
-
-        let tenant: proxist_core::metadata::TenantId = "alpha".into();
-        let range = QueryRange::new(base - Duration::from_secs(1), base + Duration::from_secs(3));
-        let rows = restarted
-            .hot_store
-            .scan_range(&tenant, &range, &["AAPL".into()])
-            .await?;
-        assert_eq!(rows.len(), 2, "expected replay to restore both rows");
-        assert_eq!(rows[0].payload, vec![1, 2, 3]);
-        assert_eq!(rows[1].payload, vec![4, 5, 6]);
-
-        let metadata_snapshot = restarted.metadata_store.get_cluster_metadata().await?;
-        let symbols = metadata_snapshot
-            .symbol_dictionaries
-            .get("alpha")
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(symbols, vec!["AAPL".to_string()]);
-
-        Ok(())
-    }
+    use tempfile::NamedTempFile;
 
     #[tokio::test]
     async fn last_by_include_cold_uses_seam_rows() -> anyhow::Result<()> {
@@ -1578,10 +1485,9 @@ mod wal_bootstrap_tests {
             })
             .await?;
 
-        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
         let hot_store = Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
         let hot_store_trait: Arc<dyn HotColumnStore> = hot_store.clone();
-        let service = IngestService::new(metadata.clone(), wal, hot_store_trait, None);
+        let service = IngestService::new(metadata.clone(), hot_store_trait, None);
 
         let snapshot = metadata.get_cluster_metadata().await?;
         service.apply_metadata(&snapshot).await?;
@@ -1643,9 +1549,8 @@ mod wal_bootstrap_tests {
             })
             .await?;
 
-        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
         let hot_store = Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let service = IngestService::new(metadata.clone(), wal, hot_store.clone(), None);
+        let service = IngestService::new(metadata.clone(), hot_store.clone(), None);
         let snapshot = metadata.get_cluster_metadata().await?;
         service.apply_metadata(&snapshot).await?;
 

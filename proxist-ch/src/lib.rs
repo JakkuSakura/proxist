@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use proxist_wal::WalSegment;
+use proxist_core::ingest::IngestSegment;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -51,7 +51,7 @@ pub struct ClickhouseTarget {
 
 #[async_trait]
 pub trait ClickhouseSink: Send + Sync {
-    async fn flush_segment(&self, segment: &WalSegment) -> anyhow::Result<()>;
+    async fn flush_segment(&self, segment: &IngestSegment) -> anyhow::Result<()>;
     fn target(&self) -> ClickhouseTarget;
 }
 
@@ -96,7 +96,7 @@ impl ClickhouseHttpSink {
 
 #[async_trait]
 impl ClickhouseSink for ClickhouseHttpSink {
-    async fn flush_segment(&self, segment: &WalSegment) -> anyhow::Result<()> {
+    async fn flush_segment(&self, segment: &IngestSegment) -> anyhow::Result<()> {
         if segment.records.is_empty() {
             return Ok(());
         }
@@ -175,12 +175,7 @@ impl ClickhouseSink for ClickhouseHttpSink {
             }
         }
 
-        debug!(
-            rows = segment.records.len(),
-            endpoint = %self.config.endpoint,
-            table = %self.config.table,
-            "flushed segment to ClickHouse"
-        );
+        debug!(rows = segment.records.len(), endpoint = %self.config.endpoint, table = %self.config.table, "flushed segment to ClickHouse");
 
         Ok(())
     }

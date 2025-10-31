@@ -2,6 +2,7 @@
 
 pub mod metadata;
 pub mod query;
+pub mod ingest;
 pub mod time;
 pub mod watermark;
 

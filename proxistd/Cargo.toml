@@ -18,7 +18,7 @@ proxist-api = { path = "../proxist-api" }
 proxist-ch = { path = "../proxist-ch" }
 proxist-core = { path = "../proxist-core" }
 proxist-mem = { path = "../proxist-mem" }
-proxist-wal = { path = "../proxist-wal" }
+proxist-exec = { path = "../proxist-exec" }
 proxist-metadata-sqlite = { path = "../proxist-metadata-sqlite" }
 serde_bytes.workspace = true
 tempfile.workspace = true

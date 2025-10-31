@@ -16,13 +16,12 @@ use proxist_core::{
 };
 use proxist_mem::{HotColumnStore, HotSymbolSummary};
 use proxist_metadata_sqlite::SqliteMetadataStore;
-use proxist_wal::{WalRecord, WalSegment, WalWriter};
+use proxist_core::ingest::{IngestRecord, IngestSegment};
 use serde_bytes::ByteBuf;
 use tokio::sync::Mutex;
 
 pub struct IngestService {
     metadata: SqliteMetadataStore,
-    wal: Arc<dyn WalWriter>,
     hot_store: Arc<dyn HotColumnStore>,
     clickhouse: Option<Arc<dyn ClickhouseSink>>,
     clickhouse_target: Option<ClickhouseTarget>,
@@ -51,8 +50,6 @@ struct ShardBatchPlan {
     shard_id: String,
     tenant: TenantId,
     batch: PersistenceBatch,
-    wal_first_offset: u64,
-    wal_last_offset: u64,
     rows: usize,
 }
 
@@ -62,25 +59,21 @@ struct ShardBatchAccumulator {
     tenant: TenantId,
     start: SystemTime,
     end: SystemTime,
-    wal_first_offset: u64,
-    wal_last_offset: u64,
     rows: usize,
 }
 
 impl ShardBatchAccumulator {
-    fn new(record: &WalRecord, offset: u64) -> Self {
+    fn new(record: &IngestRecord) -> Self {
         Self {
             shard_id: record.shard_id.clone(),
             tenant: record.tenant.clone(),
             start: record.timestamp,
             end: record.timestamp,
-            wal_first_offset: offset,
-            wal_last_offset: offset,
             rows: 1,
         }
     }
 
-    fn observe(&mut self, record: &WalRecord, offset: u64) {
+    fn observe(&mut self, record: &IngestRecord) {
         debug_assert_eq!(
             self.shard_id, record.shard_id,
             "shard mismatch within batch accumulator"
@@ -91,27 +84,15 @@ impl ShardBatchAccumulator {
         if record.timestamp > self.end {
             self.end = record.timestamp;
         }
-        if offset < self.wal_first_offset {
-            self.wal_first_offset = offset;
-        }
-        if offset > self.wal_last_offset {
-            self.wal_last_offset = offset;
-        }
         self.rows += 1;
     }
 
     fn into_plan(self) -> ShardBatchPlan {
-        let batch_id = format!(
-            "{}-{}",
-            self.shard_id.replace(':', "_"),
-            self.wal_first_offset
-        );
+        let batch_id = format!("{}-{}", self.shard_id.replace(':', "_"), system_time_to_micros(self.start));
         ShardBatchPlan {
             shard_id: self.shard_id,
             tenant: self.tenant,
             batch: PersistenceBatch::new(batch_id, self.start, self.end),
-            wal_first_offset: self.wal_first_offset,
-            wal_last_offset: self.wal_last_offset,
             rows: self.rows,
         }
     }
@@ -120,7 +101,6 @@ impl ShardBatchAccumulator {
 impl IngestService {
     pub fn new(
         metadata: SqliteMetadataStore,
-        wal: Arc<dyn WalWriter>,
         hot_store: Arc<dyn HotColumnStore>,
         clickhouse: Option<(
             Arc<dyn ClickhouseSink>,
@@ -134,7 +114,6 @@ impl IngestService {
         };
         Self {
             metadata,
-            wal,
             hot_store,
             clickhouse: clickhouse_sink,
             clickhouse_target: target,
@@ -247,15 +226,14 @@ impl IngestService {
         Ok(format!("{tenant}::{symbol}"))
     }
 
-    fn plan_shard_batches(segment: &WalSegment) -> Vec<ShardBatchPlan> {
+    fn plan_shard_batches(segment: &IngestSegment) -> Vec<ShardBatchPlan> {
         let mut accumulators: HashMap<String, ShardBatchAccumulator> = HashMap::new();
 
-        for (idx, record) in segment.records.iter().enumerate() {
-            let offset = segment.base_offset.0 + idx as u64;
+        for record in &segment.records {
             accumulators
                 .entry(record.shard_id.clone())
-                .and_modify(|acc| acc.observe(record, offset))
-                .or_insert_with(|| ShardBatchAccumulator::new(record, offset));
+                .and_modify(|acc| acc.observe(record))
+                .or_insert_with(|| ShardBatchAccumulator::new(record));
         }
 
         accumulators
@@ -392,6 +370,7 @@ impl IngestService {
         let span = tracing::info_span!("ingest", rows = batch.ticks.len());
         let _guard = span.enter();
         metrics::counter!("proxist_ingest_requests_total", 1);
+        let mut records: Vec<IngestRecord> = Vec::with_capacity(batch.ticks.len());
         for tick in &batch.ticks {
             let shard_id = self.resolve_shard(&tick.tenant, &tick.symbol).await?;
 
@@ -404,7 +383,7 @@ impl IngestService {
                 map.insert((tick.tenant.clone(), tick.symbol.clone()), shard_id.clone());
             }
 
-            let record = WalRecord {
+            let record = IngestRecord {
                 tenant: tick.tenant.clone(),
                 shard_id,
                 symbol: tick.symbol.clone(),
@@ -412,8 +391,7 @@ impl IngestService {
                 payload: payload_to_vec(&tick.payload),
                 seq: tick.seq,
             };
-
-            self.wal.append(record).await?;
+            records.push(record);
             self.hot_store
                 .append_row(
                     &tick.tenant,
@@ -425,8 +403,8 @@ impl IngestService {
             rows_written += 1;
         }
 
-        if !batch.ticks.is_empty() {
-            let segment = self.wal.flush_segment().await?;
+        if !records.is_empty() {
+            let segment = IngestSegment::new(records);
             let shard_plans = Self::plan_shard_batches(&segment);
             self.begin_persistence(&shard_plans).await?;
 
@@ -461,8 +439,6 @@ impl IngestService {
                     shard = %plan.shard_id,
                     tenant = %plan.tenant,
                     rows = plan.rows,
-                    wal_first = plan.wal_first_offset,
-                    wal_last = plan.wal_last_offset,
                     start = ?plan.batch.start,
                     end = ?plan.batch.end,
                     "persisted shard batch"
@@ -483,7 +459,7 @@ impl IngestService {
         Ok(())
     }
 
-    pub async fn warm_from_records(&self, records: &[WalRecord]) -> anyhow::Result<()> {
+    pub async fn warm_from_records(&self, records: &[IngestRecord]) -> anyhow::Result<()> {
         let mut last_ts: Option<SystemTime> = None;
         for record in records {
             self.metadata
@@ -671,7 +647,7 @@ mod tests {
     use proxist_ch::{ClickhouseConfig, ClickhouseHttpClient};
     use proxist_core::{metadata::ShardAssignment, query::QueryRange};
     use proxist_mem::{InMemoryHotColumnStore, MemConfig, SeamBoundaryRow};
-    use proxist_wal::{InMemoryWal, WalRecord, WalSegment};
+    use proxist_core::ingest::{IngestRecord, IngestSegment};
     use std::collections::HashMap;
     use std::time::Duration;
     use tempfile::{NamedTempFile, TempDir};
@@ -819,12 +795,12 @@ mod tests {
     #[derive(Default, Clone)]
     struct RecordingClickhouseSink {
         flushed_counts: Arc<Mutex<Vec<usize>>>,
-        flushed_records: Arc<Mutex<Vec<WalRecord>>>,
+        flushed_records: Arc<Mutex<Vec<IngestRecord>>>,
     }
 
     #[async_trait]
     impl ClickhouseSink for RecordingClickhouseSink {
-        async fn flush_segment(&self, segment: &WalSegment) -> anyhow::Result<()> {
+        async fn flush_segment(&self, segment: &IngestSegment) -> anyhow::Result<()> {
             self.flushed_counts.lock().await.push(segment.records.len());
             self.flushed_records
                 .lock()
@@ -847,7 +823,7 @@ mod tests {
             self.flushed_counts.lock().await.clone()
         }
 
-        async fn records(&self) -> Vec<WalRecord> {
+        async fn records(&self) -> Vec<IngestRecord> {
             self.flushed_records.lock().await.clone()
         }
     }
@@ -856,7 +832,6 @@ mod tests {
     async fn ingest_pipeline_wal_clickhouse_and_memory() -> anyhow::Result<()> {
         let temp = NamedTempFile::new()?;
         let metadata = SqliteMetadataStore::connect(temp.path().to_str().unwrap()).await?;
-        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
         let hot_store = TestHotStore::default();
         let hot_store_arc: Arc<dyn HotColumnStore> = Arc::new(hot_store.clone());
         let mock_sink = RecordingClickhouseSink::default();
@@ -865,7 +840,6 @@ mod tests {
 
         let service = IngestService::new(
             metadata.clone(),
-            wal,
             hot_store_arc,
             Some((
                 Arc::new(mock_sink.clone()),
@@ -918,7 +892,6 @@ mod tests {
             })
             .await?;
 
-        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
         let hot_store = Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
         let hot_store_trait: Arc<dyn HotColumnStore> = hot_store.clone();
 
@@ -928,7 +901,6 @@ mod tests {
 
         let service = IngestService::new(
             metadata.clone(),
-            wal,
             hot_store_trait,
             Some((
                 Arc::new(recording_sink.clone()),
@@ -1010,10 +982,9 @@ mod tests {
     async fn hot_summary_matches_ingested_counts() -> anyhow::Result<()> {
         let temp = NamedTempFile::new()?;
         let metadata = SqliteMetadataStore::connect(temp.path().to_str().unwrap()).await?;
-        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let service = IngestService::new(metadata.clone(), wal, hot_store, None);
+        let service = IngestService::new(metadata.clone(), hot_store, None);
 
         let ticks = vec![
             IngestTick {
@@ -1075,10 +1046,9 @@ mod tests {
             .await?;
         metadata.alloc_symbol(&"alpha".into(), "AAPL").await?;
 
-        let wal: Arc<dyn WalWriter> = Arc::new(InMemoryWal::new());
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let service = IngestService::new(metadata.clone(), wal, hot_store, None);
+        let service = IngestService::new(metadata.clone(), hot_store, None);
 
         let snapshot = metadata.get_cluster_metadata().await?;
         service.apply_metadata(&snapshot).await?;

@@ -60,6 +60,10 @@ impl SqliteMetadataStore {
         Ok(store)
     }
 
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     async fn run_migrations(&self) -> Result<()> {
         for stmt in MIGRATIONS {
             sqlx::query(stmt).execute(&self.pool).await?;
