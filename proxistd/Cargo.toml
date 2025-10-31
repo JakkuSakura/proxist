@@ -25,5 +25,5 @@ tempfile.workspace = true
 base64.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
-sqlparser = "0.43"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+fp-sql = { path = "../FerroPhase/crates/fp-sql" }

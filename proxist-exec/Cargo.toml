@@ -13,8 +13,14 @@ proxist-ch = { path = "../proxist-ch" }
 proxist-core = { path = "../proxist-core" }
 proxist-metadata-sqlite = { path = "../proxist-metadata-sqlite" }
 sqlx = { workspace = true }
+tokio-postgres = { version = "0.7", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
+duckdb = { version = "0.10", optional = true }
+proxist-mem = { path = "../proxist-mem" }
+fp-sql = { path = "../FerroPhase/crates/fp-sql" }
+base64 = { workspace = true }
 
 [features]
 default = []
-duckdb = []
-postgres = []
+duckdb = ["dep:duckdb"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]

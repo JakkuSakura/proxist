@@ -34,15 +34,19 @@ use proxist_core::{
     MetadataStore, ShardAssignment, ShardHealth,
 };
 use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
-use proxist_exec::{ExecutorConfig, InMemoryScheduler, SqlExecutor};
+use proxist_exec::{ExecutorConfig, ProxistScheduler, SqlExecutor};
 use proxist_metadata_sqlite::SqliteMetadataStore;
 // WAL removed: ingestion is immediately applied to hot store and persisted
 use serde_bytes::ByteBuf;
 use serde_json::json;
-use sqlparser::{
-    ast::{Expr, FunctionArg, FunctionArgExpr, Ident, SetExpr, Statement, Value},
+use fp_sql::{
+    ast::{Expr, FunctionArg, FunctionArgExpr, Ident, SetExpr, Statement, Value, Values},
     dialect::ClickHouseDialect,
     parser::Parser,
+    ensure_engine_clause,
+    replace_engine_case_insensitive,
+    split_statements,
+    strip_leading_sql_comments,
 };
 use tokio::signal;
 use tracing::{error, info, instrument};
@@ -88,6 +92,8 @@ struct DaemonConfig {
     http_addr: SocketAddr,
     clickhouse: Option<ClickhouseConfig>,
     api_token: Option<String>,
+    duckdb_path: Option<String>,
+    pg_url: Option<String>,
 }
 
 impl DaemonConfig {
@@ -114,6 +120,8 @@ impl DaemonConfig {
             http_addr,
             clickhouse,
             api_token,
+            duckdb_path: std::env::var("PROXIST_DUCKDB_PATH").ok(),
+            pg_url: std::env::var("PROXIST_PG_URL").ok(),
         })
     }
 }
@@ -166,7 +174,7 @@ struct ProxistDaemon {
     metadata_store: SqliteMetadataStore,
     hot_store: Arc<dyn HotColumnStore>,
     ingest_service: Arc<IngestService>,
-    scheduler: Arc<InMemoryScheduler>,
+    scheduler: Arc<ProxistScheduler>,
     metrics_handle: Option<PrometheusHandle>,
 }
 
@@ -176,7 +184,7 @@ struct AppState {
     metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
     hot_store: Arc<dyn HotColumnStore>,
     ingest: Arc<IngestService>,
-    scheduler: Arc<InMemoryScheduler>,
+    scheduler: Arc<ProxistScheduler>,
     metrics: Option<PrometheusHandle>,
     api_token: Option<String>,
 }
@@ -254,104 +262,6 @@ fn hot_row_to_query_row(row: proxist_mem::HotRow) -> proxist_api::QueryRow {
         symbol: row.symbol,
         timestamp: row.timestamp,
         payload: ByteBuf::from(row.payload),
-    }
-}
-
-fn split_sql_statements(input: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut prev_char: Option<char> = None;
-
-    for ch in input.chars() {
-        match ch {
-            '\'' if !in_double && !matches!(prev_char, Some('\\')) => {
-                in_single = !in_single;
-                current.push(ch);
-            }
-            '"' if !in_single && !matches!(prev_char, Some('\\')) => {
-                in_double = !in_double;
-                current.push(ch);
-            }
-            ';' if !in_single && !in_double => {
-                if !current.trim().is_empty() {
-                    statements.push(current.trim().to_string());
-                }
-                current.clear();
-            }
-            _ => {
-                current.push(ch);
-            }
-        }
-        prev_char = Some(ch);
-    }
-
-    if !current.trim().is_empty() {
-        statements.push(current.trim().to_string());
-    }
-
-    statements
-}
-
-fn replace_engine_case_insensitive(sql: &str, new_engine: &str) -> String {
-    let lower = sql.to_ascii_lowercase();
-    if let Some(pos) = lower.find("mixedmergetree") {
-        let end = pos + "mixedmergetree".len();
-        let mut result = String::with_capacity(sql.len() + new_engine.len());
-        result.push_str(&sql[..pos]);
-        result.push_str(new_engine);
-        result.push_str(&sql[end..]);
-        result
-    } else {
-        sql.to_string()
-    }
-}
-
-fn ensure_engine_clause(sql: &str, engine: &str) -> String {
-    if sql.to_ascii_lowercase().contains("engine") {
-        return sql.to_string();
-    }
-
-    let lower = sql.to_ascii_lowercase();
-    if let Some(order_pos) = lower.find("order by") {
-        let (before, after) = sql.split_at(order_pos);
-        format!("{} ENGINE = {} {}", before.trim_end(), engine, after)
-    } else {
-        let trimmed = sql.trim_end();
-        let has_semicolon = trimmed.ends_with(';');
-        let base = trimmed.trim_end_matches(';').trim_end();
-        if has_semicolon {
-            format!("{} ENGINE = {};", base, engine)
-        } else {
-            format!("{} ENGINE = {}", base, engine)
-        }
-    }
-}
-
-fn strip_leading_sql_comments(mut sql: &str) -> &str {
-    loop {
-        let trimmed = sql.trim_start();
-        if trimmed.is_empty() {
-            return trimmed;
-        }
-        if trimmed.starts_with("--") {
-            if let Some(line_end) = trimmed.find('\n') {
-                sql = &trimmed[line_end + 1..];
-                continue;
-            } else {
-                return "";
-            }
-        }
-        if trimmed.starts_with("/*") {
-            if let Some(end_idx) = trimmed.find("*/") {
-                sql = &trimmed[end_idx + 2..];
-                continue;
-            } else {
-                return "";
-            }
-        }
-        return trimmed;
     }
 }
 
@@ -537,7 +447,7 @@ async fn forward_sql_to_scheduler(state: &AppState, sql: &str) -> Result<String,
 
 fn build_ingest_ticks(
     columns: &[Ident],
-    values: sqlparser::ast::Values,
+    values: Values,
     seq_counter: &mut u64,
 ) -> anyhow::Result<Vec<IngestTick>> {
     let column_names: Vec<String> = if columns.is_empty() {
@@ -762,11 +672,14 @@ impl ProxistDaemon {
 
         // Build in-memory scheduler with SQLite + optional ClickHouse
         let ch_client = clickhouse_bundle.as_ref().map(|(_, _, c)| Arc::clone(c));
-        let scheduler = InMemoryScheduler::new(
+        let scheduler = ProxistScheduler::new(
             ExecutorConfig {
                 sqlite_path: Some(config.metadata_path.clone()),
+                duckdb_path: config.duckdb_path.clone(),
+                pg_url: config.pg_url.clone(),
             },
             ch_client.map(|c| (*c).clone()),
+            Some(Arc::clone(&hot_store)),
         )
         .await?;
         let scheduler = Arc::new(scheduler);
@@ -809,6 +722,10 @@ impl ProxistDaemon {
                 let mut cache = self.metadata_cache.lock().await;
                 *cache = snapshot.clone();
             }
+
+            // Update scheduler's persisted cutoff based on ingest watermark.
+            self.scheduler
+                .set_persisted_cutoff(self.ingest_service.last_persisted_timestamp());
 
             let assigned = snapshot.assignments.len();
             let total_symbols: usize = snapshot
@@ -952,7 +869,7 @@ impl ProxistDaemon {
                 .clickhouse_table()
                 .map(|t| t.to_ascii_lowercase());
 
-            for stmt_text in split_sql_statements(&sql_text) {
+            for stmt_text in split_statements(&sql_text) {
                 let normalized = strip_leading_sql_comments(&stmt_text);
                 if normalized.is_empty() {
                     continue;
@@ -980,6 +897,8 @@ impl ProxistDaemon {
                         } else {
                             forwarded = ensure_engine_clause(&forwarded, "MergeTree");
                         }
+                        // Register DDL for hot path mapping (annotations parsed from comment).
+                        state.scheduler.register_ddl(&forwarded).map_err(|e| AppError(anyhow!(e)))?;
                         let raw = forward_sql_to_scheduler(&state, &forwarded).await?;
                         outputs.push(raw);
                         continue;
