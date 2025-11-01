@@ -11,7 +11,7 @@ pub struct IngestRecord {
     pub symbol: String,
     #[serde(with = "crate::time::serde_micros")]
     pub timestamp: SystemTime,
-    #[serde(with = "serde_bytes" )]
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
     pub seq: u64,
 }
@@ -26,6 +26,7 @@ impl IngestSegment {
     pub fn new(records: Vec<IngestRecord>) -> Self {
         Self { records }
     }
-    pub fn is_empty(&self) -> bool { self.records.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
 }
-

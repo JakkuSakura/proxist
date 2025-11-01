@@ -8,6 +8,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::clickhouse::{
+    ClickhouseConfig, ClickhouseHttpClient, ClickhouseHttpSink, ClickhouseQueryRow, ClickhouseSink,
+};
+use crate::metadata_sqlite::SqliteMetadataStore;
+use crate::scheduler::{ExecutorConfig, ProxistScheduler, SqlExecutor, SqlResult};
 use anyhow::{anyhow, bail, Context};
 use axum::{
     body::{Body, Bytes},
@@ -26,29 +31,22 @@ use proxist_core::api::{
     DiagnosticsBundle, DiagnosticsHotSummaryRow, IngestBatchRequest, IngestTick, QueryRequest,
     QueryResponse, QueryRow, StatusResponse, SymbolDictionarySpec,
 };
-use crate::clickhouse::{
-    ClickhouseConfig, ClickhouseHttpClient, ClickhouseHttpSink, ClickhouseQueryRow, ClickhouseSink,
-};
 use proxist_core::{
     metadata::ClusterMetadata,
     query::{QueryOperation, RollingAggregation},
     MetadataStore, ShardAssignment, ShardHealth,
 };
 use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
-use crate::scheduler::{ExecutorConfig, ProxistScheduler, SqlExecutor, SqlResult};
-use crate::metadata_sqlite::SqliteMetadataStore;
 // WAL removed: ingestion is immediately applied to hot store and persisted
-use serde_bytes::ByteBuf;
-use serde_json::json;
 use fp_sql::{
     ast::{Expr, FunctionArg, FunctionArgExpr, Ident, SetExpr, Statement, Value, Values},
     dialect::ClickHouseDialect,
-    parser::Parser,
     ensure_engine_clause,
-    replace_engine_case_insensitive,
-    split_statements,
-    strip_leading_sql_comments,
+    parser::Parser,
+    replace_engine_case_insensitive, split_statements, strip_leading_sql_comments,
 };
+use serde_bytes::ByteBuf;
+use serde_json::json;
 use tokio::signal;
 use tracing::{error, info, instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -131,7 +129,8 @@ impl DaemonConfig {
 
 fn load_clickhouse_config() -> Option<ClickhouseConfig> {
     let endpoint = std::env::var("PROXIST_CLICKHOUSE_ENDPOINT").ok()?;
-    let database = std::env::var("PROXIST_CLICKHOUSE_DATABASE").unwrap_or_else(|_| "proxist".into());
+    let database =
+        std::env::var("PROXIST_CLICKHOUSE_DATABASE").unwrap_or_else(|_| "proxist".into());
     let table = std::env::var("PROXIST_CLICKHOUSE_TABLE").unwrap_or_else(|_| "ticks".into());
     let username = std::env::var("PROXIST_CLICKHOUSE_USER").ok();
     let password = std::env::var("PROXIST_CLICKHOUSE_PASSWORD").ok();
@@ -632,7 +631,6 @@ fn micros_to_system_time(micros: i64) -> SystemTime {
     }
 }
 
-
 impl ProxistDaemon {
     async fn new(
         config: DaemonConfig,
@@ -897,7 +895,10 @@ impl ProxistDaemon {
                             forwarded = ensure_engine_clause(&forwarded, "MergeTree");
                         }
                         // Register DDL for hot path mapping (annotations parsed from comment).
-                        state.scheduler.register_ddl(&forwarded).map_err(|e| AppError(anyhow!(e)))?;
+                        state
+                            .scheduler
+                            .register_ddl(&forwarded)
+                            .map_err(|e| AppError(anyhow!(e)))?;
                         let raw = forward_sql_to_scheduler(&state, &forwarded).await?;
                         outputs.push(raw);
                         continue;
@@ -1104,8 +1105,7 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                     hot_rows.retain(|row| row.timestamp > persisted);
                 }
             }
-            let mut rows: Vec<QueryRow> =
-                hot_rows.into_iter().map(hot_row_to_query_row).collect();
+            let mut rows: Vec<QueryRow> = hot_rows.into_iter().map(hot_row_to_query_row).collect();
 
             if include_cold {
                 if let Some(client) = state.ingest.clickhouse_client() {
@@ -1131,9 +1131,7 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                 }
             }
 
-            rows.sort_by_key(|row| {
-                (system_time_to_micros(row.timestamp), row.symbol.clone())
-            });
+            rows.sort_by_key(|row| (system_time_to_micros(row.timestamp), row.symbol.clone()));
             rows.dedup_by(|a, b| {
                 a.symbol == b.symbol
                     && a.timestamp == b.timestamp
@@ -1144,14 +1142,18 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
         }
         QueryOperation::LastBy | QueryOperation::AsOf => {
             let mut hot_rows = match op_kind {
-                QueryOperation::LastBy => state
-                    .hot_store
-                    .last_by(&request.tenant, &request.symbols, request.range.end)
-                    .await?,
-                QueryOperation::AsOf => state
-                    .hot_store
-                    .asof(&request.tenant, &request.symbols, request.range.end)
-                    .await?,
+                QueryOperation::LastBy => {
+                    state
+                        .hot_store
+                        .last_by(&request.tenant, &request.symbols, request.range.end)
+                        .await?
+                }
+                QueryOperation::AsOf => {
+                    state
+                        .hot_store
+                        .asof(&request.tenant, &request.symbols, request.range.end)
+                        .await?
+                }
                 _ => unreachable!(),
             };
 
@@ -1163,19 +1165,18 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
 
             let mut map: HashMap<String, QueryRow> = HashMap::new();
 
-            let mut upsert =
-                |row: QueryRow| match map.entry(row.symbol.clone()) {
-                    std::collections::hash_map::Entry::Vacant(slot) => {
+            let mut upsert = |row: QueryRow| match map.entry(row.symbol.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(row);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if system_time_to_micros(row.timestamp)
+                        > system_time_to_micros(slot.get().timestamp)
+                    {
                         slot.insert(row);
                     }
-                    std::collections::hash_map::Entry::Occupied(mut slot) => {
-                        if system_time_to_micros(row.timestamp)
-                            > system_time_to_micros(slot.get().timestamp)
-                        {
-                            slot.insert(row);
-                        }
-                    }
-                };
+                }
+            };
 
             for row in hot_rows {
                 upsert(hot_row_to_query_row(row));
@@ -1211,9 +1212,7 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                         .seam_rows_at(&request.tenant, seam_ts)
                         .await?;
                     for seam in seam_rows {
-                        if !request.symbols.is_empty()
-                            && !request.symbols.contains(&seam.symbol)
-                        {
+                        if !request.symbols.is_empty() && !request.symbols.contains(&seam.symbol) {
                             continue;
                         }
                         if seam.timestamp > request.range.end {
@@ -1247,14 +1246,11 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                     "rolling_window queries require at least one symbol"
                 )));
             }
-            let config = request
-                .rolling
-                .clone()
-                .ok_or_else(|| {
-                    AppError(anyhow!(
-                        "rolling configuration is required for rolling_window queries"
-                    ))
-                })?;
+            let config = request.rolling.clone().ok_or_else(|| {
+                AppError(anyhow!(
+                    "rolling configuration is required for rolling_window queries"
+                ))
+            })?;
             if !matches!(config.aggregation, RollingAggregation::Count) {
                 return Err(AppError(anyhow!(
                     "unsupported rolling aggregation: {:?}",
@@ -1441,9 +1437,7 @@ mod ingest_tests {
             rolling: None,
         };
 
-        let response = execute_query(&state, request)
-            .await
-            .map_err(|err| err.0)?;
+        let response = execute_query(&state, request).await.map_err(|err| err.0)?;
         assert_eq!(response.rows.len(), 1);
         let row = &response.rows[0];
         assert_eq!(row.symbol, "AAPL");
@@ -1501,7 +1495,10 @@ mod ingest_tests {
         assert_eq!(row.symbol, "AAPL");
         assert_eq!(row.hot_rows, 1);
         assert_eq!(row.hot_last_micros, Some(system_time_to_micros(ts)));
-        assert!(bundle.persistence.iter().any(|tracker| tracker.shard_id == "alpha-shard"));
+        assert!(bundle
+            .persistence
+            .iter()
+            .any(|tracker| tracker.shard_id == "alpha-shard"));
         Ok(())
     }
 }

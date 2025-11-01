@@ -50,7 +50,6 @@ pub struct ClickhouseTarget {
 #[async_trait]
 pub trait ClickhouseSink: Send + Sync {
     async fn flush_segment(&self, segment: &IngestSegment) -> anyhow::Result<()>;
-    fn target(&self) -> ClickhouseTarget;
 }
 
 #[derive(Clone)]
@@ -182,14 +181,6 @@ impl ClickhouseSink for ClickhouseHttpSink {
         );
 
         Ok(())
-    }
-
-    fn target(&self) -> ClickhouseTarget {
-        ClickhouseTarget {
-            endpoint: self.config.endpoint.clone(),
-            database: self.config.database.clone(),
-            table: self.config.table.clone(),
-        }
     }
 }
 

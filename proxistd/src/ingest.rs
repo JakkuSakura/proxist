@@ -7,16 +7,16 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use anyhow::Result;
-use proxist_core::api::{ClickhouseStatus, IngestBatchRequest, ClickhouseTarget};
 use crate::clickhouse::{ClickhouseHttpClient, ClickhouseSink, ClickhouseTarget as SinkTarget};
+use crate::metadata_sqlite::SqliteMetadataStore;
+use anyhow::Result;
+use proxist_core::api::{ClickhouseStatus, ClickhouseTarget, IngestBatchRequest};
+use proxist_core::ingest::{IngestRecord, IngestSegment};
 use proxist_core::{
     metadata::{ClusterMetadata, ShardHealth, TenantId},
     MetadataStore, PersistenceBatch, PersistenceTransition, ShardPersistenceTracker,
 };
 use proxist_mem::{HotColumnStore, HotSymbolSummary};
-use crate::metadata_sqlite::SqliteMetadataStore;
-use proxist_core::ingest::{IngestRecord, IngestSegment};
 use serde_bytes::ByteBuf;
 use tokio::sync::Mutex;
 
@@ -27,9 +27,9 @@ pub struct IngestService {
     clickhouse_target: Option<ClickhouseTarget>,
     clickhouse_client: Option<Arc<ClickhouseHttpClient>>,
     last_flush_micros: AtomicI64,
-   clickhouse_error: Mutex<Option<String>>,
-   persistence_trackers: Mutex<HashMap<String, ShardPersistenceTracker>>,
-   symbol_shards: Mutex<HashMap<(TenantId, String), String>>,
+    clickhouse_error: Mutex<Option<String>>,
+    persistence_trackers: Mutex<HashMap<String, ShardPersistenceTracker>>,
+    symbol_shards: Mutex<HashMap<(TenantId, String), String>>,
     tenant_assignments: Mutex<HashMap<TenantId, String>>,
 }
 
@@ -88,7 +88,11 @@ impl ShardBatchAccumulator {
     }
 
     fn into_plan(self) -> ShardBatchPlan {
-        let batch_id = format!("{}-{}", self.shard_id.replace(':', "_"), system_time_to_micros(self.start));
+        let batch_id = format!(
+            "{}-{}",
+            self.shard_id.replace(':', "_"),
+            system_time_to_micros(self.start)
+        );
         ShardBatchPlan {
             shard_id: self.shard_id,
             tenant: self.tenant,
@@ -138,10 +142,7 @@ impl IngestService {
             let mut tenant_map = self.tenant_assignments.lock().await;
             tenant_map.clear();
             for assignment in &metadata.assignments {
-                tenant_map.insert(
-                    assignment.tenant_id.clone(),
-                    assignment.shard_id.clone(),
-                );
+                tenant_map.insert(assignment.tenant_id.clone(), assignment.shard_id.clone());
             }
         }
 
@@ -185,18 +186,11 @@ impl IngestService {
             tenants = metadata.symbol_dictionaries.len(),
             "applied metadata snapshot to ingest service"
         );
-        metrics::gauge!(
-            "proxist_assigned_shards",
-            metadata.assignments.len() as f64
-        );
+        metrics::gauge!("proxist_assigned_shards", metadata.assignments.len() as f64);
         Ok(())
     }
 
-    async fn resolve_shard(
-        &self,
-        tenant: &TenantId,
-        symbol: &str,
-    ) -> anyhow::Result<String> {
+    async fn resolve_shard(&self, tenant: &TenantId, symbol: &str) -> anyhow::Result<String> {
         let key = (tenant.clone(), symbol.to_string());
         if let Some(shard) = {
             let map = self.symbol_shards.lock().await;
@@ -223,10 +217,7 @@ impl IngestService {
         {
             let shard_id = assignment.shard_id.clone();
             let mut symbol_map = self.symbol_shards.lock().await;
-            symbol_map.insert(
-                (tenant.clone(), symbol.to_string()),
-                shard_id.clone(),
-            );
+            symbol_map.insert((tenant.clone(), symbol.to_string()), shard_id.clone());
             return Ok(shard_id);
         }
 
@@ -649,12 +640,12 @@ fn micros_to_system_time(micros: i64) -> std::time::SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::clickhouse::{ClickhouseConfig, ClickhouseHttpClient};
+    use async_trait::async_trait;
     use proxist_core::api::IngestTick;
+    use proxist_core::ingest::{IngestRecord, IngestSegment};
     use proxist_core::{metadata::ShardAssignment, query::QueryRange};
     use proxist_mem::{InMemoryHotColumnStore, MemConfig, SeamBoundaryRow};
-    use proxist_core::ingest::{IngestRecord, IngestSegment};
     use std::collections::HashMap;
     use std::time::Duration;
     use tempfile::{NamedTempFile, TempDir};

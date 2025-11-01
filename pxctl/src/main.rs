@@ -3,13 +3,13 @@ use std::fs;
 
 use anyhow::{anyhow, bail};
 use clap::{Parser, Subcommand};
-use proxist_core::{
-    metadata::ClusterMetadata,
-    query::{QueryOperation, QueryRange, RollingAggregation, RollingWindowConfig},
-};
 use proxist_core::api::{
     ControlCommand, DiagnosticsBundle, IngestBatchRequest, QueryRequest, QueryResponse,
     ShardAssignment, StatusResponse, SymbolDictionarySpec,
+};
+use proxist_core::{
+    metadata::ClusterMetadata,
+    query::{QueryOperation, QueryRange, RollingAggregation, RollingWindowConfig},
 };
 use reqwest::{Client, RequestBuilder};
 use serde::Serialize;

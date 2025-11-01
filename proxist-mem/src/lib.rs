@@ -505,15 +505,9 @@ mod tests {
     async fn rolling_window_counts_rows_within_duration() -> anyhow::Result<()> {
         let store = InMemoryHotColumnStore::new(MemConfig::default());
         let tenant: TenantId = "tenant".into();
-        store
-            .append_row(&tenant, "AAPL", ts(1_000), b"r1")
-            .await?;
-        store
-            .append_row(&tenant, "AAPL", ts(2_000), b"r2")
-            .await?;
-        store
-            .append_row(&tenant, "AAPL", ts(4_000), b"r3")
-            .await?;
+        store.append_row(&tenant, "AAPL", ts(1_000), b"r1").await?;
+        store.append_row(&tenant, "AAPL", ts(2_000), b"r2").await?;
+        store.append_row(&tenant, "AAPL", ts(4_000), b"r3").await?;
 
         let window_end = ts(3_500);
         let rows = store

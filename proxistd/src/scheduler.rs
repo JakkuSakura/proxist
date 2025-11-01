@@ -1,23 +1,29 @@
-use anyhow::Context;
+use crate::clickhouse::ClickhouseHttpClient;
+use crate::metadata_sqlite::SqliteMetadataStore;
+use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use base64::Engine as _;
 use fp_sql::{
-    ast::{BinaryOperator as BinOp, Expr, Ident, Query, Select, SetExpr, Statement, TableFactor, Value},
+    ast::{BinaryOperator as BinOp, Expr, Ident, SetExpr, Statement, Value},
     dialect::ClickHouseDialect,
     parser::Parser,
 };
-use crate::clickhouse::ClickhouseHttpClient;
-use crate::metadata_sqlite::SqliteMetadataStore;
 use proxist_core::query::QueryRange;
 use proxist_mem::HotColumnStore;
 use serde_json::{Map, Value as JsonValue};
 use sqlx::{Column, Row};
 use std::collections::HashMap;
-use std::sync::{atomic::{AtomicI64, Ordering}, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "postgres")]
 use tokio_postgres;
+
+mod plan;
+use plan::{build_table_plan, Predicate};
 
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -64,7 +70,11 @@ impl ProxistScheduler {
         hot_store: Option<Arc<dyn HotColumnStore>>,
     ) -> anyhow::Result<Self> {
         let sqlite = match cfg.sqlite_path {
-            Some(path) => Some(SqliteExecutor::connect(&path).await.context("connect sqlite")?),
+            Some(path) => Some(
+                SqliteExecutor::connect(&path)
+                    .await
+                    .context("connect sqlite")?,
+            ),
             None => None,
         };
         let duckdb = DuckDbExecutor::maybe_connect(cfg.duckdb_path.as_deref()).await?;
@@ -86,10 +96,11 @@ impl ProxistScheduler {
     }
 
     pub fn register_ddl(&self, ddl_sql: &str) -> anyhow::Result<()> {
-        if let Some(cfg) = parse_proxist_table_config(ddl_sql) {
-            if let Some(table) = parse_table_name_from_ddl(ddl_sql) {
-                self.register_table(table, cfg);
-            }
+        let cfg = parse_proxist_table_config(ddl_sql)?;
+        if let Some(table) = parse_table_name_from_ddl(ddl_sql) {
+            self.register_table(table, cfg);
+        } else {
+            anyhow::bail!("unable to determine table name from DDL");
         }
         Ok(())
     }
@@ -116,7 +127,12 @@ impl ProxistScheduler {
         let mut stmt = stmts.remove(0);
 
         let append_bounds = |selection: &mut Option<Expr>| {
-            let ident = |name: &str| Expr::Identifier(Ident { value: name.to_string(), quote_style: None });
+            let ident = |name: &str| {
+                Expr::Identifier(Ident {
+                    value: name.to_string(),
+                    quote_style: None,
+                })
+            };
             let mut clauses = Vec::new();
 
             if let Some(lo) = lower {
@@ -137,12 +153,14 @@ impl ProxistScheduler {
                 return;
             }
 
-            let extra = clauses.into_iter().reduce(|a, b| Expr::BinaryOp {
-                left: Box::new(a),
-                op: BinOp::And,
-                right: Box::new(b),
-            })
-            .unwrap();
+            let extra = clauses
+                .into_iter()
+                .reduce(|a, b| Expr::BinaryOp {
+                    left: Box::new(a),
+                    op: BinOp::And,
+                    right: Box::new(b),
+                })
+                .unwrap();
 
             if let Some(existing) = selection.take() {
                 *selection = Some(Expr::BinaryOp {
@@ -190,7 +208,12 @@ impl SqlExecutor for ProxistScheduler {
                         let mut outputs = Vec::new();
 
                         if start_u <= cutoff {
-                            if let Some(cold_sql) = self.rewrite_with_bounds(sql, &cfg.order_col, Some(start_u), Some(cutoff.min(end_u))) {
+                            if let Some(cold_sql) = self.rewrite_with_bounds(
+                                sql,
+                                &cfg.order_col,
+                                Some(start_u),
+                                Some(cutoff.min(end_u)),
+                            ) {
                                 if let Some(ch) = &self.clickhouse {
                                     outputs.push(ch.execute_raw(&cold_sql).await?);
                                 }
@@ -198,12 +221,21 @@ impl SqlExecutor for ProxistScheduler {
                         }
 
                         if end_u > cutoff {
-                            let hot_lo = if start_u > cutoff { start_u } else { cutoff + 1 };
+                            let hot_lo = if start_u > cutoff {
+                                start_u
+                            } else {
+                                cutoff + 1
+                            };
                             let mut hot_sel = sel.clone();
                             hot_sel.start = micros_to_system_time(hot_lo);
                             let rows = load_hot_rows(hot, &hot_sel).await?;
                             if !rows.is_empty() {
-                                outputs.push(duck.load_table_and_execute(&cfg, &hot_sel.table, &rows, sql)?);
+                                outputs.push(duck.load_table_and_execute(
+                                    &cfg,
+                                    &hot_sel.table,
+                                    &rows,
+                                    sql,
+                                )?);
                             }
                         }
 
@@ -213,7 +245,9 @@ impl SqlExecutor for ProxistScheduler {
                     } else {
                         let rows = load_hot_rows(hot, &sel).await?;
                         if !rows.is_empty() {
-                            return Ok(SqlResult::Text(duck.load_table_and_execute(&cfg, &sel.table, &rows, sql)?));
+                            return Ok(SqlResult::Text(
+                                duck.load_table_and_execute(&cfg, &sel.table, &rows, sql)?,
+                            ));
                         }
                     }
                 }
@@ -265,8 +299,12 @@ impl SqlExecutor for SqliteExecutor {
                     for col in row.columns() {
                         let name = col.name();
                         match row.try_get::<String, _>(name) {
-                            Ok(v) => { map.insert(name.to_string(), JsonValue::String(v)); }
-                            Err(_) => { map.insert(name.to_string(), JsonValue::Null); }
+                            Ok(v) => {
+                                map.insert(name.to_string(), JsonValue::String(v));
+                            }
+                            Err(_) => {
+                                map.insert(name.to_string(), JsonValue::Null);
+                            }
                         }
                     }
                     out.push(map);
@@ -301,7 +339,9 @@ static mut DUCK_EXEC: Option<DuckDbExecutorImpl> = None;
 #[cfg(feature = "duckdb")]
 impl DuckDbExecutorImpl {
     fn new(path: &str) -> anyhow::Result<Self> {
-        Ok(Self { conn: duckdb::Connection::open(path)? })
+        Ok(Self {
+            conn: duckdb::Connection::open(path)?,
+        })
     }
 
     fn ensure_table(&self, ddl: &str) -> anyhow::Result<()> {
@@ -309,27 +349,47 @@ impl DuckDbExecutorImpl {
         Ok(())
     }
 
-    fn insert_rows(&self, table: &str, cfg: &TableConfig, rows: &[HotRowFlat]) -> anyhow::Result<()> {
+    fn insert_rows(
+        &self,
+        table: &str,
+        cfg: &TableConfig,
+        rows: &[HotRowFlat],
+    ) -> anyhow::Result<()> {
         let tx = self.conn.transaction()?;
         let mut cols = Vec::new();
-        if let Some(c0) = cfg.filter_cols.get(0) { cols.push(c0.as_str()); }
-        if let Some(c1) = cfg.filter_cols.get(1) { cols.push(c1.as_str()); }
+        if let Some(c0) = cfg.filter_cols.get(0) {
+            cols.push(c0.as_str());
+        }
+        if let Some(c1) = cfg.filter_cols.get(1) {
+            cols.push(c1.as_str());
+        }
         cols.push(&cfg.order_col);
         cols.push(&cfg.payload_col);
-        if let Some(seq) = &cfg.seq_col { cols.push(seq.as_str()); }
+        if let Some(seq) = &cfg.seq_col {
+            cols.push(seq.as_str());
+        }
 
         let placeholders: Vec<_> = (1..=cols.len()).map(|idx| format!("?{}", idx)).collect();
         let sql = format!(
             "INSERT INTO \"{}\" ({}) VALUES ({})",
             table.replace('"', ""),
-            cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", "),
+            cols.iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", "),
             placeholders.join(", "),
         );
 
         let mut stmt = tx.prepare(&sql)?;
         for row in rows {
             if cfg.seq_col.is_some() {
-                stmt.execute((&row.k0, &row.k1, &row.ord_micros, &row.payload_base64, &row.seq))?;
+                stmt.execute((
+                    &row.k0,
+                    &row.k1,
+                    &row.ord_micros,
+                    &row.payload_base64,
+                    &row.seq,
+                ))?;
             } else {
                 stmt.execute((&row.k0, &row.k1, &row.ord_micros, &row.payload_base64))?;
             }
@@ -351,16 +411,27 @@ impl DuckDbExecutorImpl {
             Ok(cols.join("\t"))
         })?;
         let mut out = String::new();
-        for row in rows { out.push_str(&row?); out.push('\n'); }
+        for row in rows {
+            out.push_str(&row?);
+            out.push('\n');
+        }
         Ok(out)
     }
 }
 
 #[cfg(feature = "duckdb")]
 impl DuckDbExecutor {
-    fn load_table_and_execute(&self, cfg: &TableConfig, table: &str, rows: &[HotRowFlat], sql: &str) -> anyhow::Result<String> {
+    fn load_table_and_execute(
+        &self,
+        cfg: &TableConfig,
+        table: &str,
+        rows: &[HotRowFlat],
+        sql: &str,
+    ) -> anyhow::Result<String> {
         unsafe {
-            let exec = DUCK_EXEC.as_ref().ok_or_else(|| anyhow::anyhow("duckdb connection not initialized"))?;
+            let exec = DUCK_EXEC
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow("duckdb connection not initialized"))?;
             exec.ensure_table(&cfg.ddl)?;
             exec.insert_rows(table, cfg, rows)?;
             exec.query_text(sql)
@@ -369,7 +440,9 @@ impl DuckDbExecutor {
 
     async fn maybe_connect(path: Option<&str>) -> anyhow::Result<Option<Self>> {
         if let Some(p) = path {
-            unsafe { DUCK_EXEC = Some(DuckDbExecutorImpl::new(p)?); }
+            unsafe {
+                DUCK_EXEC = Some(DuckDbExecutorImpl::new(p)?);
+            }
             Ok(Some(Self))
         } else {
             Ok(None)
@@ -379,7 +452,13 @@ impl DuckDbExecutor {
 
 #[cfg(not(feature = "duckdb"))]
 impl DuckDbExecutor {
-    fn load_table_and_execute(&self, _cfg: &TableConfig, _table: &str, _rows: &[HotRowFlat], _sql: &str) -> anyhow::Result<String> {
+    fn load_table_and_execute(
+        &self,
+        _cfg: &TableConfig,
+        _table: &str,
+        _rows: &[HotRowFlat],
+        _sql: &str,
+    ) -> anyhow::Result<String> {
         anyhow::bail!("duckdb executor not enabled at compile time")
     }
 
@@ -403,7 +482,8 @@ impl PostgresExecutor {
         #[cfg(feature = "postgres")]
         {
             if let Some(u) = url {
-                let (_client, connection) = tokio_postgres::connect(u, tokio_postgres::NoTls).await?;
+                let (_client, connection) =
+                    tokio_postgres::connect(u, tokio_postgres::NoTls).await?;
                 tokio::spawn(async move {
                     let _ = connection.await;
                 });
@@ -443,126 +523,94 @@ struct SimpleSelect {
     end: SystemTime,
 }
 
-fn analyze_simple_select(sql: &str, tables: &HashMap<String, TableConfig>) -> Option<(TableConfig, SimpleSelect)> {
-    let stmts = Parser::parse_sql(&ClickHouseDialect {}, sql).ok()?;
-    let stmt = stmts.first()?;
+fn analyze_simple_select(
+    sql: &str,
+    tables: &HashMap<String, TableConfig>,
+) -> Option<(TableConfig, SimpleSelect)> {
+    let table_plan = build_table_plan(sql)?;
+    let cfg = tables.get(&table_plan.table)?.clone();
 
-    let (table, selection) = match stmt {
-        Statement::Query(q) => {
-            let Query { body, .. } = &**q;
-            match &**body {
-                SetExpr::Select(sel) => {
-                    let Select { from, selection, .. } = &**sel;
-                    if from.len() != 1 { return None; }
-                    match &from[0].relation {
-                        TableFactor::Table { name, .. } => (name.to_string(), selection),
-                        _ => return None,
-                    }
-                }
-                _ => return None,
-            }
-        }
-        _ => return None,
-    };
-
-    let cfg = tables.get(&table)?.clone();
-    let predicate = selection.as_ref()?;
-
-    let mut key0_val = None;
-    let mut key1_vals = Vec::new();
-    let mut start = None;
-    let mut end = None;
-
-    fn extract_string(expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::Value(Value::SingleQuotedString(s)) => Some(s.clone()),
-            _ => None,
-        }
-    }
-
-    fn as_micros(expr: &Expr) -> Option<i64> {
-        match expr {
-            Expr::Value(Value::Number(n, _)) => n.parse::<i64>().ok(),
-            Expr::Value(Value::SingleQuotedString(s)) => s.parse::<i64>().ok(),
-            _ => None,
-        }
-    }
-
-    fn walk(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
-        f(expr);
-        if let Expr::BinaryOp { left, right, .. } = expr {
-            walk(left, f);
-            walk(right, f);
-        }
-    }
-
-    let filter0 = cfg.filter_cols.get(0).map(|s| s.to_ascii_lowercase());
-    let filter1 = cfg.filter_cols.get(1).map(|s| s.to_ascii_lowercase());
+    let filter0 = cfg.filter_cols.get(0)?.to_ascii_lowercase();
+    let filter1 = cfg.filter_cols.get(1)?.to_ascii_lowercase();
     let order_col = cfg.order_col.to_ascii_lowercase();
 
-    walk(predicate, &mut |expr| {
-        match expr {
-            Expr::BinaryOp { left, op, right } => {
-                let left_ident = matches_ident(left);
-                match (left_ident, op) {
-                    (Some(col), BinOp::Eq) => {
-                        if filter0.as_ref().map(|c| c == &col).unwrap_or(false) {
-                            key0_val = extract_string(right);
-                        } else if filter1.as_ref().map(|c| c == &col).unwrap_or(false) {
-                            if let Some(value) = extract_string(right) {
-                                key1_vals = vec![value];
-                            }
-                        }
-                    }
-                    (Some(col), BinOp::Gt | BinOp::GtEq) if col == order_col => {
-                        start = as_micros(right).map(micros_to_system_time);
-                    }
-                    (Some(col), BinOp::Lt | BinOp::LtEq) if col == order_col => {
-                        end = as_micros(right).map(micros_to_system_time);
-                    }
-                    _ => {}
-                }
-            }
-            Expr::Between { expr, low, high, .. } => {
-                if let Some(col) = matches_ident(expr) {
-                    if col == order_col {
-                        start = as_micros(low).map(micros_to_system_time);
-                        end = as_micros(high).map(micros_to_system_time);
-                    }
-                }
-            }
-            Expr::InList { expr, list, .. } => {
-                if let Expr::Identifier(Ident { value, .. }) = &**expr {
-                    let col = value.to_ascii_lowercase();
-                    if filter1.as_ref().map(|c| c == &col).unwrap_or(false) {
-                        let vals: Vec<String> = list.iter().filter_map(extract_string).collect();
-                        if !vals.is_empty() { key1_vals = vals; }
-                    }
-                }
-            }
-            _ => {}
-        }
-    });
+    let mut key0 = None;
+    let mut key1_values = Vec::new();
+    let mut lower: Option<i64> = None;
+    let mut upper: Option<i64> = None;
 
-    let key0 = key0_val?;
-    if key1_vals.is_empty() {
+    for predicate in &table_plan.filter_predicates {
+        match predicate {
+            Predicate::Eq { column, value } => {
+                let col = column.to_ascii_lowercase();
+                if col == filter0 {
+                    key0 = Some(value.clone());
+                } else if col == filter1 {
+                    key1_values = vec![value.clone()];
+                }
+            }
+            Predicate::In { column, values } => {
+                if column.to_ascii_lowercase() == filter1 {
+                    key1_values = values.clone();
+                }
+            }
+            Predicate::RangeLower {
+                column,
+                inclusive,
+                bound,
+            } => {
+                if column.to_ascii_lowercase() == order_col {
+                    let adjusted = if *inclusive { *bound } else { bound + 1 };
+                    lower = Some(lower.map_or(adjusted, |current| current.max(adjusted)));
+                }
+            }
+            Predicate::RangeUpper {
+                column,
+                inclusive,
+                bound,
+            } => {
+                if column.to_ascii_lowercase() == order_col {
+                    let adjusted = if *inclusive { *bound } else { bound - 1 };
+                    upper = Some(upper.map_or(adjusted, |current| current.min(adjusted)));
+                }
+            }
+            Predicate::Between { column, low, high } => {
+                if column.to_ascii_lowercase() == order_col {
+                    lower = Some(lower.map_or(*low, |current| current.max(*low)));
+                    upper = Some(upper.map_or(*high, |current| current.min(*high)));
+                }
+            }
+        }
+    }
+
+    let key0 = key0?;
+    if key1_values.is_empty() {
         return None;
     }
-    let start = start.unwrap_or(micros_to_system_time(i64::MIN));
-    let end = end.unwrap_or(micros_to_system_time(i64::MAX));
 
-    Some((cfg, SimpleSelect { table, key0, key1_list: key1_vals, start, end }))
+    let start = lower
+        .map(micros_to_system_time)
+        .unwrap_or_else(|| micros_to_system_time(i64::MIN));
+    let end = upper
+        .map(micros_to_system_time)
+        .unwrap_or_else(|| micros_to_system_time(i64::MAX));
+
+    Some((
+        cfg,
+        SimpleSelect {
+            table: table_plan.table,
+            key0,
+            key1_list: key1_values,
+            start,
+            end,
+        },
+    ))
 }
 
-fn matches_ident(expr: &Expr) -> Option<String> {
-    if let Expr::Identifier(Ident { value, .. }) = expr {
-        Some(value.to_ascii_lowercase())
-    } else {
-        None
-    }
-}
-
-async fn load_hot_rows(hot: &Arc<dyn HotColumnStore>, sel: &SimpleSelect) -> anyhow::Result<Vec<HotRowFlat>> {
+async fn load_hot_rows(
+    hot: &Arc<dyn HotColumnStore>,
+    sel: &SimpleSelect,
+) -> anyhow::Result<Vec<HotRowFlat>> {
     let range = QueryRange::new(sel.start, sel.end);
     let rows = hot.scan_range(&sel.key0, &range, &sel.key1_list).await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -605,11 +653,16 @@ fn parse_table_name_from_ddl(sql: &str) -> Option<String> {
     None
 }
 
-fn parse_proxist_table_config(sql: &str) -> Option<TableConfig> {
+fn parse_proxist_table_config(sql: &str) -> anyhow::Result<TableConfig> {
     let lower = sql.to_ascii_lowercase();
-    let idx = lower.find("proxist:")?;
+    let idx = lower
+        .find("proxist:")
+        .ok_or_else(|| anyhow!("missing proxist annotation"))?;
     let tail = &sql[idx + "proxist:".len()..];
-    let end = tail.find('\n').or_else(|| tail.find("*/")).unwrap_or(tail.len());
+    let end = tail
+        .find('\n')
+        .or_else(|| tail.find("*/"))
+        .unwrap_or(tail.len());
     let body = tail[..end].trim();
 
     let mut order_col = None;
@@ -637,10 +690,19 @@ fn parse_proxist_table_config(sql: &str) -> Option<TableConfig> {
         }
     }
 
-    Some(TableConfig {
+    let order_col = order_col.ok_or_else(|| anyhow!("proxist annotation missing order_col"))?;
+    let payload_col =
+        payload_col.ok_or_else(|| anyhow!("proxist annotation missing payload_col"))?;
+    if filter_cols.len() < 2 {
+        anyhow::bail!(
+            "proxist annotation must specify at least two filter_cols (group key and entity key)"
+        );
+    }
+
+    Ok(TableConfig {
         ddl: sql.to_string(),
-        order_col: order_col?,
-        payload_col: payload_col?,
+        order_col,
+        payload_col,
         filter_cols,
         seq_col,
     })
