@@ -1,5 +1,7 @@
 use fp_sql::{
-    ast::{BinaryOperator as BinOp, Expr, GroupByExpr, Ident, SetExpr, Statement, TableFactor, Value},
+    ast::{
+        BinaryOperator as BinOp, Expr, GroupByExpr, Ident, SetExpr, Statement, TableFactor, Value,
+    },
     dialect::ClickHouseDialect,
     parser::Parser,
 };
@@ -309,11 +311,16 @@ fn collect_predicates(expr: &Expr, out: &mut Vec<Predicate>) -> bool {
             BinOp::And => collect_predicates(left, out) && collect_predicates(right, out),
             BinOp::Eq => {
                 if let (Some(col), Some(val)) = (column_ident(left), literal_scalar(right)) {
-                    out.push(Predicate::Eq { column: col, value: val });
+                    out.push(Predicate::Eq {
+                        column: col,
+                        value: val,
+                    });
                     true
-                } else if let (Some(col), Some(val)) = (column_ident(right), literal_scalar(left))
-                {
-                    out.push(Predicate::Eq { column: col, value: val });
+                } else if let (Some(col), Some(val)) = (column_ident(right), literal_scalar(left)) {
+                    out.push(Predicate::Eq {
+                        column: col,
+                        value: val,
+                    });
                     true
                 } else {
                     false
@@ -389,7 +396,10 @@ fn collect_predicates(expr: &Expr, out: &mut Vec<Predicate>) -> bool {
                 if values.is_empty() {
                     false
                 } else {
-                    out.push(Predicate::In { column: col, values });
+                    out.push(Predicate::In {
+                        column: col,
+                        values,
+                    });
                     true
                 }
             } else {

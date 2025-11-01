@@ -5,14 +5,14 @@ use async_trait::async_trait;
 use base64::Engine as _;
 mod plan;
 use plan::{
-    build_table_plan, parse_table_name_from_ddl, rewrite_with_bounds, strip_limit_offset, OrderItem,
-    Predicate,
+    build_table_plan, parse_table_name_from_ddl, rewrite_with_bounds, strip_limit_offset,
+    OrderItem, Predicate,
 };
 use proxist_core::query::QueryRange;
 use proxist_mem::HotColumnStore;
-use serde_json::{Map, Value as JsonValue};
 #[cfg(feature = "duckdb")]
 use serde_json::Number as JsonNumber;
+use serde_json::{Map, Value as JsonValue};
 use sqlx::{Column, Row};
 use std::collections::HashMap;
 use std::sync::{
@@ -111,7 +111,6 @@ impl ProxistScheduler {
             .unwrap_or(-1);
         self.persisted_cutoff_micros.store(micros, Ordering::SeqCst);
     }
-
 }
 
 #[async_trait]
@@ -290,13 +289,13 @@ impl DuckDbExecutorImpl {
         })
     }
 
-    fn ensure_table(&self, ddl: &str) -> anyhow::Result<()> {
+    fn ensure_table(&mut self, ddl: &str) -> anyhow::Result<()> {
         self.conn.execute(ddl, [])?;
         Ok(())
     }
 
     fn insert_rows(
-        &self,
+        &mut self,
         table: &str,
         cfg: &TableConfig,
         rows: &[HotRowFlat],
@@ -329,15 +328,20 @@ impl DuckDbExecutorImpl {
         let mut stmt = tx.prepare(&sql)?;
         for row in rows {
             if cfg.seq_col.is_some() {
-                stmt.execute((
+                stmt.execute(duckdb::params![
                     &row.k0,
                     &row.k1,
                     &row.ord_micros,
                     &row.payload_base64,
-                    &row.seq,
-                ))?;
+                    &row.seq
+                ])?;
             } else {
-                stmt.execute((&row.k0, &row.k1, &row.ord_micros, &row.payload_base64))?;
+                stmt.execute(duckdb::params![
+                    &row.k0,
+                    &row.k1,
+                    &row.ord_micros,
+                    &row.payload_base64
+                ])?;
             }
         }
         tx.commit()?;
@@ -348,7 +352,11 @@ impl DuckDbExecutorImpl {
         let mut stmt = self.conn.prepare(sql)?;
         let column_count = stmt.column_count();
         let column_names: Vec<String> = (0..column_count)
-            .map(|idx| stmt.column_name(idx).unwrap_or("").to_string())
+            .map(|idx| {
+                stmt.column_name(idx)
+                    .map(|name| name.to_string())
+                    .unwrap_or_default()
+            })
             .collect();
 
         let rows = stmt.query_map([], move |row| {
@@ -390,8 +398,8 @@ impl DuckDbExecutor {
     ) -> anyhow::Result<Vec<JsonValue>> {
         unsafe {
             let exec = DUCK_EXEC
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow("duckdb connection not initialized"))?;
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("duckdb connection not initialized"))?;
             exec.ensure_table(&cfg.ddl)?;
             exec.insert_rows(table, cfg, rows)?;
             exec.query_rows(sql)

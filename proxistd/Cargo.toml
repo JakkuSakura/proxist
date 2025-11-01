@@ -21,14 +21,14 @@ tempfile.workspace = true
 base64.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "=0.4.31", default-features = false, features = ["std"] }
 fp-sql = { path = "../FerroPhase/crates/fp-sql" }
 sqlx.workspace = true
-duckdb = { version = "0.10", optional = true }
+duckdb = { version = "=0.10.1", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 reqwest.workspace = true
 
 [features]
-default = []
+default = ["duckdb", "postgres"]
 duckdb = ["dep:duckdb"]
 postgres = ["dep:tokio-postgres"]

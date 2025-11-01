@@ -1382,7 +1382,7 @@ mod ingest_tests {
     use proxist_core::api::{IngestBatchRequest, IngestTick};
     use proxist_core::query::{QueryOperation, QueryRange};
     use serde_bytes::ByteBuf;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
     use tempfile::NamedTempFile;
 
     #[tokio::test]
@@ -1399,12 +1399,28 @@ mod ingest_tests {
             })
             .await?;
 
-        let hot_store = Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let hot_store_trait: Arc<dyn HotColumnStore> = hot_store.clone();
-        let service = IngestService::new(metadata.clone(), hot_store_trait, None);
+        let hot_store: Arc<dyn HotColumnStore> =
+            Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let service = Arc::new(IngestService::new(
+            metadata.clone(),
+            hot_store.clone(),
+            None,
+        ));
 
         let snapshot = metadata.get_cluster_metadata().await?;
         service.apply_metadata(&snapshot).await?;
+        let scheduler = Arc::new(
+            ProxistScheduler::new(
+                ExecutorConfig {
+                    sqlite_path: None,
+                    duckdb_path: None,
+                    pg_url: None,
+                },
+                None,
+                Some(hot_store.clone()),
+            )
+            .await?,
+        );
 
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
         let batch = IngestBatchRequest {
@@ -1421,8 +1437,9 @@ mod ingest_tests {
         let state = AppState {
             metadata: metadata.clone(),
             metadata_cache: Arc::new(tokio::sync::Mutex::new(snapshot)),
-            hot_store,
-            ingest: Arc::new(service),
+            hot_store: hot_store.clone(),
+            ingest: service.clone(),
+            scheduler,
             metrics: None,
             api_token: None,
         };
@@ -1461,10 +1478,27 @@ mod ingest_tests {
             })
             .await?;
 
-        let hot_store = Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let service = IngestService::new(metadata.clone(), hot_store.clone(), None);
+        let hot_store: Arc<dyn HotColumnStore> =
+            Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let service = Arc::new(IngestService::new(
+            metadata.clone(),
+            hot_store.clone(),
+            None,
+        ));
         let snapshot = metadata.get_cluster_metadata().await?;
         service.apply_metadata(&snapshot).await?;
+        let scheduler = Arc::new(
+            ProxistScheduler::new(
+                ExecutorConfig {
+                    sqlite_path: None,
+                    duckdb_path: None,
+                    pg_url: None,
+                },
+                None,
+                Some(hot_store.clone()),
+            )
+            .await?,
+        );
 
         let ts = SystemTime::UNIX_EPOCH + Duration::from_millis(500);
         service
@@ -1482,8 +1516,9 @@ mod ingest_tests {
         let state = AppState {
             metadata: metadata.clone(),
             metadata_cache: Arc::new(tokio::sync::Mutex::new(snapshot)),
-            hot_store,
-            ingest: Arc::new(service),
+            hot_store: hot_store.clone(),
+            ingest: service.clone(),
+            scheduler,
             metrics: None,
             api_token: None,
         };

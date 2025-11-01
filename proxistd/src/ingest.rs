@@ -806,14 +806,6 @@ mod tests {
                 .extend(segment.records.iter().cloned());
             Ok(())
         }
-
-        fn target(&self) -> SinkTarget {
-            SinkTarget {
-                endpoint: "http://localhost:8123".into(),
-                database: "proxist".into(),
-                table: "ticks".into(),
-            }
-        }
     }
 
     impl RecordingClickhouseSink {
@@ -833,7 +825,11 @@ mod tests {
         let hot_store = TestHotStore::default();
         let hot_store_arc: Arc<dyn HotColumnStore> = Arc::new(hot_store.clone());
         let mock_sink = RecordingClickhouseSink::default();
-        let target = mock_sink.target();
+        let target = SinkTarget {
+            endpoint: "http://localhost:8123".into(),
+            database: "proxist".into(),
+            table: "ticks".into(),
+        };
         let clickhouse_client = Arc::new(ClickhouseHttpClient::new(ClickhouseConfig::default())?);
 
         let service = IngestService::new(
@@ -894,7 +890,11 @@ mod tests {
         let hot_store_trait: Arc<dyn HotColumnStore> = hot_store.clone();
 
         let recording_sink = RecordingClickhouseSink::default();
-        let target = recording_sink.target();
+        let target = SinkTarget {
+            endpoint: "http://localhost:8123".into(),
+            database: "proxist".into(),
+            table: "ticks".into(),
+        };
         let clickhouse_client = Arc::new(ClickhouseHttpClient::new(ClickhouseConfig::default())?);
 
         let service = IngestService::new(
