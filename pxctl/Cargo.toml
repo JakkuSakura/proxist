@@ -12,7 +12,6 @@ serde_json.workspace = true
 serde.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-proxist-api = { path = "../proxist-api" }
 tracing-subscriber.workspace = true
 reqwest.workspace = true
 proxist-core = { path = "../proxist-core" }

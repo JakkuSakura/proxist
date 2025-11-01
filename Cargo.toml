@@ -2,10 +2,6 @@
 members = [
     "proxist-core",
     "proxist-mem",
-    "proxist-ch",
-    "proxist-api",
-    "proxist-metadata-sqlite",
-    "proxist-exec",
     "proxistd",
     "pxctl",
 ]

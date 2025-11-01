@@ -14,12 +14,8 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
-proxist-api = { path = "../proxist-api" }
-proxist-ch = { path = "../proxist-ch" }
 proxist-core = { path = "../proxist-core" }
 proxist-mem = { path = "../proxist-mem" }
-proxist-exec = { path = "../proxist-exec" }
-proxist-metadata-sqlite = { path = "../proxist-metadata-sqlite" }
 serde_bytes.workspace = true
 tempfile.workspace = true
 base64.workspace = true
@@ -27,3 +23,12 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 fp-sql = { path = "../FerroPhase/crates/fp-sql" }
+sqlx.workspace = true
+duckdb = { version = "0.10", optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+reqwest.workspace = true
+
+[features]
+default = []
+duckdb = ["dep:duckdb"]
+postgres = ["dep:tokio-postgres"]

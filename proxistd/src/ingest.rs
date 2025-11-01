@@ -8,14 +8,14 @@ use std::{
 };
 
 use anyhow::Result;
-use proxist_api::{ClickhouseStatus, IngestBatchRequest};
-use proxist_ch::{ClickhouseHttpClient, ClickhouseSink, ClickhouseTarget};
+use proxist_core::api::{ClickhouseStatus, IngestBatchRequest, ClickhouseTarget};
+use crate::clickhouse::{ClickhouseHttpClient, ClickhouseSink, ClickhouseTarget as SinkTarget};
 use proxist_core::{
     metadata::{ClusterMetadata, ShardHealth, TenantId},
     MetadataStore, PersistenceBatch, PersistenceTransition, ShardPersistenceTracker,
 };
 use proxist_mem::{HotColumnStore, HotSymbolSummary};
-use proxist_metadata_sqlite::SqliteMetadataStore;
+use crate::metadata_sqlite::SqliteMetadataStore;
 use proxist_core::ingest::{IngestRecord, IngestSegment};
 use serde_bytes::ByteBuf;
 use tokio::sync::Mutex;
@@ -104,19 +104,26 @@ impl IngestService {
         hot_store: Arc<dyn HotColumnStore>,
         clickhouse: Option<(
             Arc<dyn ClickhouseSink>,
-            ClickhouseTarget,
+            SinkTarget,
             Arc<ClickhouseHttpClient>,
         )>,
     ) -> Self {
-        let (clickhouse_sink, target, client) = match clickhouse {
-            Some((sink, target, client)) => (Some(sink), Some(target), Some(client)),
-            None => (None, None, None),
+        let (clickhouse_sink, _sink_target, client, api_target) = match clickhouse {
+            Some((sink, target, client)) => {
+                let api_target = ClickhouseTarget {
+                    endpoint: target.endpoint.clone(),
+                    database: target.database.clone(),
+                    table: target.table.clone(),
+                };
+                (Some(sink), Some(target), Some(client), Some(api_target))
+            }
+            None => (None, None, None, None),
         };
         Self {
             metadata,
             hot_store,
             clickhouse: clickhouse_sink,
-            clickhouse_target: target,
+            clickhouse_target: api_target,
             clickhouse_client: client,
             last_flush_micros: AtomicI64::new(-1),
             clickhouse_error: Mutex::new(None),
@@ -493,7 +500,7 @@ impl IngestService {
         let target = self
             .clickhouse_target
             .as_ref()
-            .map(|t| proxist_api::ClickhouseTarget {
+            .map(|t| ClickhouseTarget {
                 endpoint: t.endpoint.clone(),
                 database: t.database.clone(),
                 table: t.table.clone(),
@@ -501,7 +508,7 @@ impl IngestService {
             .or_else(|| {
                 self.clickhouse_client.as_ref().map(|client| {
                     let t = client.target();
-                    proxist_api::ClickhouseTarget {
+                    ClickhouseTarget {
                         endpoint: t.endpoint,
                         database: t.database,
                         table: t.table,
@@ -643,8 +650,8 @@ fn micros_to_system_time(micros: i64) -> std::time::SystemTime {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use proxist_api::IngestTick;
-    use proxist_ch::{ClickhouseConfig, ClickhouseHttpClient};
+    use crate::clickhouse::{ClickhouseConfig, ClickhouseHttpClient};
+    use proxist_core::api::IngestTick;
     use proxist_core::{metadata::ShardAssignment, query::QueryRange};
     use proxist_mem::{InMemoryHotColumnStore, MemConfig, SeamBoundaryRow};
     use proxist_core::ingest::{IngestRecord, IngestSegment};
@@ -809,8 +816,8 @@ mod tests {
             Ok(())
         }
 
-        fn target(&self) -> ClickhouseTarget {
-            ClickhouseTarget {
+        fn target(&self) -> SinkTarget {
+            SinkTarget {
                 endpoint: "http://localhost:8123".into(),
                 database: "proxist".into(),
                 table: "ticks".into(),

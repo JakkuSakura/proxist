@@ -1,5 +1,3 @@
-//! ClickHouse persistence adapter.
-
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
@@ -161,8 +159,9 @@ impl ClickhouseSink for ClickhouseHttpSink {
                         attempt += 1;
                         if attempt > self.config.max_retries {
                             return Err(anyhow!(
-                                "clickhouse insert error after {} retries: {err}",
-                                self.config.max_retries
+                                "clickhouse insert error after {} retries: {}",
+                                self.config.max_retries,
+                                err
                             ));
                         }
                         tokio::time::sleep(Duration::from_millis(
@@ -175,7 +174,12 @@ impl ClickhouseSink for ClickhouseHttpSink {
             }
         }
 
-        debug!(rows = segment.records.len(), endpoint = %self.config.endpoint, table = %self.config.table, "flushed segment to ClickHouse");
+        debug!(
+            rows = segment.records.len(),
+            endpoint = %self.config.endpoint,
+            table = %self.config.table,
+            "flushed segment to ClickHouse"
+        );
 
         Ok(())
     }

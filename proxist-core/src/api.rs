@@ -1,11 +1,9 @@
-//! API models shared across CLI and daemon.
-
 use std::time::SystemTime;
 
-pub use proxist_core::metadata::{ShardAssignment, ShardHealth};
-use proxist_core::{
+pub use crate::metadata::{ShardAssignment, ShardHealth};
+use crate::{
     metadata::TenantId,
-    query::{QueryRange, RollingWindowConfig},
+    query::{QueryOperation, QueryRange, RollingWindowConfig},
     ShardPersistenceTracker,
 };
 use serde::{Deserialize, Serialize};
@@ -15,7 +13,7 @@ use serde_bytes::ByteBuf;
 pub struct IngestTick {
     pub tenant: TenantId,
     pub symbol: String,
-    #[serde(with = "proxist_core::time::serde_micros")]
+    #[serde(with = "crate::time::serde_micros")]
     pub timestamp: SystemTime,
     pub payload: ByteBuf,
     pub seq: u64,
@@ -33,7 +31,7 @@ pub struct QueryRequest {
     pub range: QueryRange,
     pub include_cold: bool,
     #[serde(default = "default_query_op")]
-    pub op: proxist_core::query::QueryOperation,
+    pub op: QueryOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolling: Option<RollingWindowConfig>,
 }
@@ -43,14 +41,14 @@ pub struct QueryResponse {
     pub rows: Vec<QueryRow>,
 }
 
-fn default_query_op() -> proxist_core::query::QueryOperation {
-    proxist_core::query::QueryOperation::Range
+fn default_query_op() -> QueryOperation {
+    QueryOperation::Range
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRow {
     pub symbol: String,
-    #[serde(with = "proxist_core::time::serde_micros")]
+    #[serde(with = "crate::time::serde_micros")]
     pub timestamp: SystemTime,
     pub payload: ByteBuf,
 }
@@ -63,7 +61,7 @@ pub struct SymbolDictionarySpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsBundle {
-    #[serde(with = "proxist_core::time::serde_micros")]
+    #[serde(with = "crate::time::serde_micros")]
     pub captured_at: SystemTime,
     pub status: StatusResponse,
     pub metrics: Option<String>,
@@ -87,7 +85,7 @@ pub struct DiagnosticsHotSummaryRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
-    pub metadata: proxist_core::metadata::ClusterMetadata,
+    pub metadata: crate::metadata::ClusterMetadata,
     pub shard_health: Vec<ShardHealth>,
     pub clickhouse: ClickhouseStatus,
 }
@@ -96,7 +94,7 @@ pub struct StatusResponse {
 pub struct ClickhouseStatus {
     pub enabled: bool,
     pub target: Option<ClickhouseTarget>,
-    #[serde(with = "proxist_core::time::serde_opt_micros")]
+    #[serde(with = "crate::time::serde_opt_micros")]
     pub last_flush: Option<SystemTime>,
     pub last_error: Option<String>,
 }
@@ -119,4 +117,12 @@ pub enum ControlCommand {
 pub struct CommandResponse {
     pub accepted: bool,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClickhouseConfigView {
+    pub endpoint: String,
+    pub database: String,
+    pub table: String,
+    pub username: Option<String>,
 }

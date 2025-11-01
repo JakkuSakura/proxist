@@ -1,5 +1,3 @@
-//! SQLite-backed implementation of the Proxist metadata store.
-
 use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -301,8 +299,7 @@ impl MetadataStore for SqliteMetadataStore {
             let watermark_json: String = row.get("watermark_json");
             let persistence_state_json: String = row.get("persistence_state_json");
             let watermark: Watermark = serde_json::from_str(&watermark_json)?;
-            let persistence_state: PersistenceState =
-                serde_json::from_str(&persistence_state_json)?;
+            let persistence_state: PersistenceState = serde_json::from_str(&persistence_state_json)?;
 
             health.push(ShardHealth {
                 shard_id: row.get("shard_id"),

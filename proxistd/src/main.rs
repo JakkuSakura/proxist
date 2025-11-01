@@ -1,9 +1,10 @@
+mod clickhouse;
 mod ingest;
+mod metadata_sqlite;
+mod scheduler;
 
 use std::collections::HashMap;
-use std::env;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,11 +22,11 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::NaiveDateTime;
 use ingest::{HotColdSummaryRow, IngestService};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use proxist_api::{
-    DiagnosticsBundle, IngestBatchRequest, IngestTick, QueryRequest, QueryResponse, StatusResponse,
-    SymbolDictionarySpec,
+use proxist_core::api::{
+    DiagnosticsBundle, DiagnosticsHotSummaryRow, IngestBatchRequest, IngestTick, QueryRequest,
+    QueryResponse, QueryRow, StatusResponse, SymbolDictionarySpec,
 };
-use proxist_ch::{
+use crate::clickhouse::{
     ClickhouseConfig, ClickhouseHttpClient, ClickhouseHttpSink, ClickhouseQueryRow, ClickhouseSink,
 };
 use proxist_core::{
@@ -34,8 +35,8 @@ use proxist_core::{
     MetadataStore, ShardAssignment, ShardHealth,
 };
 use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
-use proxist_exec::{ExecutorConfig, ProxistScheduler, SqlExecutor};
-use proxist_metadata_sqlite::SqliteMetadataStore;
+use crate::scheduler::{ExecutorConfig, ProxistScheduler, SqlExecutor, SqlResult};
+use crate::metadata_sqlite::SqliteMetadataStore;
 // WAL removed: ingestion is immediately applied to hot store and persisted
 use serde_bytes::ByteBuf;
 use serde_json::json;
@@ -240,8 +241,8 @@ async fn compose_diagnostics(state: &AppState) -> Result<DiagnosticsBundle, AppE
     })
 }
 
-fn convert_summary_row(row: HotColdSummaryRow) -> proxist_api::DiagnosticsHotSummaryRow {
-    proxist_api::DiagnosticsHotSummaryRow {
+fn convert_summary_row(row: HotColdSummaryRow) -> DiagnosticsHotSummaryRow {
+    DiagnosticsHotSummaryRow {
         tenant: row.tenant,
         symbol: row.symbol,
         shard_id: row.shard_id,
@@ -257,8 +258,8 @@ fn option_time_to_micros(ts: Option<SystemTime>) -> Option<i64> {
     ts.map(system_time_to_micros)
 }
 
-fn hot_row_to_query_row(row: proxist_mem::HotRow) -> proxist_api::QueryRow {
-    proxist_api::QueryRow {
+fn hot_row_to_query_row(row: proxist_mem::HotRow) -> QueryRow {
+    QueryRow {
         symbol: row.symbol,
         timestamp: row.timestamp,
         payload: ByteBuf::from(row.payload),
@@ -436,7 +437,6 @@ fn render_rows_as_jsoneachrow(rows: Vec<serde_json::Map<String, serde_json::Valu
 }
 
 async fn forward_sql_to_scheduler(state: &AppState, sql: &str) -> Result<String, AppError> {
-    use proxist_exec::SqlResult;
     let result = state.scheduler.execute(sql).await?;
     let body = match result {
         SqlResult::Text(s) => s,
@@ -604,11 +604,11 @@ fn query_operation_label(op: &QueryOperation) -> &'static str {
     }
 }
 
-fn clickhouse_row_to_query_row(row: ClickhouseQueryRow) -> anyhow::Result<proxist_api::QueryRow> {
+fn clickhouse_row_to_query_row(row: ClickhouseQueryRow) -> anyhow::Result<QueryRow> {
     let payload = BASE64_STANDARD
         .decode(row.payload_base64.as_bytes())
         .context("decode ClickHouse payload")?;
-    Ok(proxist_api::QueryRow {
+    Ok(QueryRow {
         symbol: row.symbol,
         timestamp: micros_to_system_time(row.ts_micros),
         payload: ByteBuf::from(payload),
@@ -642,7 +642,6 @@ impl ProxistDaemon {
         let cache = Arc::new(tokio::sync::Mutex::new(ClusterMetadata::default()));
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let replay_records: Vec<proxist_core::ingest::IngestRecord> = Vec::new();
 
         let clickhouse_bundle = config.clickhouse.clone().and_then(|cfg| {
             let sink = ClickhouseHttpSink::new(cfg.clone())
@@ -1105,7 +1104,7 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                     hot_rows.retain(|row| row.timestamp > persisted);
                 }
             }
-            let mut rows: Vec<proxist_api::QueryRow> =
+            let mut rows: Vec<QueryRow> =
                 hot_rows.into_iter().map(hot_row_to_query_row).collect();
 
             if include_cold {
@@ -1162,10 +1161,10 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                 }
             }
 
-            let mut map: HashMap<String, proxist_api::QueryRow> = HashMap::new();
+            let mut map: HashMap<String, QueryRow> = HashMap::new();
 
             let mut upsert =
-                |row: proxist_api::QueryRow| match map.entry(row.symbol.clone()) {
+                |row: QueryRow| match map.entry(row.symbol.clone()) {
                     std::collections::hash_map::Entry::Vacant(slot) => {
                         slot.insert(row);
                     }
@@ -1220,7 +1219,7 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                         if seam.timestamp > request.range.end {
                             continue;
                         }
-                        upsert(proxist_api::QueryRow {
+                        upsert(QueryRow {
                             symbol: seam.symbol,
                             timestamp: seam.timestamp,
                             payload: ByteBuf::from(seam.payload),
@@ -1229,7 +1228,7 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                 }
             }
 
-            let mut rows: Vec<proxist_api::QueryRow> = if request.symbols.is_empty() {
+            let mut rows: Vec<QueryRow> = if request.symbols.is_empty() {
                 map.into_values().collect()
             } else {
                 request
@@ -1319,7 +1318,7 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                     "count": count,
                 }))
                 .map_err(|err| AppError(anyhow!(err)))?;
-                rows.push(proxist_api::QueryRow {
+                rows.push(QueryRow {
                     symbol,
                     timestamp: request.range.end,
                     payload: ByteBuf::from(payload),
@@ -1384,7 +1383,7 @@ mod system_summary_tests {
 #[cfg(test)]
 mod ingest_tests {
     use super::*;
-    use proxist_api::{IngestBatchRequest, IngestTick};
+    use proxist_core::api::{IngestBatchRequest, IngestTick};
     use proxist_core::query::{QueryOperation, QueryRange};
     use serde_bytes::ByteBuf;
     use std::time::{Duration, UNIX_EPOCH};
