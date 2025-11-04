@@ -36,8 +36,37 @@ pub trait SqlExecutor: Send + Sync {
     async fn execute(&self, sql: &str) -> anyhow::Result<SqlResult>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickhouseWireFormat {
+    JsonEachRow,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClickhouseWire {
+    pub format: ClickhouseWireFormat,
+    pub body: String,
+}
+
+impl ClickhouseWire {
+    fn jsoneachrow(body: String) -> Self {
+        Self {
+            format: ClickhouseWireFormat::JsonEachRow,
+            body,
+        }
+    }
+
+    fn with_unknown(body: String) -> Self {
+        Self {
+            format: ClickhouseWireFormat::Unknown,
+            body,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SqlResult {
+    Clickhouse(ClickhouseWire),
     Text(String),
     Rows(Vec<Map<String, JsonValue>>),
 }
@@ -126,80 +155,106 @@ impl SqlExecutor for ProxistScheduler {
                 };
 
                 if let Some(plan) = plan {
-                    let limit_hint = plan
-                        .limit
-                        .map(|limit| limit.saturating_add(plan.offset.unwrap_or(0)));
+                    let requested_format = detect_wire_format(sql);
+                    if !matches!(
+                        requested_format,
+                        ClickhouseWireFormat::JsonEachRow | ClickhouseWireFormat::Unknown
+                    ) {
+                        if let Some(ch) = &self.clickhouse {
+                            return Ok(SqlResult::Clickhouse(ClickhouseWire {
+                                format: requested_format,
+                                body: ch.execute_raw(sql).await?,
+                            }));
+                        }
+                        // fall through to default executors if ClickHouse is unavailable
+                    } else {
+                        let limit_hint = plan
+                            .limit
+                            .map(|limit| limit.saturating_add(plan.offset.unwrap_or(0)));
 
-                    if let Some(hot_sql) = strip_limit_offset(sql, limit_hint) {
-                        let cutoff = self.persisted_cutoff_micros.load(Ordering::SeqCst);
-                        let mut cold_rows = Vec::new();
-                        let mut hot_rows = Vec::new();
-                        let mut plan_failed = false;
+                        if let Some(hot_sql) = strip_limit_offset(sql, limit_hint) {
+                            let cutoff = self.persisted_cutoff_micros.load(Ordering::SeqCst);
+                            let mut cold_rows = Vec::new();
+                            let mut hot_rows = Vec::new();
+                            let mut plan_failed = false;
 
-                        if cutoff >= 0 {
-                            let start_u = system_time_to_micros(plan.select.start);
-                            let end_u = system_time_to_micros(plan.select.end);
+                            if cutoff >= 0 {
+                                let start_u = system_time_to_micros(plan.select.start);
+                                let end_u = system_time_to_micros(plan.select.end);
 
-                            if start_u <= cutoff {
-                                if let Some(cold_sql) = rewrite_with_bounds(
-                                    sql,
-                                    &plan.cfg.order_col,
-                                    Some(start_u),
-                                    Some(cutoff.min(end_u)),
-                                    limit_hint,
-                                ) {
-                                    if let Some(ch) = &self.clickhouse {
-                                        let text = ch.execute_raw(&cold_sql).await?;
-                                        cold_rows = parse_json_rows(&text)?;
+                                if start_u <= cutoff {
+                                    if let Some(cold_sql) = rewrite_with_bounds(
+                                        sql,
+                                        &plan.cfg.order_col,
+                                        Some(start_u),
+                                        Some(cutoff.min(end_u)),
+                                        limit_hint,
+                                    ) {
+                                        if let Some(ch) = &self.clickhouse {
+                                            let text = ch.execute_raw(&cold_sql).await?;
+                                            cold_rows = parse_json_rows(&text)?;
+                                        } else {
+                                            plan_failed = true;
+                                        }
                                     } else {
                                         plan_failed = true;
                                     }
-                                } else {
-                                    plan_failed = true;
                                 }
-                            }
 
-                            if !plan_failed && end_u > cutoff {
-                                let hot_lo = if start_u > cutoff {
-                                    start_u
-                                } else {
-                                    cutoff + 1
-                                };
-                                let mut select = plan.select.clone();
-                                select.start = micros_to_system_time(hot_lo);
-                                let rows = load_hot_rows(hot, &select).await?;
+                                if !plan_failed && end_u > cutoff {
+                                    let hot_lo = if start_u > cutoff {
+                                        start_u
+                                    } else {
+                                        cutoff + 1
+                                    };
+                                    let mut select = plan.select.clone();
+                                    select.start = micros_to_system_time(hot_lo);
+                                    let rows = load_hot_rows(hot, &select).await?;
+                                    if !rows.is_empty() {
+                                        hot_rows = duck.load_table_and_execute(
+                                            &plan.cfg,
+                                            &select.table,
+                                            &rows,
+                                            &hot_sql,
+                                        )?;
+                                    }
+                                }
+                            } else {
+                                let rows = load_hot_rows(hot, &plan.select).await?;
                                 if !rows.is_empty() {
                                     hot_rows = duck.load_table_and_execute(
                                         &plan.cfg,
-                                        &select.table,
+                                        &plan.select.table,
                                         &rows,
                                         &hot_sql,
                                     )?;
                                 }
                             }
-                        } else {
-                            let rows = load_hot_rows(hot, &plan.select).await?;
-                            if !rows.is_empty() {
-                                hot_rows = duck.load_table_and_execute(
-                                    &plan.cfg,
-                                    &plan.select.table,
-                                    &rows,
-                                    &hot_sql,
-                                )?;
-                            }
-                        }
 
-                        if !plan_failed && (!cold_rows.is_empty() || !hot_rows.is_empty()) {
-                            let merged = merge_rows(cold_rows, hot_rows, &plan)?;
-                            let formatted = format_json_rows(&merged, plan.offset, plan.limit);
-                            return Ok(SqlResult::Text(formatted));
+                            if !plan_failed && (!cold_rows.is_empty() || !hot_rows.is_empty()) {
+                                let merged = merge_rows(cold_rows, hot_rows, &plan)?;
+                                let wire = format_json_rows_as_clickhouse(
+                                    &merged,
+                                    plan.offset,
+                                    plan.limit,
+                                    ClickhouseWireFormat::JsonEachRow,
+                                );
+                                return Ok(SqlResult::Clickhouse(wire));
+                            }
                         }
                     }
                 }
             }
 
             if let Some(ch) = &self.clickhouse {
-                return Ok(SqlResult::Text(ch.execute_raw(sql).await?));
+                let wire_format = detect_wire_format(sql);
+                let body = ch.execute_raw(sql).await?;
+                let wire = if matches!(wire_format, ClickhouseWireFormat::JsonEachRow) {
+                    ClickhouseWire::jsoneachrow(body)
+                } else {
+                    ClickhouseWire::with_unknown(body)
+                };
+                return Ok(SqlResult::Clickhouse(wire));
             }
         }
 
@@ -695,17 +750,18 @@ fn merge_rows(
     }
 }
 
-fn format_json_rows(rows: &[JsonValue], offset: Option<usize>, limit: Option<usize>) -> String {
+fn format_json_rows_as_clickhouse(
+    rows: &[JsonValue],
+    offset: Option<usize>,
+    limit: Option<usize>,
+    format: ClickhouseWireFormat,
+) -> ClickhouseWire {
     let iter = rows.iter().skip(offset.unwrap_or(0));
     let rows: Vec<_> = if let Some(limit) = limit {
         iter.take(limit).cloned().collect()
     } else {
         iter.cloned().collect()
     };
-
-    if rows.is_empty() {
-        return String::new();
-    }
 
     let mut body = String::new();
     for value in rows {
@@ -714,7 +770,10 @@ fn format_json_rows(rows: &[JsonValue], offset: Option<usize>, limit: Option<usi
             body.push('\n');
         }
     }
-    body
+    match format {
+        ClickhouseWireFormat::JsonEachRow => ClickhouseWire::jsoneachrow(body),
+        ClickhouseWireFormat::Unknown => ClickhouseWire::with_unknown(body),
+    }
 }
 
 fn extract_order_key(row: &JsonValue, column: &str) -> anyhow::Result<i64> {
@@ -731,6 +790,26 @@ fn extract_order_key(row: &JsonValue, column: &str) -> anyhow::Result<i64> {
             .map_err(|_| anyhow!("unable to parse order column value as integer")),
         _ => Err(anyhow!("unsupported order column type")),
     }
+}
+
+fn detect_wire_format(sql: &str) -> ClickhouseWireFormat {
+    let lower = sql.to_ascii_lowercase();
+    if let Some(idx) = lower.rfind("format") {
+        let mut tail = lower[idx + "format".len()..].trim_start();
+        if let Some(end) = tail.find(';') {
+            tail = &tail[..end];
+        }
+        for token in tail.split_whitespace() {
+            if token.is_empty() {
+                continue;
+            }
+            if token == "jsoneachrow" {
+                return ClickhouseWireFormat::JsonEachRow;
+            }
+            break;
+        }
+    }
+    ClickhouseWireFormat::Unknown
 }
 
 fn parse_proxist_table_config(sql: &str) -> anyhow::Result<TableConfig> {
@@ -786,4 +865,27 @@ fn parse_proxist_table_config(sql: &str) -> anyhow::Result<TableConfig> {
         filter_cols,
         seq_col,
     })
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn detect_wire_format_identifies_json() {
+        let sql = "SELECT * FROM foo FORMAT JSONEachRow";
+        assert!(matches!(
+            detect_wire_format(sql),
+            ClickhouseWireFormat::JsonEachRow
+        ));
+    }
+
+    #[test]
+    fn detect_wire_format_handles_absent_format() {
+        let sql = "SELECT * FROM foo";
+        assert!(matches!(
+            detect_wire_format(sql),
+            ClickhouseWireFormat::Unknown
+        ));
+    }
 }

@@ -12,7 +12,9 @@ use crate::clickhouse::{
     ClickhouseConfig, ClickhouseHttpClient, ClickhouseHttpSink, ClickhouseQueryRow, ClickhouseSink,
 };
 use crate::metadata_sqlite::SqliteMetadataStore;
-use crate::scheduler::{ExecutorConfig, ProxistScheduler, SqlExecutor, SqlResult};
+use crate::scheduler::{
+    ClickhouseWire, ClickhouseWireFormat, ExecutorConfig, ProxistScheduler, SqlExecutor, SqlResult,
+};
 use anyhow::{anyhow, bail, Context};
 use axum::{
     body::{Body, Bytes},
@@ -438,6 +440,12 @@ fn render_rows_as_jsoneachrow(rows: Vec<serde_json::Map<String, serde_json::Valu
 async fn forward_sql_to_scheduler(state: &AppState, sql: &str) -> Result<String, AppError> {
     let result = state.scheduler.execute(sql).await?;
     let body = match result {
+        SqlResult::Clickhouse(ClickhouseWire { format, body }) => {
+            if let ClickhouseWireFormat::Unknown = format {
+                // Future formats will be exposed once the API supports them.
+            }
+            body
+        }
         SqlResult::Text(s) => s,
         SqlResult::Rows(rows) => render_rows_as_jsoneachrow(rows),
     };
