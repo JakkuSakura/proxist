@@ -10,6 +10,10 @@ CUTOFF_MICROS="${PROXIST_PERSISTED_CUTOFF_OVERRIDE_MICROS:-1704103205000000}"
 PROXIST_PG_PORT="${PROXIST_PG_PORT:-15432}"
 PROXIST_PG_ADDR="127.0.0.1:${PROXIST_PG_PORT}"
 PROXIST_PG_USER="${PROXIST_PG_USER:-postgres}"
+COLD_ROWS="${PROXIST_BENCH_COLD_ROWS:-2000000}"
+HOT_BATCH_SIZE="${PROXIST_BENCH_HOT_BATCH_SIZE:-2000}"
+HOT_BATCHES="${PROXIST_BENCH_HOT_BATCHES:-5}"
+WINDOW_MICROS="${PROXIST_BENCH_WINDOW_MICROS:-1000000}"
 
 if command -v docker >/dev/null 2>&1; then
   COMPOSE_CMD=(docker compose -f "${COMPOSE_FILE}")
@@ -111,15 +115,16 @@ echo "Creating schema in ClickHouse..."
 "${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "DROP TABLE IF EXISTS proxist.ticks" >/dev/null
 "${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "CREATE TABLE proxist.ticks (tenant String, shard_id String, symbol String, ts_micros Int64, payload_base64 String, seq UInt64) ENGINE = MergeTree ORDER BY (tenant, symbol, ts_micros)" >/dev/null
 
+COLD_BASE_MICROS=$((CUTOFF_MICROS - COLD_ROWS - 1))
 COLD_INSERT_SQL="
 INSERT INTO proxist.ticks SELECT
   'alpha' AS tenant,
   'alpha-shard' AS shard_id,
   concat('SYM', toString(number % 10)) AS symbol,
-  toUnixTimestamp64Micro(toDateTime64('2024-01-01 10:00:00', 6) + number * 0.000001) AS ts_micros,
+  ${COLD_BASE_MICROS} + number AS ts_micros,
   base64Encode(toString(number)) AS payload_base64,
   number AS seq
-FROM numbers(200000);
+FROM numbers(${COLD_ROWS});
 "
 
 echo "Loading cold dataset directly into ClickHouse..."
@@ -132,64 +137,120 @@ if [[ "${PROXIST_BENCH_DEBUG_CH:-0}" == "1" ]]; then
   head -n 5 "${CH_SAMPLE_FILE}"
 fi
 
-echo "Ingesting hot dataset through proxistd (psql)..."
-HOT_INSERT_SQL="
-INSERT INTO ticks (tenant, symbol, ts_micros, payload_base64, seq) VALUES
-  ('alpha','SYM1',1704103206000000,'AQ==',1),
-  ('alpha','SYM2',1704103207000000,'Ag==',2),
-  ('alpha','SYM3',1704103208000000,'Aw==',3)
-"
-if ! psql -h 127.0.0.1 -p "${PROXIST_PG_PORT}" -U "${PROXIST_PG_USER}" -d postgres -c "${HOT_INSERT_SQL}" >/dev/null 2>&1; then
-  echo "hot ingest failed via psql" >&2
-  if [[ -f "${PROXIST_LOG}" ]]; then
-    echo "proxistd logs:" >&2
-    cat "${PROXIST_LOG}" >&2
+HOT_BASE_MICROS=$((CUTOFF_MICROS + 1))
+HOT_LAST_MICROS="${HOT_BASE_MICROS}"
+HOT_SEQ=1
+
+append_hot_batch() {
+  local batch_start="${HOT_LAST_MICROS}"
+  local batch_size="${HOT_BATCH_SIZE}"
+  local sql
+  sql=$(python3 - <<PY
+batch_start=${batch_start}
+batch_size=${batch_size}
+seq_start=${HOT_SEQ}
+symbols=["SYM1","SYM2","SYM3"]
+rows=[]
+for i in range(batch_size):
+    ts=batch_start+i+1
+    sym=symbols[i % len(symbols)]
+    rows.append(f"('alpha','{sym}',{ts},'AQ==',{seq_start+i})")
+print("INSERT INTO ticks (tenant, symbol, ts_micros, payload_base64, seq) VALUES " + ",".join(rows))
+PY
+)
+  if ! psql -h 127.0.0.1 -p "${PROXIST_PG_PORT}" -U "${PROXIST_PG_USER}" -d postgres -c "${sql}" >/dev/null 2>&1; then
+    return 1
   fi
-  KEEP_LOG=1
-  exit 1
-fi
+  HOT_SEQ=$((HOT_SEQ + batch_size))
+  HOT_LAST_MICROS=$((batch_start + batch_size))
+  return 0
+}
 
-HOT_QUERY=$(cat <<'JSON'
+echo "Appending hot dataset through proxistd (psql)..."
+for _ in $(seq 1 "${HOT_BATCHES}"); do
+  if ! append_hot_batch; then
+    echo "hot append failed via psql" >&2
+    if [[ -f "${PROXIST_LOG}" ]]; then
+      echo "proxistd logs:" >&2
+      cat "${PROXIST_LOG}" >&2
+    fi
+    KEEP_LOG=1
+    exit 1
+  fi
+done
+
+build_hot_query() {
+  local end_micros="$1"
+  local start_micros=$((end_micros - WINDOW_MICROS + 1))
+  cat <<SQL
 SELECT symbol, ts_micros, payload_base64
 FROM ticks
 WHERE tenant = 'alpha'
   AND symbol IN ('SYM1','SYM2','SYM3')
-  AND ts_micros BETWEEN 1704103206000000 AND 1704103209000000
+  AND ts_micros BETWEEN ${start_micros} AND ${end_micros}
 ORDER BY ts_micros ASC
 FORMAT JSONEachRow
-JSON
-)
+SQL
+}
 
-COLD_QUERY=$(cat <<'JSON'
+build_cold_query() {
+  local cold_start="${COLD_BASE_MICROS}"
+  local cold_end=$((CUTOFF_MICROS - 1))
+  cat <<SQL
 SELECT symbol, ts_micros, payload_base64
 FROM ticks
 WHERE tenant = 'alpha'
   AND symbol IN ('SYM1','SYM2','SYM3')
-  AND ts_micros BETWEEN 1704103200000000 AND 1704103204000000
+  AND ts_micros BETWEEN ${cold_start} AND ${cold_end}
 ORDER BY ts_micros ASC
 FORMAT JSONEachRow
-JSON
-)
+SQL
+}
 
-MIXED_QUERY=$(cat <<'JSON'
+build_mixed_query() {
+  local end_micros="$1"
+  local start_micros=$((CUTOFF_MICROS - (WINDOW_MICROS / 2)))
+  cat <<SQL
 SELECT symbol, ts_micros, payload_base64
 FROM ticks
 WHERE tenant = 'alpha'
   AND symbol IN ('SYM1','SYM2','SYM3')
-  AND ts_micros BETWEEN 1704103200000000 AND 1704103209000000
+  AND ts_micros BETWEEN ${start_micros} AND ${end_micros}
 ORDER BY ts_micros ASC
 FORMAT JSONEachRow
-JSON
-)
+SQL
+}
 
 bench_query() {
   local name="$1"
-  local payload="$2"
+  local mode="$2"
   local iterations=5
   local total=0
 
   echo "Running ${name} benchmark (${iterations} iterations)..."
   for i in $(seq 1 ${iterations}); do
+    if ! append_hot_batch; then
+      echo "hot append failed via psql" >&2
+      KEEP_LOG=1
+      break
+    fi
+    local payload
+    case "${mode}" in
+      hot)
+        payload="$(build_hot_query "${HOT_LAST_MICROS}")"
+        ;;
+      cold)
+        payload="$(build_cold_query)"
+        ;;
+      mixed)
+        payload="$(build_mixed_query "${HOT_LAST_MICROS}")"
+        ;;
+      *)
+        echo "unknown bench mode ${mode}" >&2
+        KEEP_LOG=1
+        break
+        ;;
+    esac
     local start
     local end
     start=$(python3 - <<'PY'
@@ -234,8 +295,8 @@ PY
   echo "${name} average latency: ${avg} ms"
 }
 
-bench_query "hot-only" "${HOT_QUERY}"
-bench_query "cold-only" "${COLD_QUERY}"
-bench_query "mixed" "${MIXED_QUERY}"
+bench_query "hot-only" "hot"
+bench_query "cold-only" "cold"
+bench_query "mixed" "mixed"
 
 echo "Benchmarks complete. Persisted cutoff override: ${CUTOFF_MICROS} micros."
