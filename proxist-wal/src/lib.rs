@@ -158,6 +158,10 @@ impl WalManager {
         let mut last_micros: Option<i64> = None;
         let first_seq = guard.manifest.next_seq;
         let mut last_seq = guard.manifest.next_seq;
+        let mut writer = guard
+            .writer
+            .take()
+            .ok_or_else(|| anyhow!("wal writer not initialized"))?;
 
         for record in records {
             let seq = guard.manifest.next_seq;
@@ -175,14 +179,9 @@ impl WalManager {
             ensure_writer_capacity(
                 &self.config,
                 &mut guard.manifest,
-                guard.writer.as_mut(),
+                Some(&mut writer),
                 entry_len + header_len,
             )?;
-
-            let writer = guard
-                .writer
-                .as_mut()
-                .ok_or_else(|| anyhow!("wal writer not initialized"))?;
 
             writer
                 .writer
@@ -205,19 +204,18 @@ impl WalManager {
             last_micros = Some(system_time_to_micros(record.timestamp));
         }
 
-        if let Some(writer) = guard.writer.as_mut() {
-            writer.writer.flush()?;
-            if self.config.fsync {
-                writer
-                    .writer
-                    .get_ref()
-                    .sync_data()
-                    .context("fsync wal segment")?;
-            }
+        writer.writer.flush()?;
+        if self.config.fsync {
+            writer
+                .writer
+                .get_ref()
+                .sync_data()
+                .context("fsync wal segment")?;
         }
 
         guard.rows_since_snapshot += records.len() as u64;
         write_manifest(&self.config.dir, &guard.manifest)?;
+        guard.writer = Some(writer);
 
         Ok(WalAppendResult {
             first_seq,
