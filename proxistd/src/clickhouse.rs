@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use proxist_core::ingest::IngestSegment;
 use reqwest::Client;
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::debug;
@@ -202,8 +203,53 @@ pub struct ClickhouseHttpClient {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClickhouseQueryRow {
     pub symbol: String,
+    #[serde(deserialize_with = "deserialize_i64_any")]
     pub ts_micros: i64,
     pub payload_base64: String,
+}
+
+fn deserialize_i64_any<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct I64Visitor;
+
+    impl<'de> Visitor<'de> for I64Visitor {
+        type Value = i64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an i64 or a string containing an i64")
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            i64::try_from(value).map_err(|_| E::custom("u64 out of range for i64"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            value
+                .parse::<i64>()
+                .map_err(|_| E::custom("invalid i64 string"))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&value)
+        }
+    }
+
+    deserializer.deserialize_any(I64Visitor)
 }
 
 impl ClickhouseHttpClient {

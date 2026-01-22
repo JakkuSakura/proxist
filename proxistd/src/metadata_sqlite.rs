@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::str::FromStr;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -48,9 +49,12 @@ pub struct SqliteMetadataStore {
 
 impl SqliteMetadataStore {
     pub async fn connect(path: &str) -> Result<Self> {
-        let options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true);
+        let mut options = if path.starts_with("sqlite:") {
+            SqliteConnectOptions::from_str(path)?
+        } else {
+            SqliteConnectOptions::new().filename(path)
+        };
+        options = options.create_if_missing(true).read_only(false);
         let pool = SqlitePool::connect_with(options).await?;
         let store = Self { pool };
         store.run_migrations().await?;
