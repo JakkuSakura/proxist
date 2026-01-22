@@ -102,6 +102,7 @@ struct DaemonConfig {
     wal_snapshot_rows: u64,
     wal_fsync: bool,
     wal_replay_persist: bool,
+    persisted_cutoff_override: Option<SystemTime>,
 }
 
 impl DaemonConfig {
@@ -147,6 +148,10 @@ impl DaemonConfig {
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true),
+            persisted_cutoff_override: std::env::var("PROXIST_PERSISTED_CUTOFF_OVERRIDE_MICROS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(micros_to_system_time),
         })
     }
 }
@@ -213,6 +218,7 @@ struct AppState {
     scheduler: Arc<ProxistScheduler>,
     metrics: Option<PrometheusHandle>,
     api_token: Option<String>,
+    persisted_cutoff_override: Option<SystemTime>,
 }
 
 #[derive(Debug)]
@@ -663,6 +669,18 @@ fn micros_to_system_time(micros: i64) -> SystemTime {
     }
 }
 
+fn apply_persisted_override(
+    persisted: Option<SystemTime>,
+    override_ts: Option<SystemTime>,
+) -> Option<SystemTime> {
+    match (persisted, override_ts) {
+        (Some(persisted), Some(override_ts)) => Some(std::cmp::min(persisted, override_ts)),
+        (None, Some(override_ts)) => Some(override_ts),
+        (Some(persisted), None) => Some(persisted),
+        (None, None) => None,
+    }
+}
+
 impl ProxistDaemon {
     async fn new(
         config: DaemonConfig,
@@ -782,8 +800,9 @@ impl ProxistDaemon {
             }
 
             // Update scheduler's persisted cutoff based on ingest watermark.
-            self.scheduler
-                .set_persisted_cutoff(self.ingest_service.last_persisted_timestamp());
+            let persisted = self.ingest_service.last_persisted_timestamp();
+            let effective = apply_persisted_override(persisted, self.config.persisted_cutoff_override);
+            self.scheduler.set_persisted_cutoff(effective);
 
             let assigned = snapshot.assignments.len();
             let total_symbols: usize = snapshot
@@ -825,6 +844,7 @@ impl ProxistDaemon {
             scheduler: Arc::clone(&self.scheduler),
             metrics: self.metrics_handle.clone(),
             api_token: self.config.api_token.clone(),
+            persisted_cutoff_override: self.config.persisted_cutoff_override,
         };
 
         async fn status_handler(
@@ -1208,7 +1228,10 @@ async fn replay_wal(
 
 async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryResponse, AppError> {
     let op_kind = request.op.clone();
-    let persisted_at = state.ingest.last_persisted_timestamp();
+    let persisted_at = apply_persisted_override(
+        state.ingest.last_persisted_timestamp(),
+        state.persisted_cutoff_override,
+    );
     let include_cold = request.include_cold;
 
     let rows = match &op_kind {
@@ -1560,6 +1583,7 @@ mod ingest_tests {
             scheduler,
             metrics: None,
             api_token: None,
+            persisted_cutoff_override: None,
         };
 
         let range = QueryRange::new(ts - Duration::from_millis(1), ts + Duration::from_secs(1));
@@ -1640,6 +1664,7 @@ mod ingest_tests {
             scheduler,
             metrics: None,
             api_token: None,
+            persisted_cutoff_override: None,
         };
 
         let bundle = compose_diagnostics(&state).await.map_err(|err| err.0)?;
