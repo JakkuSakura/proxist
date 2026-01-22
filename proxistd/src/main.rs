@@ -1,6 +1,7 @@
 mod clickhouse;
 mod ingest;
 mod metadata_sqlite;
+mod pgwire_server;
 mod scheduler;
 
 use std::collections::HashMap;
@@ -44,11 +45,12 @@ use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
 use proxist_wal::{WalConfig, WalManager};
 use fp_sql::{
     ast::{Expr, FunctionArg, FunctionArgExpr, Ident, SetExpr, Statement, Value, Values},
-    dialect::ClickHouseDialect,
     ensure_engine_clause,
     parser::Parser,
-    replace_engine_case_insensitive, split_statements, strip_leading_sql_comments,
+    parse_sql_dialect, replace_engine_case_insensitive, split_statements, sqlparser_dialect,
+    strip_leading_sql_comments, SqlDialect,
 };
+use fp_prql::PrqlFrontend;
 use serde_bytes::ByteBuf;
 use serde_json::json;
 use tokio::signal;
@@ -93,6 +95,9 @@ fn init_metrics() -> anyhow::Result<Option<PrometheusHandle>> {
 struct DaemonConfig {
     metadata_path: String,
     http_addr: SocketAddr,
+    http_dialect: DialectMode,
+    pg_addr: Option<SocketAddr>,
+    pg_dialect: DialectMode,
     clickhouse: Option<ClickhouseConfig>,
     api_token: Option<String>,
     duckdb_path: Option<String>,
@@ -112,6 +117,11 @@ impl DaemonConfig {
         let http_addr = std::env::var("PROXIST_HTTP_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8080".into())
             .parse()?;
+        let http_dialect =
+            parse_dialect_mode(std::env::var("PROXIST_HTTP_DIALECT").ok(), DialectDefault::Http)?;
+        let pg_addr = std::env::var("PROXIST_PG_ADDR").ok().map(|value| value.parse()).transpose()?;
+        let pg_dialect =
+            parse_dialect_mode(std::env::var("PROXIST_PG_DIALECT").ok(), DialectDefault::Pg)?;
         let clickhouse = load_clickhouse_config();
         let api_token = if let Ok(token_path) = std::env::var("PROXIST_API_TOKEN_FILE") {
             let contents = std::fs::read_to_string(&token_path)
@@ -127,6 +137,9 @@ impl DaemonConfig {
         Ok(Self {
             metadata_path,
             http_addr,
+            http_dialect,
+            pg_addr,
+            pg_dialect,
             clickhouse,
             api_token,
             duckdb_path: std::env::var("PROXIST_DUCKDB_PATH").ok(),
@@ -154,6 +167,51 @@ impl DaemonConfig {
                 .map(micros_to_system_time),
         })
     }
+}
+
+#[derive(Debug, Clone)]
+enum DialectMode {
+    Sql(SqlDialect),
+    Prql(SqlDialect),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DialectDefault {
+    Http,
+    Pg,
+}
+
+impl DialectMode {
+    fn sql_dialect(&self) -> SqlDialect {
+        match self {
+            DialectMode::Sql(dialect) | DialectMode::Prql(dialect) => dialect.clone(),
+        }
+    }
+
+    fn is_clickhouse(&self) -> bool {
+        matches!(self.sql_dialect(), SqlDialect::ClickHouse)
+    }
+}
+
+fn parse_dialect_mode(
+    value: Option<String>,
+    default_kind: DialectDefault,
+) -> anyhow::Result<DialectMode> {
+    let default_sql = match default_kind {
+        DialectDefault::Http => SqlDialect::ClickHouse,
+        DialectDefault::Pg => SqlDialect::Postgres,
+    };
+    let Some(raw) = value else {
+        return Ok(DialectMode::Sql(default_sql));
+    };
+    let lowered = raw.trim().to_ascii_lowercase();
+    if lowered == "prql" {
+        return Ok(DialectMode::Prql(default_sql));
+    }
+    let Some(parsed) = parse_sql_dialect(&lowered) else {
+        bail!("unsupported dialect {raw}");
+    };
+    Ok(DialectMode::Sql(parsed))
 }
 
 
@@ -219,6 +277,7 @@ struct AppState {
     metrics: Option<PrometheusHandle>,
     api_token: Option<String>,
     persisted_cutoff_override: Option<SystemTime>,
+    http_dialect: DialectMode,
 }
 
 #[derive(Debug)]
@@ -467,6 +526,11 @@ fn render_rows_as_jsoneachrow(rows: Vec<serde_json::Map<String, serde_json::Valu
     out
 }
 
+enum SqlBatchResult {
+    Text(String),
+    Scheduler(SqlResult),
+}
+
 async fn forward_sql_to_scheduler(state: &AppState, sql: &str) -> Result<String, AppError> {
     let result = state.scheduler.execute(sql).await?;
     let body = match result {
@@ -480,6 +544,151 @@ async fn forward_sql_to_scheduler(state: &AppState, sql: &str) -> Result<String,
         SqlResult::Rows(rows) => render_rows_as_jsoneachrow(rows),
     };
     Ok(body)
+}
+
+fn compile_statements(
+    dialect: &DialectMode,
+    sql_text: &str,
+) -> Result<Vec<String>, AppError> {
+    match dialect {
+        DialectMode::Sql(_) => Ok(split_statements(sql_text)),
+        DialectMode::Prql(target) => {
+            let frontend = PrqlFrontend::new();
+            let compiled = frontend
+                .compile(sql_text, Some(target.clone()))
+                .map_err(|err| AppError(anyhow!(err)))?;
+            Ok(compiled.statements)
+        }
+    }
+}
+
+fn parse_sql_with_dialect(
+    dialect: &DialectMode,
+    sql: &str,
+) -> Result<Vec<Statement>, AppError> {
+    let dialect_impl = sqlparser_dialect(dialect.sql_dialect());
+    Parser::parse_sql(dialect_impl.as_ref(), sql)
+        .map_err(|err| AppError(anyhow!("failed to parse SQL: {err}")))
+}
+
+async fn execute_sql_batch(
+    state: &AppState,
+    dialect: DialectMode,
+    sql_text: &str,
+) -> Result<Vec<SqlBatchResult>, AppError> {
+    let mut outputs = Vec::new();
+    let mut seq_counter: u64 = 0;
+    let ingest_table = state
+        .ingest
+        .clickhouse_table()
+        .map(|t| t.to_ascii_lowercase());
+
+    for stmt_text in compile_statements(&dialect, sql_text)? {
+        let normalized = strip_leading_sql_comments(&stmt_text);
+        if normalized.is_empty() {
+            continue;
+        }
+
+        if normalized.to_ascii_lowercase().starts_with("create") {
+            let mut parsed = parse_sql_with_dialect(&dialect, normalized)?;
+            if parsed.is_empty() {
+                continue;
+            }
+            if parsed.len() != 1 {
+                let raw = forward_sql_to_scheduler(state, normalized).await?;
+                outputs.push(SqlBatchResult::Text(raw));
+                continue;
+            }
+            let mut stmt = parsed.remove(0);
+            if let Statement::CreateTable { engine, .. } = &mut stmt {
+                if dialect.is_clickhouse() {
+                    let mut forwarded = normalized.to_string();
+                    if let Some(e) = engine {
+                        if e.eq_ignore_ascii_case("mixedmergetree") {
+                            forwarded = replace_engine_case_insensitive(&forwarded, "MergeTree");
+                        }
+                    } else {
+                        forwarded = ensure_engine_clause(&forwarded, "MergeTree");
+                    }
+                    state.scheduler.register_ddl(&forwarded)?;
+                    let raw = forward_sql_to_scheduler(state, &forwarded).await?;
+                    outputs.push(SqlBatchResult::Text(raw));
+                    continue;
+                }
+            }
+        }
+
+        if !normalized.to_ascii_lowercase().starts_with("insert") {
+            if let Some(view) = match_system_summary_query(normalized) {
+                let format = detect_output_format(normalized);
+                let summary = state.ingest.hot_cold_summary().await?;
+                let rendered = render_system_summary(&summary, format, view);
+                outputs.push(SqlBatchResult::Text(rendered));
+                continue;
+            }
+            let result = state.scheduler.execute(normalized).await?;
+            outputs.push(SqlBatchResult::Scheduler(result));
+            continue;
+        }
+
+        let parsed = parse_sql_with_dialect(&dialect, normalized)?;
+        if parsed.is_empty() {
+            continue;
+        }
+        if parsed.len() != 1 {
+            return Err(AppError(anyhow!(
+                "multiple statements detected; please separate with semicolons"
+            )));
+        }
+
+        match parsed.into_iter().next().unwrap() {
+            Statement::Insert {
+                table_name,
+                columns,
+                source,
+                ..
+            } => {
+                let table_name_lower = table_name.to_string().to_ascii_lowercase();
+                tracing::debug!(
+                    table = %table_name_lower,
+                    ?ingest_table,
+                    "processing INSERT statement"
+                );
+                if let Some(expected) = ingest_table.as_ref() {
+                    if &table_name_lower != expected {
+                        let raw = forward_sql_to_scheduler(state, normalized).await?;
+                        outputs.push(SqlBatchResult::Text(raw));
+                        continue;
+                    }
+                }
+                if let Some(query) = source {
+                    match *query.body {
+                        SetExpr::Values(values) => {
+                            let ticks =
+                                build_ingest_ticks(&columns, values, &mut seq_counter)?;
+                            if !ticks.is_empty() {
+                                state.ingest.ingest(IngestBatchRequest { ticks }).await?;
+                            }
+                            outputs.push(SqlBatchResult::Text("Ok.\n".to_string()));
+                        }
+                        _ => {
+                            let raw = forward_sql_to_scheduler(state, normalized).await?;
+                            outputs.push(SqlBatchResult::Text(raw));
+                        }
+                    }
+                } else {
+                    let raw = forward_sql_to_scheduler(state, normalized).await?;
+                    outputs.push(SqlBatchResult::Text(raw));
+                }
+            }
+            _ => {
+                let result = state.scheduler.execute(normalized).await?;
+                outputs.push(SqlBatchResult::Scheduler(result));
+            }
+        }
+    }
+
+    Ok(outputs)
 }
 
 fn build_ingest_ticks(
@@ -778,6 +987,7 @@ impl ProxistDaemon {
         tokio::select! {
             result = self.control_loop() => { result?; },
             result = self.serve_http() => { result?; },
+            result = self.serve_pg() => { result?; },
             _ = shutdown_signal() => {
                 info!("shutdown signal received");
             }
@@ -845,6 +1055,7 @@ impl ProxistDaemon {
             metrics: self.metrics_handle.clone(),
             api_token: self.config.api_token.clone(),
             persisted_cutoff_override: self.config.persisted_cutoff_override,
+            http_dialect: self.config.http_dialect.clone(),
         };
 
         async fn status_handler(
@@ -940,132 +1151,24 @@ impl ProxistDaemon {
                     .unwrap());
             }
 
-            let dialect = ClickHouseDialect {};
-            let mut outputs = Vec::new();
-            let mut seq_counter: u64 = 0;
-            let ingest_table = state
-                .ingest
-                .clickhouse_table()
-                .map(|t| t.to_ascii_lowercase());
-
-            for stmt_text in split_statements(&sql_text) {
-                let normalized = strip_leading_sql_comments(&stmt_text);
-                if normalized.is_empty() {
-                    continue;
-                }
-
-                if normalized.to_ascii_lowercase().starts_with("create") {
-                    let mut parsed = Parser::parse_sql(&dialect, normalized)
-                        .map_err(|err| AppError(anyhow!("failed to parse SQL: {err}")))?;
-                    if parsed.is_empty() {
-                        continue;
-                    }
-                    if parsed.len() != 1 {
-                        let raw = forward_sql_to_scheduler(&state, normalized).await?;
-                        outputs.push(raw);
-                        continue;
-                    }
-                    let mut stmt = parsed.remove(0);
-                    if let Statement::CreateTable { engine, .. } = &mut stmt {
-                        let mut forwarded = normalized.to_string();
-                        if let Some(e) = engine {
-                            if e.eq_ignore_ascii_case("mixedmergetree") {
-                                forwarded =
-                                    replace_engine_case_insensitive(&forwarded, "MergeTree");
+            let outputs = execute_sql_batch(&state, state.http_dialect.clone(), &sql_text).await?;
+            let mut body = String::new();
+            for output in outputs {
+                let chunk = match output {
+                    SqlBatchResult::Text(text) => text,
+                    SqlBatchResult::Scheduler(result) => match result {
+                        SqlResult::Clickhouse(ClickhouseWire { format, body }) => {
+                            if let ClickhouseWireFormat::Unknown = format {
+                                // Future formats will be exposed once the API supports them.
                             }
-                        } else {
-                            forwarded = ensure_engine_clause(&forwarded, "MergeTree");
+                            body
                         }
-                        // Register DDL for hot path mapping (annotations parsed from comment).
-                        state
-                            .scheduler
-                            .register_ddl(&forwarded)
-                            .map_err(|e| AppError(anyhow!(e)))?;
-                        let raw = forward_sql_to_scheduler(&state, &forwarded).await?;
-                        outputs.push(raw);
-                        continue;
-                    }
-                    let raw = forward_sql_to_scheduler(&state, normalized).await?;
-                    outputs.push(raw);
-                    continue;
-                }
-
-                if !normalized.to_ascii_lowercase().starts_with("insert") {
-                    if let Some(view) = match_system_summary_query(normalized) {
-                        let format = detect_output_format(normalized);
-                        let summary = state.ingest.hot_cold_summary().await?;
-                        let rendered = render_system_summary(&summary, format, view);
-                        outputs.push(rendered);
-                        continue;
-                    }
-                    let raw = forward_sql_to_scheduler(&state, normalized).await?;
-                    outputs.push(raw);
-                    continue;
-                }
-
-                let parsed = Parser::parse_sql(&dialect, normalized)
-                    .map_err(|err| AppError(anyhow!("failed to parse SQL: {err}")))?;
-                if parsed.is_empty() {
-                    continue;
-                }
-                if parsed.len() != 1 {
-                    return Err(AppError(anyhow!(
-                        "multiple statements detected; please separate with semicolons"
-                    )));
-                }
-
-                match parsed.into_iter().next().unwrap() {
-                    Statement::Insert {
-                        table_name,
-                        columns,
-                        source,
-                        ..
-                    } => {
-                        let table_name_lower = table_name.to_string().to_ascii_lowercase();
-                        tracing::debug!(
-                            table = %table_name_lower,
-                            ?ingest_table,
-                            "processing INSERT statement"
-                        );
-                        if let Some(expected) = ingest_table.as_ref() {
-                            if &table_name_lower != expected {
-                                tracing::debug!(
-                                    expected = %expected,
-                                    "forwarding INSERT to ClickHouse"
-                                );
-                                let raw = forward_sql_to_scheduler(&state, normalized).await?;
-                                outputs.push(raw);
-                                continue;
-                            }
-                        }
-                        if let Some(query) = source {
-                            match *query.body {
-                                SetExpr::Values(values) => {
-                                    let ticks =
-                                        build_ingest_ticks(&columns, values, &mut seq_counter)?;
-                                    if !ticks.is_empty() {
-                                        state.ingest.ingest(IngestBatchRequest { ticks }).await?;
-                                    }
-                                    outputs.push("Ok.\n".to_string());
-                                }
-                                _ => {
-                                    let raw = forward_sql_to_scheduler(&state, normalized).await?;
-                                    outputs.push(raw);
-                                }
-                            }
-                        } else {
-                            let raw = forward_sql_to_scheduler(&state, normalized).await?;
-                            outputs.push(raw);
-                        }
-                    }
-                    _ => {
-                        let raw = forward_sql_to_scheduler(&state, normalized).await?;
-                        outputs.push(raw);
-                    }
-                }
+                        SqlResult::Text(text) => text,
+                        SqlResult::Rows(rows) => render_rows_as_jsoneachrow(rows),
+                    },
+                };
+                body.push_str(&chunk);
             }
-
-            let body = outputs.join("");
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/plain; charset=UTF-8")
@@ -1168,6 +1271,25 @@ impl ProxistDaemon {
             .with_graceful_shutdown(shutdown_signal())
             .await?;
         Ok(())
+    }
+
+    async fn serve_pg(&self) -> anyhow::Result<()> {
+        let Some(pg_addr) = self.config.pg_addr else {
+            std::future::pending::<()>().await;
+            return Ok(());
+        };
+        let state = AppState {
+            metadata: self.metadata_store.clone(),
+            metadata_cache: Arc::clone(&self.metadata_cache),
+            hot_store: Arc::clone(&self.hot_store),
+            ingest: Arc::clone(&self.ingest_service),
+            scheduler: Arc::clone(&self.scheduler),
+            metrics: self.metrics_handle.clone(),
+            api_token: self.config.api_token.clone(),
+            persisted_cutoff_override: self.config.persisted_cutoff_override,
+            http_dialect: self.config.http_dialect.clone(),
+        };
+        pgwire_server::serve(pg_addr, Arc::new(state), self.config.pg_dialect.clone()).await
     }
 }
 
@@ -1584,6 +1706,7 @@ mod ingest_tests {
             metrics: None,
             api_token: None,
             persisted_cutoff_override: None,
+            http_dialect: DialectMode::Sql(SqlDialect::ClickHouse),
         };
 
         let range = QueryRange::new(ts - Duration::from_millis(1), ts + Duration::from_secs(1));
@@ -1665,6 +1788,7 @@ mod ingest_tests {
             metrics: None,
             api_token: None,
             persisted_cutoff_override: None,
+            http_dialect: DialectMode::Sql(SqlDialect::ClickHouse),
         };
 
         let bundle = compose_diagnostics(&state).await.map_err(|err| err.0)?;
