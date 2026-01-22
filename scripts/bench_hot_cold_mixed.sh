@@ -159,7 +159,7 @@ HOT_QUERY=$(cat <<'JSON'
   "tenant": "alpha",
   "symbols": ["SYM1", "SYM2", "SYM3"],
   "range": {"start": 1704103206000000, "end": 1704103209000000},
-  "include_cold": false,
+  "include_cold": true,
   "op": "range"
 }
 JSON
