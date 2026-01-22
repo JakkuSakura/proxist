@@ -5,6 +5,7 @@ mod scheduler;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,11 +36,12 @@ use proxist_core::api::{
 };
 use proxist_core::{
     metadata::ClusterMetadata,
+    ingest::IngestRecord,
     query::{QueryOperation, RollingAggregation},
     MetadataStore, ShardAssignment, ShardHealth,
 };
 use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
-// WAL removed: ingestion is immediately applied to hot store and persisted
+use proxist_wal::{WalConfig, WalManager};
 use fp_sql::{
     ast::{Expr, FunctionArg, FunctionArgExpr, Ident, SetExpr, Statement, Value, Values},
     dialect::ClickHouseDialect,
@@ -95,6 +97,11 @@ struct DaemonConfig {
     api_token: Option<String>,
     duckdb_path: Option<String>,
     pg_url: Option<String>,
+    wal_dir: Option<String>,
+    wal_segment_bytes: u64,
+    wal_snapshot_rows: u64,
+    wal_fsync: bool,
+    wal_replay_persist: bool,
 }
 
 impl DaemonConfig {
@@ -123,11 +130,27 @@ impl DaemonConfig {
             api_token,
             duckdb_path: std::env::var("PROXIST_DUCKDB_PATH").ok(),
             pg_url: std::env::var("PROXIST_PG_URL").ok(),
+            wal_dir: std::env::var("PROXIST_WAL_DIR").ok(),
+            wal_segment_bytes: std::env::var("PROXIST_WAL_SEGMENT_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256 * 1024 * 1024),
+            wal_snapshot_rows: std::env::var("PROXIST_WAL_SNAPSHOT_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5_000_000),
+            wal_fsync: std::env::var("PROXIST_WAL_FSYNC")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
+            wal_replay_persist: std::env::var("PROXIST_WAL_REPLAY_PERSIST")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
         })
     }
 }
 
-// WAL bootstrap removed
 
 fn load_clickhouse_config() -> Option<ClickhouseConfig> {
     let endpoint = std::env::var("PROXIST_CLICKHOUSE_ENDPOINT").ok()?;
@@ -178,6 +201,7 @@ struct ProxistDaemon {
     ingest_service: Arc<IngestService>,
     scheduler: Arc<ProxistScheduler>,
     metrics_handle: Option<PrometheusHandle>,
+    wal: Option<Arc<WalManager>>,
 }
 
 #[derive(Clone)]
@@ -649,6 +673,24 @@ impl ProxistDaemon {
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
 
+        let wal = config.wal_dir.as_ref().map(|dir| {
+            let cfg = WalConfig {
+                dir: PathBuf::from(dir),
+                segment_max_bytes: config.wal_segment_bytes,
+                snapshot_every_rows: config.wal_snapshot_rows,
+                fsync: config.wal_fsync,
+            };
+            WalManager::open(cfg)
+        });
+        let wal = match wal {
+            Some(Ok(manager)) => Some(Arc::new(manager)),
+            Some(Err(err)) => {
+                tracing::error!(error = %err, "failed to initialize WAL; continuing without disk WAL");
+                None
+            }
+            None => None,
+        };
+
         let clickhouse_bundle = config.clickhouse.clone().and_then(|cfg| {
             let sink = ClickhouseHttpSink::new(cfg.clone())
                 .map(|sink| Arc::new(sink) as Arc<dyn ClickhouseSink>);
@@ -673,6 +715,7 @@ impl ProxistDaemon {
             metadata_store.clone(),
             hot_store.clone(),
             ingest_clickhouse,
+            wal.clone(),
         ));
 
         // Build in-memory scheduler with SQLite + optional ClickHouse
@@ -689,7 +732,16 @@ impl ProxistDaemon {
         .await?;
         let scheduler = Arc::new(scheduler);
 
-        // No WAL replay; ingest is applied directly
+        if let Some(wal) = wal.as_ref() {
+            replay_wal(
+                wal,
+                &hot_store,
+                &ingest_service,
+                &metadata_store,
+                config.wal_replay_persist,
+            )
+            .await?;
+        }
 
         Ok(Self {
             config,
@@ -699,6 +751,7 @@ impl ProxistDaemon {
             ingest_service,
             scheduler,
             metrics_handle,
+            wal,
         })
     }
 
@@ -746,11 +799,12 @@ impl ProxistDaemon {
             );
 
             let tracker_snapshot = self.ingest_service.tracker_snapshot().await;
+            let wal_backlog_bytes = self.wal.as_ref().map(|wal| wal.backlog_bytes()).unwrap_or(0);
             for tracker in tracker_snapshot {
                 let health = ShardHealth {
                     shard_id: tracker.shard_id.clone(),
                     is_leader: true,
-                    wal_backlog_bytes: 0,
+                    wal_backlog_bytes,
                     clickhouse_lag_ms: 0,
                     watermark: tracker.watermark,
                     persistence_state: tracker.state.clone(),
@@ -1097,6 +1151,61 @@ impl ProxistDaemon {
     }
 }
 
+async fn replay_wal(
+    wal: &Arc<WalManager>,
+    hot_store: &Arc<dyn HotColumnStore>,
+    ingest: &Arc<IngestService>,
+    metadata: &SqliteMetadataStore,
+    persist_replay: bool,
+) -> anyhow::Result<()> {
+    let snapshot = wal.load_snapshot()?;
+    let mut after_seq = 0_u64;
+
+    if let Some(snapshot) = snapshot {
+        tracing::info!(
+            last_seq = snapshot.last_seq,
+            bytes = snapshot.bytes.len(),
+            "restoring hot store from WAL snapshot"
+        );
+        hot_store.restore_snapshot(&snapshot.bytes).await?;
+        ingest.hydrate_from_hot_store().await?;
+        after_seq = snapshot.last_seq;
+    }
+
+    let records = wal.replay_from(after_seq)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(rows = records.len(), "replaying WAL records into hot store");
+    ingest.warm_from_records(&records).await?;
+
+    if persist_replay {
+        let persisted = metadata.list_shard_health().await?;
+        let mut persisted_map: HashMap<String, SystemTime> = HashMap::new();
+        for health in persisted {
+            if let Some(ts) = health.watermark.persisted {
+                persisted_map.insert(health.shard_id, ts);
+            }
+        }
+
+        let filtered: Vec<IngestRecord> = records
+            .into_iter()
+            .filter(|record| match persisted_map.get(&record.shard_id) {
+                Some(cutoff) => record.timestamp > *cutoff,
+                None => true,
+            })
+            .collect();
+
+        if !filtered.is_empty() {
+            tracing::info!(rows = filtered.len(), "persisting replayed WAL rows");
+            ingest.persist_replayed(&filtered).await?;
+        }
+    }
+
+    Ok(())
+}
+
 async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryResponse, AppError> {
     let op_kind = request.op.clone();
     let persisted_at = state.ingest.last_persisted_timestamp();
@@ -1413,6 +1522,7 @@ mod ingest_tests {
             metadata.clone(),
             hot_store.clone(),
             None,
+            None,
         ));
 
         let snapshot = metadata.get_cluster_metadata().await?;
@@ -1492,6 +1602,7 @@ mod ingest_tests {
             metadata.clone(),
             hot_store.clone(),
             None,
+            None,
         ));
         let snapshot = metadata.get_cluster_metadata().await?;
         service.apply_metadata(&snapshot).await?;
@@ -1542,6 +1653,75 @@ mod ingest_tests {
             .persistence
             .iter()
             .any(|tracker| tracker.shard_id == "alpha-shard"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod wal_replay_tests {
+    use super::*;
+    use serde_bytes::ByteBuf;
+    use tempfile::{NamedTempFile, TempDir};
+
+    #[tokio::test]
+    async fn wal_replay_restores_hot_store() -> anyhow::Result<()> {
+        let wal_dir = TempDir::new()?;
+        let wal = Arc::new(WalManager::open(WalConfig {
+            dir: wal_dir.path().to_path_buf(),
+            segment_max_bytes: 1024 * 1024,
+            snapshot_every_rows: 10,
+            fsync: false,
+        })?);
+
+        let metadata_file = NamedTempFile::new()?;
+        let metadata_path = metadata_file.path().to_str().unwrap().to_string();
+        let metadata = SqliteMetadataStore::connect(&metadata_path).await?;
+        metadata
+            .put_shard_assignment(ShardAssignment {
+                shard_id: "alpha-shard".into(),
+                tenant_id: "alpha".into(),
+                node_id: "node-a".into(),
+                symbol_range: ("A".into(), "Z".into()),
+            })
+            .await?;
+
+        let hot_store: Arc<dyn HotColumnStore> =
+            Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let service = Arc::new(IngestService::new(
+            metadata.clone(),
+            hot_store.clone(),
+            None,
+            Some(wal.clone()),
+        ));
+
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        service
+            .ingest(IngestBatchRequest {
+                ticks: vec![IngestTick {
+                    tenant: "alpha".into(),
+                    symbol: "AAPL".into(),
+                    timestamp: ts,
+                    payload: ByteBuf::from(vec![9]),
+                    seq: 1,
+                }],
+            })
+            .await?;
+
+        let replay_store: Arc<dyn HotColumnStore> =
+            Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let replay_service = Arc::new(IngestService::new(
+            metadata.clone(),
+            replay_store.clone(),
+            None,
+            Some(wal.clone()),
+        ));
+
+        replay_wal(&wal, &replay_store, &replay_service, &metadata, false).await?;
+        let summary = replay_service.hot_cold_summary().await?;
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].symbol, "AAPL");
+        assert_eq!(summary[0].hot_rows, 1);
+
         Ok(())
     }
 }

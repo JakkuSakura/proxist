@@ -17,6 +17,7 @@ echo "Starting ClickHouse via docker compose..."
 
 METADATA_DB="$(mktemp)"
 PROXIST_LOG="$(mktemp)"
+WAL_DIR="$(mktemp -d)"
 PROXIST_PID=""
 
 cleanup() {
@@ -26,6 +27,7 @@ cleanup() {
     wait "${PROXIST_PID}" 2>/dev/null || true
   fi
   rm -f "${METADATA_DB}" "${PROXIST_LOG}"
+  rm -rf "${WAL_DIR}"
   echo "Stopping ClickHouse..."
   "${COMPOSE_CMD[@]}" down --remove-orphans >/dev/null
 }
@@ -43,6 +45,7 @@ echo "Starting proxistd..."
   PROXIST_CLICKHOUSE_ENDPOINT="http://127.0.0.1:18123" \
   PROXIST_CLICKHOUSE_DATABASE="proxist" \
   PROXIST_CLICKHOUSE_TABLE="ticks" \
+  PROXIST_WAL_DIR="${WAL_DIR}" \
   cargo run --quiet --bin proxistd
 ) >"${PROXIST_LOG}" 2>&1 &
 PROXIST_PID=$!

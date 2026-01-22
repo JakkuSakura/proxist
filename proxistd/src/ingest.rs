@@ -17,6 +17,7 @@ use proxist_core::{
     MetadataStore, PersistenceBatch, PersistenceTransition, ShardPersistenceTracker,
 };
 use proxist_mem::{HotColumnStore, HotSymbolSummary};
+use proxist_wal::WalManager;
 use serde_bytes::ByteBuf;
 use tokio::sync::Mutex;
 
@@ -26,6 +27,7 @@ pub struct IngestService {
     clickhouse: Option<Arc<dyn ClickhouseSink>>,
     clickhouse_target: Option<ClickhouseTarget>,
     clickhouse_client: Option<Arc<ClickhouseHttpClient>>,
+    wal: Option<Arc<WalManager>>,
     last_flush_micros: AtomicI64,
     clickhouse_error: Mutex<Option<String>>,
     persistence_trackers: Mutex<HashMap<String, ShardPersistenceTracker>>,
@@ -111,6 +113,7 @@ impl IngestService {
             SinkTarget,
             Arc<ClickhouseHttpClient>,
         )>,
+        wal: Option<Arc<WalManager>>,
     ) -> Self {
         let (clickhouse_sink, _sink_target, client, api_target) = match clickhouse {
             Some((sink, target, client)) => {
@@ -129,6 +132,7 @@ impl IngestService {
             clickhouse: clickhouse_sink,
             clickhouse_target: api_target,
             clickhouse_client: client,
+            wal,
             last_flush_micros: AtomicI64::new(-1),
             clickhouse_error: Mutex::new(None),
             persistence_trackers: Mutex::new(HashMap::new()),
@@ -336,10 +340,15 @@ impl IngestService {
         shard_id: &str,
         tracker: &ShardPersistenceTracker,
     ) -> anyhow::Result<()> {
+        let wal_backlog_bytes = self
+            .wal
+            .as_ref()
+            .map(|wal| wal.backlog_bytes())
+            .unwrap_or(0);
         let health = ShardHealth {
             shard_id: shard_id.to_string(),
             is_leader: true,
-            wal_backlog_bytes: 0,
+            wal_backlog_bytes,
             clickhouse_lag_ms: 0,
             watermark: tracker.watermark,
             persistence_state: tracker.state.clone(),
@@ -369,17 +378,14 @@ impl IngestService {
         let _guard = span.enter();
         metrics::counter!("proxist_ingest_requests_total", 1);
         let mut records: Vec<IngestRecord> = Vec::with_capacity(batch.ticks.len());
+        let mut pending_hot: Vec<(TenantId, String, SystemTime, Vec<u8>)> =
+            Vec::with_capacity(batch.ticks.len());
         for tick in &batch.ticks {
             let shard_id = self.resolve_shard(&tick.tenant, &tick.symbol).await?;
 
             self.metadata
                 .alloc_symbol(&tick.tenant, &tick.symbol)
                 .await?;
-
-            {
-                let mut map = self.symbol_shards.lock().await;
-                map.insert((tick.tenant.clone(), tick.symbol.clone()), shard_id.clone());
-            }
 
             let record = IngestRecord {
                 tenant: tick.tenant.clone(),
@@ -389,58 +395,57 @@ impl IngestService {
                 payload: payload_to_vec(&tick.payload),
                 seq: tick.seq,
             };
+            pending_hot.push((
+                tick.tenant.clone(),
+                tick.symbol.clone(),
+                tick.timestamp,
+                record.payload.clone(),
+            ));
             records.push(record);
-            self.hot_store
-                .append_row(
-                    &tick.tenant,
-                    &tick.symbol,
-                    tick.timestamp,
-                    tick.payload.as_ref(),
-                )
-                .await?;
-            rows_written += 1;
         }
 
         if !records.is_empty() {
-            let segment = IngestSegment::new(records);
-            let shard_plans = Self::plan_shard_batches(&segment);
-            self.begin_persistence(&shard_plans).await?;
-
-            if let Some(sink) = &self.clickhouse {
-                if let Err(err) = sink.flush_segment(&segment).await {
-                    *self.clickhouse_error.lock().await = Some(err.to_string());
-                    metrics::counter!("proxist_clickhouse_flush_total", 1, "status" => "error");
-                    metrics::counter!("proxist_ingest_failures_total", 1);
-                    self.fail_persistence(&shard_plans).await?;
-                    return Err(err);
+            let mut wal_append = None;
+            if let Some(wal) = &self.wal {
+                let append = wal.append_records(&records)?;
+                if append.rows_written > 0 {
+                    metrics::counter!(
+                        "proxist_wal_rows_total",
+                        append.rows_written as u64
+                    );
+                    metrics::counter!(
+                        "proxist_wal_bytes_total",
+                        append.bytes_written as u64
+                    );
                 }
-                *self.clickhouse_error.lock().await = None;
-                metrics::counter!("proxist_clickhouse_flush_total", 1, "status" => "ok");
+                wal_append = Some(append);
             }
 
-            if let Some(last) = segment
-                .records
-                .iter()
-                .map(|record| system_time_to_micros(record.timestamp))
-                .max()
             {
-                self.last_flush_micros.store(last, Ordering::SeqCst);
+                let mut map = self.symbol_shards.lock().await;
+                for record in &records {
+                    map.insert((record.tenant.clone(), record.symbol.clone()), record.shard_id.clone());
+                }
             }
 
-            if self.clickhouse.is_none() {
-                *self.clickhouse_error.lock().await = None;
+            for (tenant, symbol, ts, payload) in pending_hot.drain(..) {
+                self.hot_store
+                    .append_row(&tenant, &symbol, ts, &payload)
+                    .await?;
+                rows_written += 1;
             }
 
-            self.commit_persistence(&shard_plans).await?;
-            for plan in &shard_plans {
-                tracing::debug!(
-                    shard = %plan.shard_id,
-                    tenant = %plan.tenant,
-                    rows = plan.rows,
-                    start = ?plan.batch.start,
-                    end = ?plan.batch.end,
-                    "persisted shard batch"
-                );
+            let segment = IngestSegment::new(records);
+            self.persist_segment(segment).await?;
+
+            if let (Some(wal), Some(append)) = (self.wal.as_ref(), wal_append) {
+                if append.last_seq > 0 && wal.snapshot_due() {
+                    let snapshot = self
+                        .hot_store
+                        .snapshot(&ShardPersistenceTracker::new("wal"))
+                        .await?;
+                    let _ = wal.maybe_snapshot(snapshot, append.last_seq, append.last_micros);
+                }
             }
         }
 
@@ -457,8 +462,77 @@ impl IngestService {
         Ok(())
     }
 
+    async fn persist_segment(&self, segment: IngestSegment) -> Result<()> {
+        let shard_plans = Self::plan_shard_batches(&segment);
+        self.begin_persistence(&shard_plans).await?;
+
+        if let Some(sink) = &self.clickhouse {
+            if let Err(err) = sink.flush_segment(&segment).await {
+                *self.clickhouse_error.lock().await = Some(err.to_string());
+                metrics::counter!("proxist_clickhouse_flush_total", 1, "status" => "error");
+                metrics::counter!("proxist_ingest_failures_total", 1);
+                self.fail_persistence(&shard_plans).await?;
+                return Err(err);
+            }
+            *self.clickhouse_error.lock().await = None;
+            metrics::counter!("proxist_clickhouse_flush_total", 1, "status" => "ok");
+        }
+
+        if let Some(last) = segment
+            .records
+            .iter()
+            .map(|record| system_time_to_micros(record.timestamp))
+            .max()
+        {
+            self.last_flush_micros.store(last, Ordering::SeqCst);
+        }
+
+        if self.clickhouse.is_none() {
+            *self.clickhouse_error.lock().await = None;
+        }
+
+        self.commit_persistence(&shard_plans).await?;
+        for plan in &shard_plans {
+            tracing::debug!(
+                shard = %plan.shard_id,
+                tenant = %plan.tenant,
+                rows = plan.rows,
+                start = ?plan.batch.start,
+                end = ?plan.batch.end,
+                "persisted shard batch"
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn persist_replayed(&self, records: &[IngestRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let segment = IngestSegment::new(records.to_vec());
+        self.persist_segment(segment).await
+    }
+
     pub async fn warm_from_records(&self, records: &[IngestRecord]) -> anyhow::Result<()> {
         let mut last_ts: Option<SystemTime> = None;
+        {
+            let mut map = self.symbol_shards.lock().await;
+            for record in records {
+                map.insert((record.tenant.clone(), record.symbol.clone()), record.shard_id.clone());
+            }
+        }
+
+        {
+            let mut trackers = self.persistence_trackers.lock().await;
+            for record in records {
+                let tracker = trackers
+                    .entry(record.shard_id.clone())
+                    .or_insert_with(|| ShardPersistenceTracker::new(record.shard_id.clone()));
+                tracker.watermark.bump_wal(record.timestamp);
+            }
+        }
+
         for record in records {
             self.metadata
                 .alloc_symbol(&record.tenant, &record.symbol)
@@ -477,6 +551,33 @@ impl IngestService {
             self.last_flush_micros
                 .store(system_time_to_micros(ts), Ordering::SeqCst);
         }
+        Ok(())
+    }
+
+    pub async fn hydrate_from_hot_store(&self) -> anyhow::Result<()> {
+        let summary = self.hot_store.hot_summary().await?;
+        if summary.is_empty() {
+            return Ok(());
+        }
+
+        for entry in summary {
+            self.metadata
+                .alloc_symbol(&entry.tenant, &entry.symbol)
+                .await?;
+            let shard_id = self.resolve_shard(&entry.tenant, &entry.symbol).await?;
+            {
+                let mut symbol_map = self.symbol_shards.lock().await;
+                symbol_map.insert((entry.tenant.clone(), entry.symbol.clone()), shard_id.clone());
+            }
+            let mut trackers = self.persistence_trackers.lock().await;
+            let tracker = trackers
+                .entry(shard_id.clone())
+                .or_insert_with(|| ShardPersistenceTracker::new(shard_id));
+            if let Some(last_ts) = entry.last_timestamp {
+                tracker.watermark.bump_wal(last_ts);
+            }
+        }
+
         Ok(())
     }
 
@@ -698,6 +799,10 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn restore_snapshot(&self, _bytes: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
         async fn last_by(
             &self,
             tenant: &TenantId,
@@ -840,6 +945,7 @@ mod tests {
                 target.clone(),
                 Arc::clone(&clickhouse_client),
             )),
+            None,
         );
 
         let now = std::time::SystemTime::now();
@@ -905,6 +1011,7 @@ mod tests {
                 target.clone(),
                 Arc::clone(&clickhouse_client),
             )),
+            None,
         );
 
         let base = std::time::SystemTime::now();
@@ -982,7 +1089,7 @@ mod tests {
         let metadata = SqliteMetadataStore::connect(temp.path().to_str().unwrap()).await?;
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let service = IngestService::new(metadata.clone(), hot_store, None);
+        let service = IngestService::new(metadata.clone(), hot_store, None, None);
 
         let ticks = vec![
             IngestTick {
@@ -1046,7 +1153,7 @@ mod tests {
 
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let service = IngestService::new(metadata.clone(), hot_store, None);
+        let service = IngestService::new(metadata.clone(), hot_store, None, None);
 
         let snapshot = metadata.get_cluster_metadata().await?;
         service.apply_metadata(&snapshot).await?;

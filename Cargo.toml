@@ -2,6 +2,7 @@
 members = [
     "proxist-core",
     "proxist-mem",
+    "proxist-wal",
     "proxistd",
     "pxctl",
 ]

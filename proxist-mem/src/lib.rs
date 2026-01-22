@@ -120,6 +120,8 @@ pub trait HotColumnStore: Send + Sync {
 
     async fn snapshot(&self, shard_tracker: &ShardPersistenceTracker) -> anyhow::Result<Vec<u8>>;
 
+    async fn restore_snapshot(&self, bytes: &[u8]) -> anyhow::Result<()>;
+
     async fn last_by(
         &self,
         tenant: &TenantId,
@@ -305,6 +307,58 @@ impl HotColumnStore for InMemoryHotColumnStore {
             "generated in-memory snapshot"
         );
         Ok(bytes)
+    }
+
+    async fn restore_snapshot(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct SnapshotRow {
+            symbol: String,
+            timestamp_micros: i64,
+            #[serde(with = "serde_bytes")]
+            payload: Vec<u8>,
+        }
+
+        #[derive(Deserialize)]
+        struct SnapshotTenant {
+            tenant: String,
+            rows: Vec<SnapshotRow>,
+        }
+
+        let tenants: Vec<SnapshotTenant> = serde_json::from_slice(bytes)?;
+        let mut guard = self.inner.write().await;
+        guard.clear();
+
+        for tenant in tenants {
+            let tenant_id = tenant.tenant.clone();
+            let tenant_store = guard
+                .entry(tenant_id.clone())
+                .or_insert_with(TenantStore::default);
+            for row in tenant.rows {
+                let symbol_store = tenant_store
+                    .symbols
+                    .entry(row.symbol.clone())
+                    .or_insert_with(SymbolStore::default);
+                let timestamp = if row.timestamp_micros >= 0 {
+                    UNIX_EPOCH + Duration::from_micros(row.timestamp_micros as u64)
+                } else {
+                    UNIX_EPOCH - Duration::from_micros((-row.timestamp_micros) as u64)
+                };
+                symbol_store.rows.push(Row {
+                    timestamp,
+                    micros: row.timestamp_micros,
+                    payload: row.payload,
+                });
+                tenant_store.total_rows += 1;
+            }
+        }
+
+        for tenant_store in guard.values_mut() {
+            for store in tenant_store.symbols.values_mut() {
+                store.rows.sort_by_key(|row| row.micros);
+            }
+        }
+
+        Ok(())
     }
 
     async fn last_by(

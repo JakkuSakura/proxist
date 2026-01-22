@@ -16,6 +16,7 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 proxist-core = { path = "../proxist-core" }
 proxist-mem = { path = "../proxist-mem" }
+proxist-wal = { path = "../proxist-wal" }
 serde_bytes.workspace = true
 tempfile.workspace = true
 base64.workspace = true

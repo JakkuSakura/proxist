@@ -61,8 +61,13 @@ alpha   MSFT        alpha::MSFT    4            1704103201000000     17041032040
 beta    GOOG        beta::GOOG     4            1704103203000000     1704103205000000    1704103205000000        1704103205000000
 ```
 - Integration harness (`scripts/run_clickhouse_tests.sh`) launches ClickHouse with Docker Compose and runs `cargo test`.
-- Set `PROXIST_WAL_DIR` to enable disk-backed WAL persistence and replay; otherwise the daemon falls back to in-memory WALs for dev.
-- Disk WAL can emit snapshots + manifests so nodes can replay from the latest snapshot before scanning recent segments.
+- Set `PROXIST_WAL_DIR` to enable disk-backed WAL persistence and replay; otherwise the daemon runs without a WAL.
+- WAL tuning knobs:
+  - `PROXIST_WAL_SEGMENT_BYTES` (default 256MB) rotates WAL segments.
+  - `PROXIST_WAL_SNAPSHOT_ROWS` (default 5,000,000) controls snapshot cadence.
+  - `PROXIST_WAL_FSYNC` (`true`/`false`, default true) toggles fsync on WAL append.
+  - `PROXIST_WAL_REPLAY_PERSIST` (`true`/`false`, default true) replays WAL rows into ClickHouse on boot.
+- Disk WAL emits snapshots + manifests so nodes can replay from the latest snapshot before scanning recent segments.
 - Hot query path supports `range`, `last_by`, and `asof` operations across the in-memory store; planners will stitch in ClickHouse results once persistence watermarking is complete.
 - Daemon bearer auth can be sourced from `PROXIST_API_TOKEN_FILE`, keeping tokens out of process environments.
 - Diagnostics bundle (`/diagnostics`) returns seam summaries and persistence trackers alongside metrics for quick health snapshots.
