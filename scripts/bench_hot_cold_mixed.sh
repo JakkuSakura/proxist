@@ -12,8 +12,16 @@ PROXIST_PG_ADDR="127.0.0.1:${PROXIST_PG_PORT}"
 PROXIST_PG_USER="${PROXIST_PG_USER:-postgres}"
 COLD_ROWS="${PROXIST_BENCH_COLD_ROWS:-2000000}"
 HOT_BATCH_SIZE="${PROXIST_BENCH_HOT_BATCH_SIZE:-2000}"
-HOT_BATCHES="${PROXIST_BENCH_HOT_BATCHES:-5}"
 WINDOW_MICROS="${PROXIST_BENCH_WINDOW_MICROS:-1000000}"
+WINDOW_HALF=$((WINDOW_MICROS / 2))
+WINDOW_START=$((CUTOFF_MICROS - WINDOW_HALF + 1))
+WINDOW_END=$((WINDOW_START + WINDOW_MICROS - 1))
+HOT_ROWS="${PROXIST_BENCH_HOT_ROWS:-$WINDOW_MICROS}"
+if [[ "${HOT_ROWS}" -le 0 ]]; then
+  echo "HOT_ROWS must be > 0" >&2
+  exit 1
+fi
+HOT_BATCHES=$(( (HOT_ROWS + HOT_BATCH_SIZE - 1) / HOT_BATCH_SIZE ))
 
 if command -v docker >/dev/null 2>&1; then
   COMPOSE_CMD=(docker compose -f "${COMPOSE_FILE}")
@@ -50,6 +58,8 @@ PROXIST_LOG="$(mktemp)"
 WAL_DIR="$(mktemp -d)"
 PROXIST_PID=""
 KEEP_LOG=0
+HOT_SEQ=1
+HOT_LAST_MICROS=$((CUTOFF_MICROS + 1))
 
 cleanup() {
   if [[ -n "${PROXIST_PID}" ]] && kill -0 "${PROXIST_PID}" >/dev/null 2>&1; then
@@ -72,48 +82,79 @@ trap cleanup EXIT
 echo "Starting ClickHouse for hot/cold/mixed benchmarks..."
 "${COMPOSE_CMD[@]}" up -d clickhouse >/dev/null
 
-until "${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "SELECT 1" >/dev/null 2>&1; do
-  sleep 1
-done
-
-echo "Starting proxistd (release build)..."
-(
-  cd "${ROOT_DIR}" && \
-  PROXIST_METADATA_SQLITE_PATH="${METADATA_URI}" \
-  PROXIST_HTTP_ADDR="${PROXIST_ADDR}" \
-  PROXIST_PG_ADDR="${PROXIST_PG_ADDR}" \
-  PROXIST_PG_DIALECT="clickhouse" \
-  PROXIST_CLICKHOUSE_ENDPOINT="http://127.0.0.1:18123" \
-  PROXIST_CLICKHOUSE_DATABASE="proxist" \
-  PROXIST_CLICKHOUSE_TABLE="ticks" \
-  PROXIST_WAL_DIR="${WAL_DIR}" \
-  PROXIST_PERSISTED_CUTOFF_OVERRIDE_MICROS="${CUTOFF_MICROS}" \
-  RUST_LOG="debug" \
-  cargo run --quiet --release --bin proxistd
-) >"${PROXIST_LOG}" 2>&1 &
-PROXIST_PID=$!
-
 for _ in {1..60}; do
-  if psql -h 127.0.0.1 -p "${PROXIST_PG_PORT}" -U "${PROXIST_PG_USER}" -d postgres -c "SELECT 1" >/dev/null 2>&1; then
+  if "${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "SELECT 1" >/dev/null 2>&1; then
     break
   fi
   sleep 1
-  if ! kill -0 "${PROXIST_PID}" >/dev/null 2>&1; then
-    echo "proxistd exited unexpectedly. Logs:" >&2
-    cat "${PROXIST_LOG}" >&2
-    exit 1
-  fi
   if [[ $_ -eq 60 ]]; then
-    echo "proxistd did not become ready in time. Logs:" >&2
-    cat "${PROXIST_LOG}" >&2
+    echo "ClickHouse did not become ready in time." >&2
     exit 1
   fi
 done
 
-echo "Creating schema in ClickHouse..."
-"${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "CREATE DATABASE IF NOT EXISTS proxist" >/dev/null
-"${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "DROP TABLE IF EXISTS proxist.ticks" >/dev/null
-"${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "CREATE TABLE proxist.ticks (tenant String, shard_id String, symbol String, ts_micros Int64, payload_base64 String, seq UInt64) ENGINE = MergeTree ORDER BY (tenant, symbol, ts_micros)" >/dev/null
+start_proxistd() {
+  local cutoff="$1"
+  local replay_persist="$2"
+  PROXIST_LOG="$(mktemp)"
+  echo "Starting proxistd (release build) with cutoff ${cutoff}..."
+  (
+    cd "${ROOT_DIR}" && \
+    PROXIST_METADATA_SQLITE_PATH="${METADATA_URI}" \
+    PROXIST_HTTP_ADDR="${PROXIST_ADDR}" \
+    PROXIST_PG_ADDR="${PROXIST_PG_ADDR}" \
+    PROXIST_PG_DIALECT="clickhouse" \
+    PROXIST_CLICKHOUSE_ENDPOINT="http://127.0.0.1:18123" \
+    PROXIST_CLICKHOUSE_DATABASE="proxist" \
+    PROXIST_CLICKHOUSE_TABLE="ticks" \
+    PROXIST_WAL_DIR="${WAL_DIR}" \
+    PROXIST_WAL_REPLAY_PERSIST="${replay_persist}" \
+    PROXIST_PERSISTED_CUTOFF_OVERRIDE_MICROS="${cutoff}" \
+    RUST_LOG="debug" \
+    cargo run --quiet --release --bin proxistd
+  ) >"${PROXIST_LOG}" 2>&1 &
+  PROXIST_PID=$!
+
+  for _ in {1..60}; do
+    if psql -h 127.0.0.1 -p "${PROXIST_PG_PORT}" -U "${PROXIST_PG_USER}" -d postgres -c "SELECT 1" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    if ! kill -0 "${PROXIST_PID}" >/dev/null 2>&1; then
+      echo "proxistd exited unexpectedly. Logs:" >&2
+      cat "${PROXIST_LOG}" >&2
+      return 1
+    fi
+  done
+  echo "proxistd did not become ready in time. Logs:" >&2
+  cat "${PROXIST_LOG}" >&2
+  return 1
+}
+
+stop_proxistd() {
+  if [[ -n "${PROXIST_PID}" ]] && kill -0 "${PROXIST_PID}" >/dev/null 2>&1; then
+    echo "Stopping proxistd..."
+    kill "${PROXIST_PID}" >/dev/null 2>&1 || true
+    wait "${PROXIST_PID}" 2>/dev/null || true
+  fi
+  PROXIST_PID=""
+}
+
+echo "Ensuring database exists in ClickHouse..."
+ch_query() {
+  local sql="$1"
+  local retries=10
+  for _ in $(seq 1 ${retries}); do
+    if "${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "${sql}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ClickHouse query failed after ${retries} attempts: ${sql}" >&2
+  return 1
+}
+
+ch_query "CREATE DATABASE IF NOT EXISTS proxist"
 
 COLD_BASE_MICROS=$((CUTOFF_MICROS - COLD_ROWS - 1))
 COLD_INSERT_SQL="
@@ -127,23 +168,13 @@ INSERT INTO proxist.ticks SELECT
 FROM numbers(${COLD_ROWS});
 "
 
-echo "Loading cold dataset directly into ClickHouse..."
-"${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "${COLD_INSERT_SQL}" >/dev/null
-
-if [[ "${PROXIST_BENCH_DEBUG_CH:-0}" == "1" ]]; then
-  CH_SAMPLE_FILE="$(mktemp)"
-  "${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "SELECT symbol, ts_micros, payload_base64 FROM proxist.ticks WHERE tenant = 'alpha' AND symbol IN ('SYM1','SYM2','SYM3') AND ts_micros BETWEEN 1704103200000000 AND 1704103204000000 ORDER BY ts_micros ASC FORMAT JSONEachRow" >"${CH_SAMPLE_FILE}"
-  echo "ClickHouse sample output saved to ${CH_SAMPLE_FILE}"
-  head -n 5 "${CH_SAMPLE_FILE}"
-fi
-
-HOT_BASE_MICROS=$((CUTOFF_MICROS + 1))
+HOT_BASE_MICROS="${WINDOW_START}"
 HOT_LAST_MICROS="${HOT_BASE_MICROS}"
 HOT_SEQ=1
 
 append_hot_batch() {
   local batch_start="${HOT_LAST_MICROS}"
-  local batch_size="${HOT_BATCH_SIZE}"
+  local batch_size="${1}"
   local sql
   sql=$(python3 - <<PY
 batch_start=${batch_start}
@@ -166,91 +197,43 @@ PY
   return 0
 }
 
-echo "Appending hot dataset through proxistd (psql)..."
-for _ in $(seq 1 "${HOT_BATCHES}"); do
-  if ! append_hot_batch; then
-    echo "hot append failed via psql" >&2
-    if [[ -f "${PROXIST_LOG}" ]]; then
-      echo "proxistd logs:" >&2
-      cat "${PROXIST_LOG}" >&2
+append_hot_rows() {
+  local remaining="${HOT_ROWS}"
+  local batches="${HOT_BATCHES}"
+  while [[ "${remaining}" -gt 0 ]]; do
+    local size="${HOT_BATCH_SIZE}"
+    if [[ "${remaining}" -lt "${size}" ]]; then
+      size="${remaining}"
     fi
-    KEEP_LOG=1
-    exit 1
-  fi
-done
-
-build_hot_query() {
-  local end_micros="$1"
-  local start_micros=$((end_micros - WINDOW_MICROS + 1))
-  cat <<SQL
-SELECT symbol, ts_micros, payload_base64
-FROM ticks
-WHERE tenant = 'alpha'
-  AND symbol IN ('SYM1','SYM2','SYM3')
-  AND ts_micros BETWEEN ${start_micros} AND ${end_micros}
-ORDER BY ts_micros ASC
-FORMAT JSONEachRow
-SQL
+    if ! append_hot_batch "${size}"; then
+      return 1
+    fi
+    remaining=$((remaining - size))
+  done
+  return 0
 }
 
-build_cold_query() {
-  local cold_start="${COLD_BASE_MICROS}"
-  local cold_end=$((CUTOFF_MICROS - 1))
+build_query() {
   cat <<SQL
 SELECT symbol, ts_micros, payload_base64
 FROM ticks
 WHERE tenant = 'alpha'
   AND symbol IN ('SYM1','SYM2','SYM3')
-  AND ts_micros BETWEEN ${cold_start} AND ${cold_end}
+  AND ts_micros BETWEEN ${WINDOW_START} AND ${WINDOW_END}
 ORDER BY ts_micros ASC
-FORMAT JSONEachRow
-SQL
-}
-
-build_mixed_query() {
-  local end_micros="$1"
-  local start_micros=$((CUTOFF_MICROS - (WINDOW_MICROS / 2)))
-  cat <<SQL
-SELECT symbol, ts_micros, payload_base64
-FROM ticks
-WHERE tenant = 'alpha'
-  AND symbol IN ('SYM1','SYM2','SYM3')
-  AND ts_micros BETWEEN ${start_micros} AND ${end_micros}
-ORDER BY ts_micros ASC
-FORMAT JSONEachRow
 SQL
 }
 
 bench_query() {
   local name="$1"
-  local mode="$2"
   local iterations=5
   local total=0
+  local total_rows=0
 
   echo "Running ${name} benchmark (${iterations} iterations)..."
   for i in $(seq 1 ${iterations}); do
-    if ! append_hot_batch; then
-      echo "hot append failed via psql" >&2
-      KEEP_LOG=1
-      break
-    fi
     local payload
-    case "${mode}" in
-      hot)
-        payload="$(build_hot_query "${HOT_LAST_MICROS}")"
-        ;;
-      cold)
-        payload="$(build_cold_query)"
-        ;;
-      mixed)
-        payload="$(build_mixed_query "${HOT_LAST_MICROS}")"
-        ;;
-      *)
-        echo "unknown bench mode ${mode}" >&2
-        KEEP_LOG=1
-        break
-        ;;
-    esac
+    payload="$(build_query)"
     local start
     local end
     start=$(python3 - <<'PY'
@@ -289,14 +272,98 @@ PY
 
     echo "  iteration ${i}: ${duration} ms (rows=${count})"
     total=$((total + duration))
+    total_rows=$((total_rows + count))
   done
 
   local avg=$((total / iterations))
+  local rows_per_sec
+  rows_per_sec=$(python3 - <<PY
+total_rows=${total_rows}
+total_ms=${total}
+if total_ms <= 0:
+    print("0")
+else:
+    print(f"{(total_rows * 1000.0) / total_ms:.2f}")
+PY
+)
   echo "${name} average latency: ${avg} ms"
+  echo "${name} rows/sec: ${rows_per_sec}"
 }
 
-bench_query "hot-only" "hot"
-bench_query "cold-only" "cold"
-bench_query "mixed" "mixed"
+setup_dataset() {
+  echo "=== dataset setup ==="
+  ch_query "DROP TABLE IF EXISTS proxist.ticks"
+  if ! start_proxistd "${CUTOFF_MICROS}" "true"; then
+    KEEP_LOG=1
+    exit 1
+  fi
+
+  CREATE_SQL=$(cat <<'SQL'
+CREATE TABLE proxist.ticks (
+  tenant String,
+  shard_id String,
+  symbol String,
+  ts_micros Int64,
+  payload_base64 String,
+  seq UInt64
+) ENGINE = MergeTree
+ORDER BY (tenant, symbol, ts_micros)
+COMMENT 'proxist: order_col=ts_micros, payload_col=payload_base64, filter_cols=tenant symbol; seq_col=seq'
+SQL
+)
+  CREATE_OUT="$(mktemp)"
+  if ! psql -h 127.0.0.1 -p "${PROXIST_PG_PORT}" -U "${PROXIST_PG_USER}" -d postgres -v ON_ERROR_STOP=1 -c "${CREATE_SQL}" >"${CREATE_OUT}" 2>&1; then
+    echo "create table failed via psql" >&2
+    cat "${CREATE_OUT}" >&2 || true
+    KEEP_LOG=1
+    rm -f "${CREATE_OUT}"
+    stop_proxistd
+    exit 1
+  fi
+  rm -f "${CREATE_OUT}"
+
+  echo "Loading cold dataset directly into ClickHouse..."
+  ch_query "${COLD_INSERT_SQL}"
+
+  if [[ "${PROXIST_BENCH_DEBUG_CH:-0}" == "1" ]]; then
+    CH_SAMPLE_FILE="$(mktemp)"
+    "${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "SELECT symbol, ts_micros, payload_base64 FROM proxist.ticks WHERE tenant = 'alpha' AND symbol IN ('SYM1','SYM2','SYM3') AND ts_micros BETWEEN ${WINDOW_START} AND ${WINDOW_END} ORDER BY ts_micros ASC FORMAT JSONEachRow" >"${CH_SAMPLE_FILE}"
+    echo "ClickHouse sample output saved to ${CH_SAMPLE_FILE}"
+    head -n 5 "${CH_SAMPLE_FILE}"
+  fi
+
+  HOT_LAST_MICROS="${HOT_BASE_MICROS}"
+  HOT_SEQ=1
+  echo "Appending hot dataset through proxistd (psql)..."
+  if ! append_hot_rows; then
+    echo "hot append failed via psql" >&2
+    KEEP_LOG=1
+    stop_proxistd
+    exit 1
+  fi
+
+  stop_proxistd
+}
+
+run_mode() {
+  local name="$1"
+  local cutoff="$2"
+  echo "=== ${name} (cutoff ${cutoff}) ==="
+  if ! start_proxistd "${cutoff}" "false"; then
+    KEEP_LOG=1
+    exit 1
+  fi
+  bench_query "${name}"
+  stop_proxistd
+}
+
+HOT_ONLY_CUTOFF=$((WINDOW_START - 1))
+COLD_ONLY_CUTOFF=$((WINDOW_END + 1))
+MIXED_CUTOFF=$((WINDOW_START + 1000))
+
+setup_dataset
+run_mode "hot-only" "${HOT_ONLY_CUTOFF}"
+run_mode "cold-only" "${COLD_ONLY_CUTOFF}"
+run_mode "mixed" "${MIXED_CUTOFF}"
 
 echo "Benchmarks complete. Persisted cutoff override: ${CUTOFF_MICROS} micros."

@@ -611,8 +611,13 @@ async fn execute_sql_batch(
                         forwarded = ensure_engine_clause(&forwarded, "MergeTree");
                     }
                     state.scheduler.register_ddl(&forwarded)?;
-                    let raw = forward_sql_to_scheduler(state, &forwarded).await?;
-                    outputs.push(SqlBatchResult::Text(raw));
+                    if let Some(client) = state.ingest.clickhouse_client() {
+                        let raw = client.execute_raw(&forwarded).await?;
+                        outputs.push(SqlBatchResult::Text(raw));
+                    } else {
+                        let raw = forward_sql_to_scheduler(state, &forwarded).await?;
+                        outputs.push(SqlBatchResult::Text(raw));
+                    }
                     continue;
                 }
             }
