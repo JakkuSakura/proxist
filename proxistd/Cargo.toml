@@ -36,3 +36,10 @@ futures = "0.3"
 default = ["duckdb", "postgres"]
 duckdb = ["dep:duckdb"]
 postgres = ["dep:tokio-postgres"]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "query_path"
+harness = false

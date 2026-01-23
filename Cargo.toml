@@ -35,3 +35,6 @@ metrics-exporter-prometheus = "0.13"
 
 [workspace.metadata]
 description = "Proxist workspace"
+
+[profile.bench]
+debug = true

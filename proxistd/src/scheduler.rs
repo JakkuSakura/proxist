@@ -466,16 +466,22 @@ impl DuckDbExecutorImpl {
 
     fn query_rows(&self, sql: &str) -> anyhow::Result<Vec<JsonValue>> {
         let mut stmt = self.conn.prepare(sql)?;
-        let column_count = stmt.column_count();
-        let column_names: Vec<String> = (0..column_count)
-            .map(|idx| {
-                stmt.column_name(idx)
-                    .map(|name| name.to_string())
-                    .unwrap_or_default()
+        let mut rows = stmt.query([])?;
+        let column_names: Vec<String> = rows
+            .as_ref()
+            .map(|stmt| {
+                (0..stmt.column_count())
+                    .map(|idx| {
+                        stmt.column_name(idx)
+                            .map(|name| name.to_string())
+                            .unwrap_or_default()
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
-        let rows = stmt.query_map([], move |row| {
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
             let mut map = Map::new();
             for (idx, name) in column_names.iter().enumerate() {
                 if let Ok(v) = row.get::<usize, String>(idx) {
@@ -492,12 +498,7 @@ impl DuckDbExecutorImpl {
                     map.insert(name.clone(), JsonValue::Null);
                 }
             }
-            Ok(JsonValue::Object(map))
-        })?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
+            out.push(JsonValue::Object(map));
         }
         Ok(out)
     }
