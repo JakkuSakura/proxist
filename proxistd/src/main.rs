@@ -54,7 +54,7 @@ use fp_prql::PrqlFrontend;
 use serde_bytes::ByteBuf;
 use serde_json::json;
 use tokio::signal;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -108,6 +108,8 @@ struct DaemonConfig {
     wal_fsync: bool,
     wal_replay_persist: bool,
     persisted_cutoff_override: Option<SystemTime>,
+    cold_cache_window_micros: i64,
+    cold_cache_refresh_secs: u64,
 }
 
 impl DaemonConfig {
@@ -165,6 +167,14 @@ impl DaemonConfig {
                 .ok()
                 .and_then(|v| v.parse::<i64>().ok())
                 .map(micros_to_system_time),
+            cold_cache_window_micros: std::env::var("PROXIST_COLD_CACHE_WINDOW_MICROS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(300_000_000),
+            cold_cache_refresh_secs: std::env::var("PROXIST_COLD_CACHE_REFRESH_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30),
         })
     }
 }
@@ -1018,6 +1028,17 @@ impl ProxistDaemon {
             let persisted = self.ingest_service.last_persisted_timestamp();
             let effective = apply_persisted_override(persisted, self.config.persisted_cutoff_override);
             self.scheduler.set_persisted_cutoff(effective);
+            if let Err(err) = self
+                .scheduler
+                .refresh_cold_cache(
+                    &snapshot,
+                    self.config.cold_cache_window_micros,
+                    Duration::from_secs(self.config.cold_cache_refresh_secs),
+                )
+                .await
+            {
+                warn!(error = %err, "failed to refresh cold cache");
+            }
 
             let assigned = snapshot.assignments.len();
             let total_symbols: usize = snapshot
