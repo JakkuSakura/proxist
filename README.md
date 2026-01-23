@@ -44,7 +44,7 @@ For the full design matrix, see `docs/design-goals.md`.
 
 ## Current Capabilities
 
-- HTTP daemon (`proxistd`) exposes `/ingest`, `/query`, `/status`, `/assignments`, and `/health`.
+- HTTP daemon (`proxistd`) exposes `/query`, `/status`, `/assignments`, and `/health` (ingest via SQL INSERT).
 - Ingest pipeline appends to an in-memory WAL, writes into the hot column store, and optionally flushes batches to ClickHouse via JSONEachRow.
 - Metadata lives in SQLite with shard assignments, symbol dictionaries, and shard health snapshots surfaced through `/status`.
 - `pxctl` CLI drives status, ingest, query, seam inspection, and assignment workflows over REST (e.g., `pxctl query --tenant alpha --symbols AAPL --op last_by --end-micros …`).

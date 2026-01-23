@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 mod plan;
 use plan::{
-    build_table_plan, parse_table_name_from_ddl, rewrite_with_bounds, strip_limit_offset,
+    build_table_plan, parse_table_schema_from_ddl, rewrite_with_bounds, strip_limit_offset,
     OrderItem, Predicate,
 };
 use proxist_core::query::QueryRange;
@@ -80,6 +80,7 @@ pub struct TableConfig {
     pub payload_col: String,
     pub filter_cols: Vec<String>,
     pub seq_col: Option<String>,
+    pub columns: Vec<String>,
 }
 
 pub struct ProxistScheduler {
@@ -123,17 +124,36 @@ impl ProxistScheduler {
     }
 
     pub fn register_table(&self, table: impl Into<String>, cfg: TableConfig) {
-        self.tables.lock().unwrap().insert(table.into(), cfg);
+        let key = table.into().to_ascii_lowercase();
+        self.tables.lock().unwrap().insert(key, cfg);
     }
 
     pub fn register_ddl(&self, ddl_sql: &str) -> anyhow::Result<()> {
-        let cfg = parse_proxist_table_config(ddl_sql)?;
-        if let Some(table) = parse_table_name_from_ddl(ddl_sql) {
-            self.register_table(table, cfg);
-        } else {
-            anyhow::bail!("unable to determine table name from DDL");
+        let Some(annotation) = parse_proxist_table_config(ddl_sql)? else {
+            return Ok(());
+        };
+        let (table, columns) = parse_table_schema_from_ddl(ddl_sql)
+            .ok_or_else(|| anyhow!("unable to determine table schema from DDL"))?;
+        if columns.is_empty() {
+            anyhow::bail!("proxist annotation requires explicit column definitions");
         }
+        self.register_table(
+            table,
+            TableConfig {
+                ddl: ddl_sql.to_string(),
+                order_col: annotation.order_col,
+                payload_col: annotation.payload_col,
+                filter_cols: annotation.filter_cols,
+                seq_col: annotation.seq_col,
+                columns,
+            },
+        );
         Ok(())
+    }
+
+    pub fn table_config(&self, table: &str) -> Option<TableConfig> {
+        let key = table.to_ascii_lowercase();
+        self.tables.lock().unwrap().get(&key).cloned()
     }
 
     pub fn set_persisted_cutoff(&self, cutoff: Option<SystemTime>) {
@@ -881,11 +901,18 @@ fn detect_wire_format(sql: &str) -> ClickhouseWireFormat {
     ClickhouseWireFormat::Unknown
 }
 
-fn parse_proxist_table_config(sql: &str) -> anyhow::Result<TableConfig> {
+struct TableAnnotation {
+    order_col: String,
+    payload_col: String,
+    filter_cols: Vec<String>,
+    seq_col: Option<String>,
+}
+
+fn parse_proxist_table_config(sql: &str) -> anyhow::Result<Option<TableAnnotation>> {
     let lower = sql.to_ascii_lowercase();
-    let idx = lower
-        .find("proxist:")
-        .ok_or_else(|| anyhow!("missing proxist annotation"))?;
+    let Some(idx) = lower.find("proxist:") else {
+        return Ok(None);
+    };
     let tail = &sql[idx + "proxist:".len()..];
     let end = tail
         .find('\n')
@@ -927,13 +954,12 @@ fn parse_proxist_table_config(sql: &str) -> anyhow::Result<TableConfig> {
         );
     }
 
-    Ok(TableConfig {
-        ddl: sql.to_string(),
+    Ok(Some(TableAnnotation {
         order_col,
         payload_col,
         filter_cols,
         seq_col,
-    })
+    }))
 }
 
 #[cfg(test)]

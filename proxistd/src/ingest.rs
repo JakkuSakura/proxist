@@ -10,7 +10,7 @@ use std::{
 use crate::clickhouse::{ClickhouseHttpClient, ClickhouseSink, ClickhouseTarget as SinkTarget};
 use crate::metadata_sqlite::SqliteMetadataStore;
 use anyhow::Result;
-use proxist_core::api::{ClickhouseStatus, ClickhouseTarget, IngestBatchRequest};
+use proxist_core::api::{ClickhouseStatus, ClickhouseTarget};
 use proxist_core::ingest::{IngestRecord, IngestSegment};
 use proxist_core::{
     metadata::{ClusterMetadata, ShardHealth, TenantId},
@@ -18,7 +18,6 @@ use proxist_core::{
 };
 use proxist_mem::{HotColumnStore, HotSymbolSummary};
 use proxist_wal::WalManager;
-use serde_bytes::ByteBuf;
 use tokio::sync::Mutex;
 
 pub struct IngestService {
@@ -371,37 +370,27 @@ impl IngestService {
         Ok(())
     }
 
-    pub async fn ingest(&self, batch: IngestBatchRequest) -> Result<()> {
+    pub async fn ingest(&self, records: Vec<IngestRecord>) -> Result<()> {
         let start = Instant::now();
         let mut rows_written = 0_u64;
-        let span = tracing::info_span!("ingest", rows = batch.ticks.len());
+        let span = tracing::info_span!("ingest", rows = records.len());
         let _guard = span.enter();
         metrics::counter!("proxist_ingest_requests_total", 1);
-        let mut records: Vec<IngestRecord> = Vec::with_capacity(batch.ticks.len());
         let mut pending_hot: Vec<(TenantId, String, SystemTime, Vec<u8>)> =
-            Vec::with_capacity(batch.ticks.len());
-        for tick in &batch.ticks {
-            let shard_id = self.resolve_shard(&tick.tenant, &tick.symbol).await?;
-
+            Vec::with_capacity(records.len());
+        let mut records = records;
+        for record in &mut records {
+            let shard_id = self.resolve_shard(&record.tenant, &record.symbol).await?;
             self.metadata
-                .alloc_symbol(&tick.tenant, &tick.symbol)
+                .alloc_symbol(&record.tenant, &record.symbol)
                 .await?;
-
-            let record = IngestRecord {
-                tenant: tick.tenant.clone(),
-                shard_id,
-                symbol: tick.symbol.clone(),
-                timestamp: tick.timestamp,
-                payload: payload_to_vec(&tick.payload),
-                seq: tick.seq,
-            };
+            record.shard_id = shard_id;
             pending_hot.push((
-                tick.tenant.clone(),
-                tick.symbol.clone(),
-                tick.timestamp,
+                record.tenant.clone(),
+                record.symbol.clone(),
+                record.timestamp,
                 record.payload.clone(),
             ));
-            records.push(record);
         }
 
         if !records.is_empty() {
@@ -635,10 +624,6 @@ impl IngestService {
         self.clickhouse_client.as_ref().map(Arc::clone)
     }
 
-    pub fn clickhouse_table(&self) -> Option<String> {
-        self.clickhouse_target.as_ref().map(|t| t.table.clone())
-    }
-
     pub async fn tracker_snapshot(&self) -> Vec<ShardPersistenceTracker> {
         let guard = self.persistence_trackers.lock().await;
         guard.values().cloned().collect()
@@ -717,10 +702,6 @@ impl IngestService {
     }
 }
 
-fn payload_to_vec(buf: &ByteBuf) -> Vec<u8> {
-    buf.as_ref().to_vec()
-}
-
 fn system_time_to_micros(ts: std::time::SystemTime) -> i64 {
     ts.duration_since(std::time::UNIX_EPOCH)
         .map(|dur| dur.as_micros() as i64)
@@ -743,7 +724,6 @@ mod tests {
     use super::*;
     use crate::clickhouse::{ClickhouseConfig, ClickhouseHttpClient};
     use async_trait::async_trait;
-    use proxist_core::api::IngestTick;
     use proxist_core::ingest::{IngestRecord, IngestSegment};
     use proxist_core::{metadata::ShardAssignment, query::QueryRange};
     use proxist_mem::{InMemoryHotColumnStore, MemConfig, SeamBoundaryRow};
@@ -949,17 +929,16 @@ mod tests {
         );
 
         let now = std::time::SystemTime::now();
-        let batch = IngestBatchRequest {
-            ticks: vec![IngestTick {
-                tenant: "alpha".into(),
-                symbol: "AAPL".into(),
-                timestamp: now,
-                payload: ByteBuf::from(vec![1, 2, 3]),
-                seq: 7,
-            }],
-        };
+        let records = vec![IngestRecord {
+            tenant: "alpha".into(),
+            shard_id: String::new(),
+            symbol: "AAPL".into(),
+            timestamp: now,
+            payload: vec![1, 2, 3],
+            seq: 7,
+        }];
 
-        service.ingest(batch).await?;
+        service.ingest(records).await?;
 
         let rows = hot_store.rows.lock().await.clone();
         assert_eq!(rows.len(), 1);
@@ -1020,26 +999,26 @@ mod tests {
             base + std::time::Duration::from_secs(5),
         );
 
-        let batch = IngestBatchRequest {
-            ticks: vec![
-                IngestTick {
-                    tenant: "alpha".into(),
-                    symbol: "AAPL".into(),
-                    timestamp: base - std::time::Duration::from_secs(1),
-                    payload: ByteBuf::from(vec![1, 2, 3]),
-                    seq: 10,
-                },
-                IngestTick {
-                    tenant: "alpha".into(),
-                    symbol: "AAPL".into(),
-                    timestamp: base,
-                    payload: ByteBuf::from(vec![4, 5, 6]),
-                    seq: 11,
-                },
-            ],
-        };
+        let records = vec![
+            IngestRecord {
+                tenant: "alpha".into(),
+                shard_id: String::new(),
+                symbol: "AAPL".into(),
+                timestamp: base - std::time::Duration::from_secs(1),
+                payload: vec![1, 2, 3],
+                seq: 10,
+            },
+            IngestRecord {
+                tenant: "alpha".into(),
+                shard_id: String::new(),
+                symbol: "AAPL".into(),
+                timestamp: base,
+                payload: vec![4, 5, 6],
+                seq: 11,
+            },
+        ];
 
-        service.ingest(batch).await?;
+        service.ingest(records).await?;
 
         // Hot store should have both rows available via range query.
         let hot_rows = hot_store
@@ -1091,38 +1070,42 @@ mod tests {
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
         let service = IngestService::new(metadata.clone(), hot_store, None, None);
 
-        let ticks = vec![
-            IngestTick {
+        let records = vec![
+            IngestRecord {
                 tenant: "alpha".into(),
+                shard_id: String::new(),
                 symbol: "AAPL".into(),
                 timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(1),
-                payload: ByteBuf::from(vec![]),
+                payload: vec![],
                 seq: 1,
             },
-            IngestTick {
+            IngestRecord {
                 tenant: "alpha".into(),
+                shard_id: String::new(),
                 symbol: "MSFT".into(),
                 timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(2),
-                payload: ByteBuf::from(vec![]),
+                payload: vec![],
                 seq: 2,
             },
-            IngestTick {
+            IngestRecord {
                 tenant: "alpha".into(),
+                shard_id: String::new(),
                 symbol: "AAPL".into(),
                 timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(3),
-                payload: ByteBuf::from(vec![]),
+                payload: vec![],
                 seq: 3,
             },
-            IngestTick {
+            IngestRecord {
                 tenant: "beta".into(),
+                shard_id: String::new(),
                 symbol: "GOOG".into(),
                 timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(4),
-                payload: ByteBuf::from(vec![]),
+                payload: vec![],
                 seq: 1,
             },
         ];
 
-        service.ingest(IngestBatchRequest { ticks }).await?;
+        service.ingest(records).await?;
         let summary = service.hot_cold_summary().await?;
 
         let mut map = std::collections::HashMap::new();

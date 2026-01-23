@@ -10,21 +10,6 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IngestTick {
-    pub tenant: TenantId,
-    pub symbol: String,
-    #[serde(with = "crate::time::serde_micros")]
-    pub timestamp: SystemTime,
-    pub payload: ByteBuf,
-    pub seq: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IngestBatchRequest {
-    pub ticks: Vec<IngestTick>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRequest {
     pub tenant: TenantId,
     pub symbols: Vec<String>,

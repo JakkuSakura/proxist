@@ -4,8 +4,8 @@ use std::fs;
 use anyhow::{anyhow, bail};
 use clap::{Parser, Subcommand};
 use proxist_core::api::{
-    ControlCommand, DiagnosticsBundle, IngestBatchRequest, QueryRequest, QueryResponse,
-    ShardAssignment, StatusResponse, SymbolDictionarySpec,
+    ControlCommand, DiagnosticsBundle, QueryRequest, QueryResponse, ShardAssignment,
+    StatusResponse, SymbolDictionarySpec,
 };
 use proxist_core::{
     metadata::ClusterMetadata,
@@ -63,11 +63,6 @@ enum Commands {
         window_micros: Option<u64>,
         #[arg(long, default_value = "count")]
         window_agg: String,
-    },
-    /// Inject a test ingest batch described via JSON.
-    Ingest {
-        #[arg(long)]
-        file: String,
     },
     /// Execute raw SQL via proxist's ClickHouse-compatible endpoint.
     Sql {
@@ -226,19 +221,6 @@ fn main() -> anyhow::Result<()> {
                     .error_for_status()?;
                 let payload: QueryResponse = response.json().await?;
                 println!("{}", serde_json::to_string_pretty(&payload)?);
-                Ok::<(), anyhow::Error>(())
-            })?;
-        }
-        Commands::Ingest { file } => {
-            let json = std::fs::read_to_string(file)?;
-            let batch: IngestBatchRequest = serde_json::from_str(&json)?;
-            let url = format!("{}/ingest", endpoint);
-            info!(rows = batch.ticks.len(), "submitting ingest batch");
-            rt.block_on(async {
-                apply_auth(client.post(&url).json(&batch), token.as_deref())
-                    .send()
-                    .await?
-                    .error_for_status()?;
                 Ok::<(), anyhow::Error>(())
             })?;
         }

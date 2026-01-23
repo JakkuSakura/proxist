@@ -32,12 +32,12 @@ use chrono::NaiveDateTime;
 use ingest::{HotColdSummaryRow, IngestService};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use proxist_core::api::{
-    DiagnosticsBundle, DiagnosticsHotSummaryRow, IngestBatchRequest, IngestTick, QueryRequest,
-    QueryResponse, QueryRow, StatusResponse, SymbolDictionarySpec,
+    DiagnosticsBundle, DiagnosticsHotSummaryRow, QueryRequest, QueryResponse, QueryRow,
+    StatusResponse, SymbolDictionarySpec,
 };
 use proxist_core::{
-    metadata::ClusterMetadata,
     ingest::IngestRecord,
+    metadata::ClusterMetadata,
     query::{QueryOperation, RollingAggregation},
     MetadataStore, ShardAssignment, ShardHealth,
 };
@@ -578,10 +578,6 @@ async fn execute_sql_batch(
 ) -> Result<Vec<SqlBatchResult>, AppError> {
     let mut outputs = Vec::new();
     let mut seq_counter: u64 = 0;
-    let ingest_table = state
-        .ingest
-        .clickhouse_table()
-        .map(|t| t.to_ascii_lowercase());
 
     for stmt_text in compile_statements(&dialect, sql_text)? {
         let normalized = strip_leading_sql_comments(&stmt_text);
@@ -654,27 +650,26 @@ async fn execute_sql_batch(
                 ..
             } => {
                 let table_name_lower = table_name.to_string().to_ascii_lowercase();
-                tracing::debug!(
-                    table = %table_name_lower,
-                    ?ingest_table,
-                    "processing INSERT statement"
-                );
-                if let Some(expected) = ingest_table.as_ref() {
-                    if &table_name_lower != expected {
-                        let raw = forward_sql_to_scheduler(state, normalized).await?;
-                        outputs.push(SqlBatchResult::Text(raw));
-                        continue;
-                    }
-                }
+                let table_cfg = state.scheduler.table_config(&table_name_lower);
+                tracing::debug!(table = %table_name_lower, ingestable = table_cfg.is_some(), "processing INSERT statement");
                 if let Some(query) = source {
                     match *query.body {
                         SetExpr::Values(values) => {
-                            let ticks =
-                                build_ingest_ticks(&columns, values, &mut seq_counter)?;
-                            if !ticks.is_empty() {
-                                state.ingest.ingest(IngestBatchRequest { ticks }).await?;
+                            if let Some(cfg) = table_cfg {
+                                let records = build_ingest_records(
+                                    &cfg,
+                                    &columns,
+                                    values,
+                                    &mut seq_counter,
+                                )?;
+                                if !records.is_empty() {
+                                    state.ingest.ingest(records).await?;
+                                }
+                                outputs.push(SqlBatchResult::Text("Ok.\n".to_string()));
+                            } else {
+                                let raw = forward_sql_to_scheduler(state, normalized).await?;
+                                outputs.push(SqlBatchResult::Text(raw));
                             }
-                            outputs.push(SqlBatchResult::Text("Ok.\n".to_string()));
                         }
                         _ => {
                             let raw = forward_sql_to_scheduler(state, normalized).await?;
@@ -696,21 +691,30 @@ async fn execute_sql_batch(
     Ok(outputs)
 }
 
-fn build_ingest_ticks(
+fn build_ingest_records(
+    cfg: &crate::scheduler::TableConfig,
     columns: &[Ident],
     values: Values,
     seq_counter: &mut u64,
-) -> anyhow::Result<Vec<IngestTick>> {
+) -> anyhow::Result<Vec<IngestRecord>> {
     let column_names: Vec<String> = if columns.is_empty() {
-        vec!["tenant", "symbol", "ts", "seq"]
-            .into_iter()
-            .map(String::from)
-            .collect()
+        cfg.columns.clone()
     } else {
         columns.iter().map(|c| c.value.to_lowercase()).collect()
     };
 
-    let mut ticks = Vec::new();
+    let mut records = Vec::new();
+    let tenant_col = cfg.filter_cols.get(0).map(|s| s.to_ascii_lowercase());
+    let symbol_col = cfg.filter_cols.get(1).map(|s| s.to_ascii_lowercase());
+    let order_col = cfg.order_col.to_ascii_lowercase();
+    let payload_col = cfg.payload_col.to_ascii_lowercase();
+    let seq_col = cfg.seq_col.as_ref().map(|s| s.to_ascii_lowercase());
+
+    let tenant_col =
+        tenant_col.ok_or_else(|| anyhow!("proxist filter_cols missing tenant column"))?;
+    let symbol_col =
+        symbol_col.ok_or_else(|| anyhow!("proxist filter_cols missing symbol column"))?;
+
     for row in values.rows {
         if row.len() != column_names.len() {
             anyhow::bail!(
@@ -727,15 +731,17 @@ fn build_ingest_ticks(
         let mut payload_bytes: Option<Vec<u8>> = None;
 
         for (col, expr) in column_names.iter().zip(row.iter()) {
-            match col.as_str() {
-                "tenant" => tenant = Some(expr_to_string(expr)?),
-                "symbol" => symbol = Some(expr_to_string(expr)?),
-                "shard_id" | "table" => {}
-                "ts" | "timestamp" | "ts_micros" => timestamp = Some(expr_to_timestamp(expr)?),
-                "seq" => seq = Some(expr_to_u64(expr)?),
-                "payload" => payload_bytes = Some(expr_to_bytes(expr)?),
-                "payload_base64" => payload_bytes = Some(expr_to_base64_bytes(expr)?),
-                other => anyhow::bail!("unsupported column in INSERT: {other}"),
+            let col_lower = col.to_ascii_lowercase();
+            if col_lower == tenant_col {
+                tenant = Some(expr_to_string(expr)?);
+            } else if col_lower == symbol_col {
+                symbol = Some(expr_to_string(expr)?);
+            } else if col_lower == order_col {
+                timestamp = Some(expr_to_timestamp(expr)?);
+            } else if col_lower == payload_col {
+                payload_bytes = Some(expr_to_base64_bytes(expr)?);
+            } else if seq_col.as_deref() == Some(&col_lower) {
+                seq = Some(expr_to_u64(expr)?);
             }
         }
 
@@ -748,16 +754,17 @@ fn build_ingest_ticks(
             current
         });
 
-        ticks.push(IngestTick {
+        records.push(IngestRecord {
             tenant,
+            shard_id: String::new(),
             symbol,
             timestamp,
-            payload: ByteBuf::from(payload_bytes.unwrap_or_default()),
+            payload: payload_bytes.unwrap_or_default(),
             seq,
         });
     }
 
-    Ok(ticks)
+    Ok(records)
 }
 
 fn expr_to_string(expr: &Expr) -> anyhow::Result<String> {
@@ -766,10 +773,6 @@ fn expr_to_string(expr: &Expr) -> anyhow::Result<String> {
         Expr::Identifier(ident) => Ok(ident.value.clone()),
         _ => Err(anyhow!("expected string literal")),
     }
-}
-
-fn expr_to_bytes(expr: &Expr) -> anyhow::Result<Vec<u8>> {
-    Ok(expr_to_string(expr)?.into_bytes())
 }
 
 fn expr_to_base64_bytes(expr: &Expr) -> anyhow::Result<Vec<u8>> {
@@ -1123,14 +1126,6 @@ impl ProxistDaemon {
             Ok(StatusCode::NO_CONTENT)
         }
 
-        async fn ingest_handler(
-            State(state): State<AppState>,
-            Json(request): Json<IngestBatchRequest>,
-        ) -> Result<StatusCode, AppError> {
-            state.ingest.ingest(request).await?;
-            Ok(StatusCode::ACCEPTED)
-        }
-
         async fn metrics_handler(State(state): State<AppState>) -> Result<Response, AppError> {
             if let Some(handle) = &state.metrics {
                 let body = handle.render();
@@ -1268,7 +1263,6 @@ impl ProxistDaemon {
         let app = Router::new()
             .route("/", post(clickhouse_sql_handler))
             .route("/status", get(status_handler))
-            .route("/ingest", post(ingest_handler))
             .route("/query", post(query_handler))
             .route("/assignments", post(upsert_assignments_handler))
             .route("/metrics", get(metrics_handler))
@@ -1659,11 +1653,52 @@ mod system_summary_tests {
 #[cfg(test)]
 mod ingest_tests {
     use super::*;
-    use proxist_core::api::{IngestBatchRequest, IngestTick};
     use proxist_core::query::{QueryOperation, QueryRange};
-    use serde_bytes::ByteBuf;
     use std::time::Duration;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn build_ingest_records_maps_annotation_columns() -> anyhow::Result<()> {
+        let sql = "INSERT INTO ticks (tenant_key, symbol_key, ts_micros, payload_b64, seq_no) \
+                   VALUES ('alpha', 'AAPL', 42, 'AQID', 7)";
+        let dialect = DialectMode::Sql(SqlDialect::ClickHouse);
+        let mut parsed = parse_sql_with_dialect(&dialect, sql)?;
+        let stmt = parsed.remove(0);
+        let (columns, values) = match stmt {
+            Statement::Insert { columns, source, .. } => match source.map(|q| *q.body) {
+                Some(SetExpr::Values(values)) => (columns, values),
+                _ => bail!("expected VALUES insert"),
+            },
+            _ => bail!("expected insert"),
+        };
+
+        let cfg = crate::scheduler::TableConfig {
+            ddl: "CREATE TABLE ticks (tenant_key String, symbol_key String, ts_micros Int64, payload_b64 String, seq_no UInt64)".to_string(),
+            order_col: "ts_micros".to_string(),
+            payload_col: "payload_b64".to_string(),
+            filter_cols: vec!["tenant_key".to_string(), "symbol_key".to_string()],
+            seq_col: Some("seq_no".to_string()),
+            columns: vec![
+                "tenant_key".to_string(),
+                "symbol_key".to_string(),
+                "ts_micros".to_string(),
+                "payload_b64".to_string(),
+                "seq_no".to_string(),
+            ],
+        };
+
+        let mut seq = 0;
+        let records = build_ingest_records(&cfg, &columns, values, &mut seq)?;
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.tenant, "alpha");
+        assert_eq!(record.symbol, "AAPL");
+        assert_eq!(record.payload, vec![1, 2, 3]);
+        assert_eq!(record.seq, 7);
+        assert_eq!(system_time_to_micros(record.timestamp), 42);
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn last_by_include_cold_uses_seam_rows() -> anyhow::Result<()> {
@@ -1704,16 +1739,15 @@ mod ingest_tests {
         );
 
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
-        let batch = IngestBatchRequest {
-            ticks: vec![IngestTick {
-                tenant: "alpha".into(),
-                symbol: "AAPL".into(),
-                timestamp: ts,
-                payload: ByteBuf::from(vec![1]),
-                seq: 1,
-            }],
-        };
-        service.ingest(batch).await?;
+        let records = vec![IngestRecord {
+            tenant: "alpha".into(),
+            shard_id: String::new(),
+            symbol: "AAPL".into(),
+            timestamp: ts,
+            payload: vec![1],
+            seq: 1,
+        }];
+        service.ingest(records).await?;
 
         let state = AppState {
             metadata: metadata.clone(),
@@ -1786,15 +1820,14 @@ mod ingest_tests {
 
         let ts = SystemTime::UNIX_EPOCH + Duration::from_millis(500);
         service
-            .ingest(IngestBatchRequest {
-                ticks: vec![IngestTick {
-                    tenant: "alpha".into(),
-                    symbol: "AAPL".into(),
-                    timestamp: ts,
-                    payload: ByteBuf::from(vec![7]),
-                    seq: 1,
-                }],
-            })
+            .ingest(vec![IngestRecord {
+                tenant: "alpha".into(),
+                shard_id: String::new(),
+                symbol: "AAPL".into(),
+                timestamp: ts,
+                payload: vec![7],
+                seq: 1,
+            }])
             .await?;
 
         let state = AppState {
@@ -1827,7 +1860,6 @@ mod ingest_tests {
 #[cfg(test)]
 mod wal_replay_tests {
     use super::*;
-    use serde_bytes::ByteBuf;
     use tempfile::{NamedTempFile, TempDir};
 
     #[tokio::test]
@@ -1863,15 +1895,14 @@ mod wal_replay_tests {
 
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
         service
-            .ingest(IngestBatchRequest {
-                ticks: vec![IngestTick {
-                    tenant: "alpha".into(),
-                    symbol: "AAPL".into(),
-                    timestamp: ts,
-                    payload: ByteBuf::from(vec![9]),
-                    seq: 1,
-                }],
-            })
+            .ingest(vec![IngestRecord {
+                tenant: "alpha".into(),
+                shard_id: String::new(),
+                symbol: "AAPL".into(),
+                timestamp: ts,
+                payload: vec![9],
+                seq: 1,
+            }])
             .await?;
 
         let replay_store: Arc<dyn HotColumnStore> =

@@ -117,11 +117,16 @@ pub fn strip_limit_offset(sql: &str, limit_hint: Option<usize>) -> Option<String
     None
 }
 
-pub fn parse_table_name_from_ddl(sql: &str) -> Option<String> {
+pub fn parse_table_schema_from_ddl(sql: &str) -> Option<(String, Vec<String>)> {
     let mut stmts = Parser::parse_sql(&ClickHouseDialect {}, sql).ok()?;
     for stmt in stmts.drain(..) {
-        if let Statement::CreateTable { name, .. } = stmt {
-            return Some(name.to_string());
+        if let Statement::CreateTable { name, columns, .. } = stmt {
+            let table = name.to_string().to_ascii_lowercase();
+            let cols = columns
+                .into_iter()
+                .map(|col| col.name.value.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            return Some((table, cols));
         }
     }
     None
@@ -179,7 +184,7 @@ pub fn build_table_plan(sql: &str) -> Option<TablePlan> {
     }
 
     let table = match &select.from[0].relation {
-        TableFactor::Table { name, .. } => name.to_string(),
+        TableFactor::Table { name, .. } => name.to_string().to_ascii_lowercase(),
         _ => return Some(TablePlan::cold()),
     };
 
