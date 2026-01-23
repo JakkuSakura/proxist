@@ -6,22 +6,27 @@ COMPOSE_FILE="${ROOT_DIR}/container-compose.yaml"
 COMPOSE_CMD=(docker compose -f "${COMPOSE_FILE}")
 PROXIST_PORT="${PROXIST_PORT:-18124}"
 PROXIST_ADDR="127.0.0.1:${PROXIST_PORT}"
-CUTOFF_MICROS="${PROXIST_PERSISTED_CUTOFF_OVERRIDE_MICROS:-1704103205000000}"
+END_MICROS="${PROXIST_BENCH_END_MICROS:-1704103205000000}"
 PROXIST_PG_PORT="${PROXIST_PG_PORT:-15432}"
 PROXIST_PG_ADDR="127.0.0.1:${PROXIST_PG_PORT}"
 PROXIST_PG_USER="${PROXIST_PG_USER:-postgres}"
-COLD_ROWS="${PROXIST_BENCH_COLD_ROWS:-2000000}"
-HOT_BATCH_SIZE="${PROXIST_BENCH_HOT_BATCH_SIZE:-2000}"
-WINDOW_MICROS="${PROXIST_BENCH_WINDOW_MICROS:-1000000}"
-WINDOW_HALF=$((WINDOW_MICROS / 2))
-WINDOW_START=$((CUTOFF_MICROS - WINDOW_HALF + 1))
-WINDOW_END=$((WINDOW_START + WINDOW_MICROS - 1))
-HOT_ROWS="${PROXIST_BENCH_HOT_ROWS:-$WINDOW_MICROS}"
-if [[ "${HOT_ROWS}" -le 0 ]]; then
-  echo "HOT_ROWS must be > 0" >&2
+TOTAL_ROWS="${PROXIST_BENCH_TOTAL_ROWS:-2000000}"
+if [[ "${TOTAL_ROWS}" -le 0 ]]; then
+  echo "TOTAL_ROWS must be > 0" >&2
   exit 1
 fi
-HOT_BATCHES=$(( (HOT_ROWS + HOT_BATCH_SIZE - 1) / HOT_BATCH_SIZE ))
+WINDOW_ROWS=$((TOTAL_ROWS * 5 / 100))
+if [[ "${WINDOW_ROWS}" -le 0 ]]; then
+  echo "WINDOW_ROWS must be > 0 (check TOTAL_ROWS)" >&2
+  exit 1
+fi
+HOT_BATCH_SIZE=$((TOTAL_ROWS / 1000))
+if [[ "${HOT_BATCH_SIZE}" -le 0 ]]; then
+  HOT_BATCH_SIZE=1
+fi
+BASE_MICROS=$((END_MICROS - TOTAL_ROWS + 1))
+WINDOW_START=$((BASE_MICROS + TOTAL_ROWS - WINDOW_ROWS))
+WINDOW_END=$((BASE_MICROS + TOTAL_ROWS - 1))
 
 if command -v docker >/dev/null 2>&1; then
   COMPOSE_CMD=(docker compose -f "${COMPOSE_FILE}")
@@ -55,11 +60,11 @@ if command -v lsof >/dev/null 2>&1; then
   fi
 fi
 PROXIST_LOG="$(mktemp)"
-WAL_DIR="$(mktemp -d)"
+WAL_DIR=""
 PROXIST_PID=""
 KEEP_LOG=0
 HOT_SEQ=1
-HOT_LAST_MICROS=$((CUTOFF_MICROS + 1))
+HOT_LAST_MICROS=0
 
 cleanup() {
   if [[ -n "${PROXIST_PID}" ]] && kill -0 "${PROXIST_PID}" >/dev/null 2>&1; then
@@ -73,7 +78,9 @@ cleanup() {
     echo "proxistd log retained at ${PROXIST_LOG}"
   fi
   rm -rf "${TMP_DIR}"
-  rm -rf "${WAL_DIR}"
+  if [[ -n "${WAL_DIR}" ]]; then
+    rm -rf "${WAL_DIR}"
+  fi
   echo "Stopping ClickHouse..."
   "${COMPOSE_CMD[@]}" down --remove-orphans >/dev/null
 }
@@ -156,21 +163,7 @@ ch_query() {
 
 ch_query "CREATE DATABASE IF NOT EXISTS proxist"
 
-COLD_BASE_MICROS=$((CUTOFF_MICROS - COLD_ROWS - 1))
-COLD_INSERT_SQL="
-INSERT INTO proxist.ticks SELECT
-  'alpha' AS tenant,
-  'alpha-shard' AS shard_id,
-  concat('SYM', toString(number % 10)) AS symbol,
-  ${COLD_BASE_MICROS} + number AS ts_micros,
-  base64Encode(toString(number)) AS payload_base64,
-  number AS seq
-FROM numbers(${COLD_ROWS});
-"
-
-HOT_BASE_MICROS="${WINDOW_START}"
-HOT_LAST_MICROS="${HOT_BASE_MICROS}"
-HOT_SEQ=1
+HOT_BASE_MICROS=0
 
 append_hot_batch() {
   local batch_start="${HOT_LAST_MICROS}"
@@ -198,6 +191,9 @@ PY
 }
 
 append_hot_rows() {
+  if [[ "${HOT_ROWS}" -le 0 ]]; then
+    return 0
+  fi
   local remaining="${HOT_ROWS}"
   local batches="${HOT_BATCHES}"
   while [[ "${remaining}" -gt 0 ]]; do
@@ -291,9 +287,37 @@ PY
 }
 
 setup_dataset() {
-  echo "=== dataset setup ==="
+  local name="$1"
+  local hot_ratio="$2"
+  local hot_rows=$((WINDOW_ROWS * hot_ratio / 100))
+  local cold_rows=$((TOTAL_ROWS - hot_rows))
+  local cutoff=$((WINDOW_END - hot_rows))
+
+  if [[ "${hot_rows}" -eq 0 ]]; then
+    cutoff="${WINDOW_END}"
+  fi
+
+  HOT_ROWS="${hot_rows}"
+  HOT_BATCHES=$(( (HOT_ROWS + HOT_BATCH_SIZE - 1) / HOT_BATCH_SIZE ))
+  HOT_BASE_MICROS=$((BASE_MICROS + cold_rows))
+  HOT_LAST_MICROS=$((HOT_BASE_MICROS - 1))
+  HOT_SEQ=1
+
+  echo "=== dataset setup (${name}) ==="
+  stop_proxistd
+  if command -v lsof >/dev/null 2>&1; then
+    for port in "${PROXIST_PORT}" "${PROXIST_PG_PORT}"; do
+      local pid
+      pid=$(lsof -nP -iTCP:${port} -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print $2}' || true)
+      if [[ -n "${pid}" ]]; then
+        echo "Stopping existing proxistd on port ${port} (pid ${pid})..."
+        kill "${pid}" >/dev/null 2>&1 || true
+        sleep 1
+      fi
+    done
+  fi
   ch_query "DROP TABLE IF EXISTS proxist.ticks"
-  if ! start_proxistd "${CUTOFF_MICROS}" "true"; then
+  if ! start_proxistd "${cutoff}" "true"; then
     KEEP_LOG=1
     exit 1
   fi
@@ -323,7 +347,19 @@ SQL
   rm -f "${CREATE_OUT}"
 
   echo "Loading cold dataset directly into ClickHouse..."
-  ch_query "${COLD_INSERT_SQL}"
+  local cold_sql
+  cold_sql=$(cat <<SQL
+INSERT INTO proxist.ticks SELECT
+  'alpha' AS tenant,
+  'alpha-shard' AS shard_id,
+  concat('SYM', toString((number % 3) + 1)) AS symbol,
+  ${BASE_MICROS} + number AS ts_micros,
+  base64Encode(toString(number)) AS payload_base64,
+  number AS seq
+FROM numbers(${cold_rows});
+SQL
+)
+  ch_query "${cold_sql}"
 
   if [[ "${PROXIST_BENCH_DEBUG_CH:-0}" == "1" ]]; then
     CH_SAMPLE_FILE="$(mktemp)"
@@ -332,38 +368,44 @@ SQL
     head -n 5 "${CH_SAMPLE_FILE}"
   fi
 
-  HOT_LAST_MICROS="${HOT_BASE_MICROS}"
-  HOT_SEQ=1
-  echo "Appending hot dataset through proxistd (psql)..."
-  if ! append_hot_rows; then
-    echo "hot append failed via psql" >&2
-    KEEP_LOG=1
-    stop_proxistd
-    exit 1
+  if [[ "${HOT_ROWS}" -gt 0 ]]; then
+    echo "Appending hot dataset through proxistd (psql)..."
+    if ! append_hot_rows; then
+      echo "hot append failed via psql" >&2
+      KEEP_LOG=1
+      stop_proxistd
+      exit 1
+    fi
   fi
-
-  stop_proxistd
 }
 
 run_mode() {
   local name="$1"
-  local cutoff="$2"
-  echo "=== ${name} (cutoff ${cutoff}) ==="
-  if ! start_proxistd "${cutoff}" "false"; then
-    KEEP_LOG=1
-    exit 1
+  local hot_ratio="$2"
+  local hot_rows=$((WINDOW_ROWS * hot_ratio / 100))
+  local cutoff=$((WINDOW_END - hot_rows))
+  if [[ "${hot_rows}" -eq 0 ]]; then
+    cutoff="${WINDOW_END}"
   fi
+  echo "=== ${name} (hot ${hot_ratio}%, cutoff ${cutoff}) ==="
   bench_query "${name}"
   stop_proxistd
 }
 
-HOT_ONLY_CUTOFF=$((WINDOW_START - 1))
-COLD_ONLY_CUTOFF=$((WINDOW_END + 1))
-MIXED_CUTOFF=$((WINDOW_START + 1000))
+run_mode_with_setup() {
+  local name="$1"
+  local hot_ratio="$2"
+  WAL_DIR="$(mktemp -d)"
+  setup_dataset "${name}" "${hot_ratio}"
+  run_mode "${name}" "${hot_ratio}"
+  if [[ -n "${WAL_DIR}" ]]; then
+    rm -rf "${WAL_DIR}"
+  fi
+  WAL_DIR=""
+}
 
-setup_dataset
-run_mode "hot-only" "${HOT_ONLY_CUTOFF}"
-run_mode "cold-only" "${COLD_ONLY_CUTOFF}"
-run_mode "mixed" "${MIXED_CUTOFF}"
+run_mode_with_setup "hot-only" "100"
+run_mode_with_setup "cold-only" "0"
+run_mode_with_setup "mixed" "10"
 
-echo "Benchmarks complete. Persisted cutoff override: ${CUTOFF_MICROS} micros."
+echo "Benchmarks complete. Window rows: ${WINDOW_ROWS}, append batch size: ${HOT_BATCH_SIZE}."
