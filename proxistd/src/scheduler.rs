@@ -178,6 +178,24 @@ impl ProxistScheduler {
         }
     }
 
+    #[cfg(feature = "duckdb")]
+    pub fn clear_duckdb_table(&self, table: &str) -> anyhow::Result<()> {
+        let sanitized = table.replace('"', "");
+        unsafe {
+            let exec = DUCK_EXEC
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("duckdb connection not initialized"))?;
+            let sql = format!("DELETE FROM \"{}\"", sanitized);
+            let _ = exec.conn.execute(&sql, []);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "duckdb"))]
+    pub fn clear_duckdb_table(&self, _table: &str) -> anyhow::Result<()> {
+        anyhow::bail!("duckdb executor not enabled at compile time")
+    }
+
     async fn hot_covers_window(
         &self,
         tenant: &str,

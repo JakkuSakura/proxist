@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::cell::RefCell;
+
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use proxist_mem::{HotColumnStore, HotSymbolSummary, InMemoryHotColumnStore, MemConfig};
 use proxistd::scheduler::{ExecutorConfig, ProxistScheduler, SqlExecutor, TableConfig};
@@ -76,6 +78,13 @@ CREATE TABLE ticks (
             payload_col: "payload_base64".to_string(),
             filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
             seq_col: Some("seq".to_string()),
+            columns: vec![
+                "tenant".to_string(),
+                "symbol".to_string(),
+                "ts_micros".to_string(),
+                "payload_base64".to_string(),
+                "seq".to_string(),
+            ],
         },
     );
     scheduler.set_persisted_cutoff(Some(micros_to_system_time(cutoff_micros)));
@@ -125,17 +134,43 @@ fn bench_query_paths(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
 
     group.bench_function("hot_only", |b| {
+        let fixture = RefCell::new(build_fixture(999_999));
         b.iter_batched(
-            || build_fixture(999_999),
-            run_query,
+            || {
+                fixture
+                    .borrow()
+                    .scheduler
+                    .clear_duckdb_table("ticks")
+                    .expect("clear table");
+            },
+            |_| {
+                let fixture = fixture.borrow();
+                fixture
+                    .rt
+                    .block_on(fixture.scheduler.execute(&fixture.sql))
+                    .expect("query");
+            },
             BatchSize::SmallInput,
         );
     });
 
     group.bench_function("mixed_skip_cold", |b| {
+        let fixture = RefCell::new(build_fixture(1_100_000));
         b.iter_batched(
-            || build_fixture(1_100_000),
-            run_query,
+            || {
+                fixture
+                    .borrow()
+                    .scheduler
+                    .clear_duckdb_table("ticks")
+                    .expect("clear table");
+            },
+            |_| {
+                let fixture = fixture.borrow();
+                fixture
+                    .rt
+                    .block_on(fixture.scheduler.execute(&fixture.sql))
+                    .expect("query");
+            },
             BatchSize::SmallInput,
         );
     });
