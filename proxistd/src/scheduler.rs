@@ -8,18 +8,18 @@ use plan::{
     build_table_plan, parse_table_name_from_ddl, rewrite_with_bounds, strip_limit_offset,
     OrderItem, Predicate,
 };
-use proxist_core::{metadata::ClusterMetadata, query::QueryRange};
-use proxist_mem::HotColumnStore;
+use proxist_core::query::QueryRange;
+use proxist_mem::{HotColumnStore, HotSymbolSummary};
 #[cfg(feature = "duckdb")]
 use serde_json::Number as JsonNumber;
 use serde_json::{Map, Value as JsonValue};
 use sqlx::{Column, Row};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicI64, Ordering},
     Arc, Mutex,
 };
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
 #[cfg(feature = "postgres")]
@@ -90,7 +90,7 @@ pub struct ProxistScheduler {
     hot_store: Option<Arc<dyn HotColumnStore>>,
     tables: Arc<Mutex<HashMap<String, TableConfig>>>,
     persisted_cutoff_micros: AtomicI64,
-    cold_cache: Arc<RwLock<ColdCacheState>>,
+    hot_stats: Arc<RwLock<HashMap<(String, String), HotStats>>>,
 }
 
 impl ProxistScheduler {
@@ -118,7 +118,7 @@ impl ProxistScheduler {
             hot_store,
             tables: Arc::new(Mutex::new(HashMap::new())),
             persisted_cutoff_micros: AtomicI64::new(-1),
-            cold_cache: Arc::new(RwLock::new(ColdCacheState::default())),
+            hot_stats: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -144,86 +144,43 @@ impl ProxistScheduler {
         self.persisted_cutoff_micros.store(micros, Ordering::SeqCst);
     }
 
-    pub async fn refresh_cold_cache(
-        &self,
-        metadata: &ClusterMetadata,
-        window_micros: i64,
-        min_interval: Duration,
-    ) -> anyhow::Result<()> {
-        if window_micros <= 0 {
-            return Ok(());
+    pub async fn update_hot_stats(&self, stats: &[HotSymbolSummary]) {
+        let mut map = self.hot_stats.write().await;
+        map.clear();
+        for entry in stats {
+            map.insert(
+                (entry.tenant.clone(), entry.symbol.clone()),
+                HotStats {
+                    first_micros: entry.first_timestamp.map(system_time_to_micros),
+                    last_micros: entry.last_timestamp.map(system_time_to_micros),
+                },
+            );
         }
-        let Some(clickhouse) = &self.clickhouse else {
-            return Ok(());
-        };
-        let cutoff = self.persisted_cutoff_micros.load(Ordering::SeqCst);
-        if cutoff < 0 {
-            return Ok(());
-        }
-
-        {
-            let cache = self.cold_cache.read().await;
-            if cache.last_cutoff == cutoff {
-                if let Some(last) = cache.last_refresh {
-                    if last.elapsed() < min_interval {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        let range_end = cutoff;
-        let range_start = cutoff.saturating_sub(window_micros).saturating_add(1);
-        let tables = self.tables.lock().unwrap().clone();
-        let mut next_entries: HashMap<(String, String), ColdCacheEntry> = HashMap::new();
-
-        for (table, cfg) in tables {
-            if cfg.filter_cols.len() < 2 {
-                continue;
-            }
-            for (tenant, symbols) in &metadata.symbol_dictionaries {
-                if symbols.is_empty() {
-                    continue;
-                }
-
-                let entry_key = (table.clone(), tenant.clone());
-                let entry = next_entries
-                    .entry(entry_key)
-                    .or_insert_with(|| ColdCacheEntry::new(range_start, range_end));
-                entry.ensure_symbols(symbols);
-
-                for chunk in symbols.chunks(256) {
-                    let sql =
-                        build_cold_cache_query(&cfg, &table, tenant, chunk, range_start, range_end);
-                    let body = clickhouse.execute_raw(&sql).await?;
-                    let rows = parse_json_rows(&body)?;
-                    for row in rows {
-                        if let Some(flat) = json_row_to_hot_row(&row, &cfg) {
-                            entry.push_row(flat);
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut cache = self.cold_cache.write().await;
-        cache.entries = next_entries;
-        cache.last_cutoff = cutoff;
-        cache.last_refresh = Some(Instant::now());
-        Ok(())
     }
 
-    async fn cached_cold_rows(
+    async fn hot_covers_window(
         &self,
-        plan: &PlanAnalysis,
+        tenant: &str,
+        symbols: &[String],
         start: i64,
         end: i64,
-    ) -> Option<Vec<HotRowFlat>> {
-        let cache = self.cold_cache.read().await;
-        let entry = cache
-            .entries
-            .get(&(plan.select.table.clone(), plan.select.key0.clone()))?;
-        entry.extract_rows(&plan.select.key1_list, start, end)
+    ) -> bool {
+        let map = self.hot_stats.read().await;
+        for sym in symbols {
+            let Some(stats) = map.get(&(tenant.to_string(), sym.clone())) else {
+                return false;
+            };
+            let Some(first) = stats.first_micros else {
+                return false;
+            };
+            let Some(last) = stats.last_micros else {
+                return false;
+            };
+            if first > start || last < end {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -266,21 +223,24 @@ impl SqlExecutor for ProxistScheduler {
                             if cutoff >= 0 {
                                 let start_u = system_time_to_micros(plan.select.start);
                                 let end_u = system_time_to_micros(plan.select.end);
+                                let mut need_cold = start_u <= cutoff;
 
-                                if start_u <= cutoff {
+                                if need_cold
+                                    && self
+                                        .hot_covers_window(
+                                            &plan.select.key0,
+                                            &plan.select.key1_list,
+                                            start_u,
+                                            end_u,
+                                        )
+                                        .await
+                                {
+                                    need_cold = false;
+                                }
+
+                                if need_cold && start_u <= cutoff {
                                     let cold_end = cutoff.min(end_u);
-                                    if let Some(cached) =
-                                        self.cached_cold_rows(&plan, start_u, cold_end).await
-                                    {
-                                        if !cached.is_empty() {
-                                            cold_rows = duck.load_table_and_execute(
-                                                &plan.cfg,
-                                                &plan.select.table,
-                                                &cached,
-                                                &hot_sql,
-                                            )?;
-                                        }
-                                    } else if let Some(cold_sql) = rewrite_with_bounds(
+                                    if let Some(cold_sql) = rewrite_with_bounds(
                                         sql,
                                         &plan.cfg.order_col,
                                         Some(start_u),
@@ -298,11 +258,15 @@ impl SqlExecutor for ProxistScheduler {
                                     }
                                 }
 
-                                if !plan_failed && end_u > cutoff {
-                                    let hot_lo = if start_u > cutoff {
-                                        start_u
+                                if !plan_failed && (end_u > cutoff || !need_cold) {
+                                    let hot_lo = if need_cold {
+                                        if start_u > cutoff {
+                                            start_u
+                                        } else {
+                                            cutoff + 1
+                                        }
                                     } else {
-                                        cutoff + 1
+                                        start_u
                                     };
                                     let mut select = plan.select.clone();
                                     select.start = micros_to_system_time(hot_lo);
@@ -652,69 +616,10 @@ struct PlanAnalysis {
     limit: Option<usize>,
 }
 
-#[derive(Default, Clone)]
-struct ColdCacheState {
-    entries: HashMap<(String, String), ColdCacheEntry>,
-    last_refresh: Option<Instant>,
-    last_cutoff: i64,
-}
-
-#[derive(Clone)]
-struct ColdCacheEntry {
-    range_start: i64,
-    range_end: i64,
-    symbols: HashSet<String>,
-    rows_by_symbol: HashMap<String, Vec<HotRowFlat>>,
-}
-
-impl ColdCacheEntry {
-    fn new(range_start: i64, range_end: i64) -> Self {
-        Self {
-            range_start,
-            range_end,
-            symbols: HashSet::new(),
-            rows_by_symbol: HashMap::new(),
-        }
-    }
-
-    fn ensure_symbols(&mut self, symbols: &[String]) {
-        for sym in symbols {
-            self.symbols.insert(sym.clone());
-            self.rows_by_symbol.entry(sym.clone()).or_default();
-        }
-    }
-
-    fn push_row(&mut self, row: HotRowFlat) {
-        self.rows_by_symbol.entry(row.k1.clone()).or_default().push(row);
-    }
-
-    fn extract_rows(
-        &self,
-        symbols: &[String],
-        start: i64,
-        end: i64,
-    ) -> Option<Vec<HotRowFlat>> {
-        if start < self.range_start || end > self.range_end {
-            return None;
-        }
-        for sym in symbols {
-            if !self.symbols.contains(sym) {
-                return None;
-            }
-        }
-
-        let mut out = Vec::new();
-        for sym in symbols {
-            if let Some(rows) = self.rows_by_symbol.get(sym) {
-                for row in rows {
-                    if row.ord_micros >= start && row.ord_micros <= end {
-                        out.push(row.clone());
-                    }
-                }
-            }
-        }
-        Some(out)
-    }
+#[derive(Clone, Copy, Debug)]
+struct HotStats {
+    first_micros: Option<i64>,
+    last_micros: Option<i64>,
 }
 
 fn analyze_select(sql: &str, tables: &HashMap<String, TableConfig>) -> Option<PlanAnalysis> {
@@ -859,91 +764,6 @@ fn parse_json_rows(text: &str) -> anyhow::Result<Vec<JsonValue>> {
     Ok(rows)
 }
 
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-fn build_cold_cache_query(
-    cfg: &TableConfig,
-    table: &str,
-    tenant: &str,
-    symbols: &[String],
-    start: i64,
-    end: i64,
-) -> String {
-    let filter0 = cfg.filter_cols[0].as_str();
-    let filter1 = cfg.filter_cols[1].as_str();
-    let order_col = cfg.order_col.as_str();
-    let payload_col = cfg.payload_col.as_str();
-    let seq_col = cfg.seq_col.as_deref();
-
-    let symbol_list = symbols
-        .iter()
-        .map(|sym| format!("'{}'", escape_sql_string(sym)))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let seq_select = seq_col
-        .map(|col| format!(", {} AS seq", col))
-        .unwrap_or_default();
-
-    format!(
-        "SELECT {filter0} AS k0, {filter1} AS k1, {order_col} AS ord_micros, \
-         {payload_col} AS payload_base64{seq_select} \
-         FROM {table} \
-         WHERE {filter0} = '{tenant}' AND {filter1} IN ({symbols}) \
-         AND {order_col} BETWEEN {start} AND {end} \
-         ORDER BY {order_col} ASC \
-         FORMAT JSONEachRow",
-        filter0 = filter0,
-        filter1 = filter1,
-        order_col = order_col,
-        payload_col = payload_col,
-        seq_select = seq_select,
-        table = table,
-        tenant = escape_sql_string(tenant),
-        symbols = symbol_list,
-        start = start,
-        end = end
-    )
-}
-
-fn json_value_to_string(value: &JsonValue) -> Option<String> {
-    match value {
-        JsonValue::String(s) => Some(s.clone()),
-        JsonValue::Number(n) => Some(n.to_string()),
-        JsonValue::Bool(b) => Some(b.to_string()),
-        _ => None,
-    }
-}
-
-fn json_value_to_i64(value: &JsonValue) -> Option<i64> {
-    match value {
-        JsonValue::Number(n) => n.as_i64().or_else(|| n.as_u64().map(|v| v as i64)),
-        JsonValue::String(s) => s.parse::<i64>().ok(),
-        _ => None,
-    }
-}
-
-fn json_row_to_hot_row(row: &JsonValue, cfg: &TableConfig) -> Option<HotRowFlat> {
-    let obj = row.as_object()?;
-    let k0 = json_value_to_string(obj.get("k0")?)?;
-    let k1 = json_value_to_string(obj.get("k1")?)?;
-    let ord_micros = json_value_to_i64(obj.get("ord_micros")?)?;
-    let payload = json_value_to_string(obj.get("payload_base64")?)?;
-    let seq = match cfg.seq_col {
-        Some(_) => json_value_to_i64(obj.get("seq")?).unwrap_or(0),
-        None => 0,
-    };
-
-    Some(HotRowFlat {
-        k0,
-        k1,
-        ord_micros,
-        payload_base64: payload,
-        seq,
-    })
-}
 
 fn merge_rows(
     mut cold: Vec<JsonValue>,
@@ -1137,33 +957,46 @@ mod scheduler_tests {
         ));
     }
 
-    #[test]
-    fn cold_cache_entry_filters_rows_by_range() {
-        let mut entry = ColdCacheEntry::new(100, 200);
-        entry.ensure_symbols(&vec!["SYM1".to_string(), "SYM2".to_string()]);
-        entry.push_row(HotRowFlat {
-            k0: "alpha".to_string(),
-            k1: "SYM1".to_string(),
-            ord_micros: 120,
-            payload_base64: "AA==".to_string(),
-            seq: 1,
-        });
-        entry.push_row(HotRowFlat {
-            k0: "alpha".to_string(),
-            k1: "SYM2".to_string(),
-            ord_micros: 180,
-            payload_base64: "AQ==".to_string(),
-            seq: 2,
-        });
+    #[tokio::test]
+    async fn hot_stats_cover_window() {
+        let scheduler = ProxistScheduler {
+            sqlite: None,
+            clickhouse: None,
+            duckdb: None,
+            postgres: None,
+            hot_store: None,
+            tables: Arc::new(Mutex::new(HashMap::new())),
+            persisted_cutoff_micros: AtomicI64::new(-1),
+            hot_stats: Arc::new(RwLock::new(HashMap::new())),
+        };
 
-        let rows = entry
-            .extract_rows(&vec!["SYM1".to_string()], 110, 150)
-            .expect("range covered");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].k1, "SYM1");
+        let stats = vec![
+            HotSymbolSummary {
+                tenant: "alpha".to_string(),
+                symbol: "SYM1".to_string(),
+                rows: 10,
+                first_timestamp: Some(micros_to_system_time(100)),
+                last_timestamp: Some(micros_to_system_time(200)),
+            },
+            HotSymbolSummary {
+                tenant: "alpha".to_string(),
+                symbol: "SYM2".to_string(),
+                rows: 10,
+                first_timestamp: Some(micros_to_system_time(100)),
+                last_timestamp: Some(micros_to_system_time(200)),
+            },
+        ];
 
-        assert!(entry
-            .extract_rows(&vec!["SYM3".to_string()], 110, 150)
-            .is_none());
+        scheduler.update_hot_stats(&stats).await;
+
+        assert!(scheduler
+            .hot_covers_window("alpha", &vec!["SYM1".to_string()], 120, 180)
+            .await);
+        assert!(!scheduler
+            .hot_covers_window("alpha", &vec!["SYM1".to_string()], 90, 180)
+            .await);
+        assert!(!scheduler
+            .hot_covers_window("alpha", &vec!["SYM3".to_string()], 120, 180)
+            .await);
     }
 }
