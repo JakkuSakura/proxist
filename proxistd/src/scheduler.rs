@@ -1,4 +1,4 @@
-use crate::clickhouse::ClickhouseHttpClient;
+use crate::clickhouse::{ClickhouseHttpClient, ClickhouseNativeClient};
 use crate::metadata_sqlite::SqliteMetadataStore;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -67,6 +67,22 @@ pub enum SqlResult {
     Clickhouse(ClickhouseWire),
     Text(String),
     Rows(Vec<Map<String, JsonValue>>),
+    TypedRows(RowSet),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarValue {
+    Null,
+    String(String),
+    Int64(i64),
+    Float64(f64),
+    Bool(bool),
+}
+
+#[derive(Debug, Clone)]
+pub struct RowSet {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<ScalarValue>>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +97,7 @@ pub struct TableConfig {
 pub struct ProxistScheduler {
     sqlite: Option<SqliteExecutor>,
     clickhouse: Option<ClickhouseHttpClient>,
+    clickhouse_native: Option<ClickhouseNativeClient>,
     postgres: Option<PostgresExecutor>,
     hot_store: Option<Arc<dyn HotColumnStore>>,
     tables: Arc<Mutex<HashMap<String, TableConfig>>>,
@@ -92,6 +109,7 @@ impl ProxistScheduler {
     pub async fn new(
         cfg: ExecutorConfig,
         clickhouse: Option<ClickhouseHttpClient>,
+        clickhouse_native: Option<ClickhouseNativeClient>,
         hot_store: Option<Arc<dyn HotColumnStore>>,
     ) -> anyhow::Result<Self> {
         let sqlite = match cfg.sqlite_path {
@@ -107,6 +125,7 @@ impl ProxistScheduler {
         Ok(Self {
             sqlite,
             clickhouse,
+            clickhouse_native,
             postgres,
             hot_store,
             tables: Arc::new(Mutex::new(HashMap::new())),
@@ -226,8 +245,8 @@ impl SqlExecutor for ProxistScheduler {
                             .map(|limit| limit.saturating_add(plan.offset.unwrap_or(0)));
 
                         let cutoff = self.persisted_cutoff_micros.load(Ordering::SeqCst);
-                        let mut cold_rows = Vec::new();
-                        let mut hot_rows = Vec::new();
+                        let mut cold_rows: Option<RowSet> = None;
+                        let mut hot_rows: Option<RowSet> = None;
                         let mut plan_failed = false;
 
                         if cutoff >= 0 {
@@ -257,24 +276,51 @@ impl SqlExecutor for ProxistScheduler {
                                     Some(cold_end),
                                     limit_hint,
                                 ) {
-                                    if let Some(ch) = &self.clickhouse {
-                                        match requested_format {
-                                            ClickhouseWireFormat::JsonEachRow => {
+                                    let columns = expected_columns(&plan);
+                                    match requested_format {
+                                        ClickhouseWireFormat::JsonEachRow => {
+                                            if let Some(ch) = &self.clickhouse {
                                                 let cold_sql = ensure_jsoneachrow(&cold_sql);
                                                 let text = ch.execute_raw(&cold_sql).await?;
-                                                cold_rows = parse_json_rows(&text)?;
-                                            }
-                                            ClickhouseWireFormat::Other => {
+                                                cold_rows = Some(parse_json_rows(&text, &columns)?);
+                                            } else {
                                                 plan_failed = true;
                                             }
-                                            ClickhouseWireFormat::Unknown => {
+                                        }
+                                        ClickhouseWireFormat::Other => {
+                                            plan_failed = true;
+                                        }
+                                        ClickhouseWireFormat::Unknown => {
+                                            if let Some(native) = &self.clickhouse_native {
+                                                match native.query_rowset(&cold_sql).await {
+                                                    Ok(rowset) => {
+                                                        cold_rows = Some(align_rowset_columns(
+                                                            rowset, &columns,
+                                                        )?);
+                                                    }
+                                                    Err(_) => {
+                                                        if let Some(ch) = &self.clickhouse {
+                                                            let cold_sql =
+                                                                ensure_csv_with_names(&cold_sql);
+                                                            let text =
+                                                                ch.execute_raw(&cold_sql).await?;
+                                                            cold_rows = Some(parse_csv_rows(
+                                                                &text, &columns,
+                                                            )?);
+                                                        } else {
+                                                            plan_failed = true;
+                                                        }
+                                                    }
+                                                }
+                                            } else if let Some(ch) = &self.clickhouse {
                                                 let cold_sql = ensure_csv_with_names(&cold_sql);
                                                 let text = ch.execute_raw(&cold_sql).await?;
-                                                cold_rows = parse_csv_rows(&text)?;
+                                                cold_rows =
+                                                    Some(parse_csv_rows(&text, &columns)?);
+                                            } else {
+                                                plan_failed = true;
                                             }
                                         }
-                                    } else {
-                                        plan_failed = true;
                                     }
                                 } else {
                                     plan_failed = true;
@@ -295,20 +341,20 @@ impl SqlExecutor for ProxistScheduler {
                                 select.start = micros_to_system_time(hot_lo);
                                 let rows = load_hot_rows(hot, &select).await?;
                                 if !rows.is_empty() {
-                                    hot_rows = project_hot_rows(rows, &plan);
+                                    hot_rows = Some(project_hot_rows(rows, &plan));
                                 }
                             }
                         } else {
                             let rows = load_hot_rows(hot, &plan.select).await?;
                             if !rows.is_empty() {
-                                hot_rows = project_hot_rows(rows, &plan);
+                                hot_rows = Some(project_hot_rows(rows, &plan));
                             }
                         }
 
-                        if !plan_failed && (!cold_rows.is_empty() || !hot_rows.is_empty()) {
+                        if !plan_failed && (cold_rows.is_some() || hot_rows.is_some()) {
                             let merged = merge_rows(cold_rows, hot_rows, &plan)?;
                             let sliced = apply_offset_limit(merged, plan.offset, plan.limit);
-                            return Ok(SqlResult::Rows(sliced));
+                            return Ok(SqlResult::TypedRows(sliced));
                         }
                     }
                 }
@@ -606,28 +652,39 @@ fn micros_to_system_time(micros: i64) -> SystemTime {
     }
 }
 
-fn parse_csv_rows(text: &str) -> anyhow::Result<Vec<Map<String, JsonValue>>> {
+fn parse_csv_rows(text: &str, columns: &[String]) -> anyhow::Result<RowSet> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .from_reader(text.as_bytes());
     let headers = reader
         .headers()
         .map(|h| h.iter().map(|v| v.to_string()).collect::<Vec<_>>())?;
+    let mut positions = Vec::with_capacity(columns.len());
+    for col in columns {
+        let idx = headers
+            .iter()
+            .position(|h| h.eq_ignore_ascii_case(col));
+        positions.push(idx);
+    }
     let mut rows = Vec::new();
     for record in reader.records() {
         let record = record?;
-        let mut map = Map::new();
-        for (idx, col) in headers.iter().enumerate() {
-            let value = record.get(idx).unwrap_or("");
-            let json_value = parse_scalar_value(value);
-            map.insert(col.clone(), json_value);
+        let mut row = Vec::with_capacity(columns.len());
+        for idx in &positions {
+            let value = idx
+                .and_then(|pos| record.get(pos))
+                .unwrap_or("");
+            row.push(parse_scalar_value(value));
         }
-        rows.push(map);
+        rows.push(row);
     }
-    Ok(rows)
+    Ok(RowSet {
+        columns: columns.to_vec(),
+        rows,
+    })
 }
 
-fn parse_json_rows(text: &str) -> anyhow::Result<Vec<Map<String, JsonValue>>> {
+fn parse_json_rows(text: &str, columns: &[String]) -> anyhow::Result<RowSet> {
     let mut rows = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
@@ -636,28 +693,71 @@ fn parse_json_rows(text: &str) -> anyhow::Result<Vec<Map<String, JsonValue>>> {
         }
         let value: JsonValue = serde_json::from_str(trimmed)?;
         match value {
-            JsonValue::Object(map) => rows.push(map),
+            JsonValue::Object(map) => {
+                let mut row = Vec::with_capacity(columns.len());
+                for col in columns {
+                    let value = map.get(col).cloned().unwrap_or(JsonValue::Null);
+                    row.push(json_to_scalar(value));
+                }
+                rows.push(row);
+            }
             other => {
-                let mut map = Map::new();
-                map.insert("value".to_string(), other);
-                rows.push(map);
+                let mut row = Vec::with_capacity(columns.len());
+                if columns.len() == 1 {
+                    row.push(json_to_scalar(other));
+                } else {
+                    row.resize(columns.len(), ScalarValue::Null);
+                }
+                rows.push(row);
             }
         }
     }
-    Ok(rows)
+    Ok(RowSet {
+        columns: columns.to_vec(),
+        rows,
+    })
 }
 
-fn parse_scalar_value(value: &str) -> JsonValue {
+fn parse_scalar_value(value: &str) -> ScalarValue {
     if value.is_empty() {
-        return JsonValue::Null;
+        return ScalarValue::Null;
     }
     if let Ok(num) = value.parse::<i64>() {
-        return JsonValue::Number(num.into());
+        return ScalarValue::Int64(num);
     }
-    JsonValue::String(value.to_string())
+    if let Ok(num) = value.parse::<f64>() {
+        return ScalarValue::Float64(num);
+    }
+    if value.eq_ignore_ascii_case("true") {
+        return ScalarValue::Bool(true);
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return ScalarValue::Bool(false);
+    }
+    ScalarValue::String(value.to_string())
 }
 
-fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> Vec<Map<String, JsonValue>> {
+fn json_to_scalar(value: JsonValue) -> ScalarValue {
+    match value {
+        JsonValue::Null => ScalarValue::Null,
+        JsonValue::Bool(v) => ScalarValue::Bool(v),
+        JsonValue::Number(v) => {
+            if let Some(num) = v.as_i64() {
+                ScalarValue::Int64(num)
+            } else if let Some(num) = v.as_f64() {
+                ScalarValue::Float64(num)
+            } else {
+                ScalarValue::Null
+            }
+        }
+        JsonValue::String(v) => ScalarValue::String(v),
+        JsonValue::Array(_) | JsonValue::Object(_) => {
+            ScalarValue::String(value.to_string())
+        }
+    }
+}
+
+fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> RowSet {
     let mut rows = rows;
     if let Some(order) = plan.order_by.first() {
         let descending = order.descending;
@@ -693,40 +793,108 @@ fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> Vec<Map<Strin
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut map = Map::new();
+        let mut row_values = Vec::with_capacity(columns.len());
         for col in &columns {
             let value = if *col == filter0 {
-                JsonValue::String(row.k0.clone())
+                ScalarValue::String(row.k0.clone())
             } else if *col == filter1 {
-                JsonValue::String(row.k1.clone())
+                ScalarValue::String(row.k1.clone())
             } else if *col == order_col {
-                JsonValue::Number(row.ord_micros.into())
+                ScalarValue::Int64(row.ord_micros)
             } else if *col == payload_col {
-                JsonValue::String(row.payload_base64.clone())
+                ScalarValue::String(row.payload_base64.clone())
             } else if seq_col.as_ref().map(|s| s == col).unwrap_or(false) {
-                JsonValue::Number(row.seq.into())
+                ScalarValue::Int64(row.seq)
             } else {
-                JsonValue::Null
+                ScalarValue::Null
             };
-            map.insert(col.clone(), value);
+            row_values.push(value);
         }
-        out.push(map);
+        out.push(row_values);
     }
-    out
+    RowSet {
+        columns,
+        rows: out,
+    }
+}
+
+fn expected_columns(plan: &PlanAnalysis) -> Vec<String> {
+    if plan.has_wildcard || plan.select_cols.is_empty() {
+        plan.cfg.columns.clone()
+    } else {
+        plan.select_cols.clone()
+    }
+}
+
+fn align_rowset_columns(mut rowset: RowSet, columns: &[String]) -> anyhow::Result<RowSet> {
+    if rowset.columns.is_empty() {
+        rowset.columns = columns.to_vec();
+        return Ok(rowset);
+    }
+    if rowset.columns == columns {
+        return Ok(rowset);
+    }
+    let mut indices = Vec::with_capacity(columns.len());
+    for col in columns {
+        let idx = rowset
+            .columns
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(col));
+        indices.push(idx);
+    }
+    let mut rows = Vec::with_capacity(rowset.rows.len());
+    for row in rowset.rows.into_iter() {
+        let mut aligned = Vec::with_capacity(columns.len());
+        for idx in &indices {
+            let value = idx
+                .and_then(|pos| row.get(pos).cloned())
+                .unwrap_or(ScalarValue::Null);
+            aligned.push(value);
+        }
+        rows.push(aligned);
+    }
+    Ok(RowSet {
+        columns: columns.to_vec(),
+        rows,
+    })
 }
 
 fn merge_rows(
-    mut cold: Vec<Map<String, JsonValue>>,
-    mut hot: Vec<Map<String, JsonValue>>,
+    cold: Option<RowSet>,
+    hot: Option<RowSet>,
     plan: &PlanAnalysis,
-) -> anyhow::Result<Vec<Map<String, JsonValue>>> {
+) -> anyhow::Result<RowSet> {
+    let expected = expected_columns(plan);
+    let mut cold = cold.unwrap_or_else(|| RowSet {
+        columns: expected.clone(),
+        rows: Vec::new(),
+    });
+    let mut hot = hot.unwrap_or_else(|| RowSet {
+        columns: expected.clone(),
+        rows: Vec::new(),
+    });
+
+    if cold.columns.is_empty() {
+        cold.columns = expected.clone();
+    }
+    if hot.columns.is_empty() {
+        hot.columns = expected.clone();
+    }
+    if cold.columns != hot.columns {
+        anyhow::bail!("hot/cold column mismatch");
+    }
+
     if let Some(order) = plan.order_by.first() {
         let descending = order.descending;
-        let column = &plan.cfg.order_col;
+        let order_idx = cold
+            .columns
+            .iter()
+            .position(|col| col == &plan.cfg.order_col)
+            .ok_or_else(|| anyhow!("missing order column in result set"))?;
 
-        cold.sort_by(|a, b| {
-            let ka = extract_order_key(a, column).unwrap_or_default();
-            let kb = extract_order_key(b, column).unwrap_or_default();
+        cold.rows.sort_by(|a, b| {
+            let ka = extract_order_key(a, order_idx).unwrap_or_default();
+            let kb = extract_order_key(b, order_idx).unwrap_or_default();
             if descending {
                 kb.cmp(&ka)
             } else {
@@ -734,9 +902,9 @@ fn merge_rows(
             }
         });
 
-        hot.sort_by(|a, b| {
-            let ka = extract_order_key(a, column).unwrap_or_default();
-            let kb = extract_order_key(b, column).unwrap_or_default();
+        hot.rows.sort_by(|a, b| {
+            let ka = extract_order_key(a, order_idx).unwrap_or_default();
+            let kb = extract_order_key(b, order_idx).unwrap_or_default();
             if descending {
                 kb.cmp(&ka)
             } else {
@@ -744,53 +912,58 @@ fn merge_rows(
             }
         });
 
-        let mut merged = Vec::with_capacity(cold.len() + hot.len());
+        let mut merged = Vec::with_capacity(cold.rows.len() + hot.rows.len());
         let mut i = 0;
         let mut j = 0;
-        while i < cold.len() && j < hot.len() {
-            let kc = extract_order_key(&cold[i], column)?;
-            let kh = extract_order_key(&hot[j], column)?;
+        while i < cold.rows.len() && j < hot.rows.len() {
+            let kc = extract_order_key(&cold.rows[i], order_idx)?;
+            let kh = extract_order_key(&hot.rows[j], order_idx)?;
             let take_cold = if descending { kc >= kh } else { kc <= kh };
             if take_cold {
-                merged.push(cold[i].clone());
+                merged.push(cold.rows[i].clone());
                 i += 1;
             } else {
-                merged.push(hot[j].clone());
+                merged.push(hot.rows[j].clone());
                 j += 1;
             }
         }
-        merged.extend_from_slice(&cold[i..]);
-        merged.extend_from_slice(&hot[j..]);
-        Ok(merged)
+        merged.extend_from_slice(&cold.rows[i..]);
+        merged.extend_from_slice(&hot.rows[j..]);
+        Ok(RowSet {
+            columns: cold.columns,
+            rows: merged,
+        })
     } else {
-        cold.extend(hot.into_iter());
-        Ok(cold)
+        let mut merged = cold.rows;
+        merged.extend(hot.rows.into_iter());
+        Ok(RowSet {
+            columns: cold.columns,
+            rows: merged,
+        })
     }
 }
 
-fn apply_offset_limit(
-    rows: Vec<Map<String, JsonValue>>,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> Vec<Map<String, JsonValue>> {
-    let iter = rows.into_iter().skip(offset.unwrap_or(0));
-    if let Some(limit) = limit {
+fn apply_offset_limit(rows: RowSet, offset: Option<usize>, limit: Option<usize>) -> RowSet {
+    let iter = rows.rows.into_iter().skip(offset.unwrap_or(0));
+    let sliced = if let Some(limit) = limit {
         iter.take(limit).collect()
     } else {
         iter.collect()
+    };
+    RowSet {
+        columns: rows.columns,
+        rows: sliced,
     }
 }
 
-fn extract_order_key(row: &Map<String, JsonValue>, column: &str) -> anyhow::Result<i64> {
+fn extract_order_key(row: &[ScalarValue], index: usize) -> anyhow::Result<i64> {
     let value = row
-        .get(column)
-        .ok_or_else(|| anyhow!("missing order column {} in result row", column))?;
+        .get(index)
+        .ok_or_else(|| anyhow!("missing order column in result row"))?;
     match value {
-        JsonValue::Number(num) => num
-            .as_i64()
-            .or_else(|| num.as_f64().map(|f| f as i64))
-            .ok_or_else(|| anyhow!("unable to interpret numeric order column")),
-        JsonValue::String(s) => s
+        ScalarValue::Int64(v) => Ok(*v),
+        ScalarValue::Float64(v) => Ok(*v as i64),
+        ScalarValue::String(s) => s
             .parse::<i64>()
             .map_err(|_| anyhow!("unable to parse order column value as integer")),
         _ => Err(anyhow!("unsupported order column type")),
@@ -942,6 +1115,7 @@ mod scheduler_tests {
         let scheduler = ProxistScheduler {
             sqlite: None,
             clickhouse: None,
+            clickhouse_native: None,
             postgres: None,
             hot_store: None,
             tables: Arc::new(Mutex::new(HashMap::new())),
@@ -1036,28 +1210,24 @@ mod scheduler_tests {
         ];
 
         let projected = project_hot_rows(rows, &plan);
-        assert_eq!(projected.len(), 2);
-        let first = &projected[0];
+        assert_eq!(projected.rows.len(), 2);
         assert_eq!(
-            first.get("symbol"),
-            Some(&JsonValue::String("SYM1".to_string()))
+            projected.columns,
+            vec!["symbol".to_string(), "ts_micros".to_string()]
         );
-        assert_eq!(first.get("ts_micros"), Some(&JsonValue::Number(1.into())));
-        assert_eq!(first.len(), 2);
+        let first = &projected.rows[0];
+        assert_eq!(first[0], ScalarValue::String("SYM1".to_string()));
+        assert_eq!(first[1], ScalarValue::Int64(1));
     }
 
     #[test]
     fn parse_csv_rows_with_names() {
         let input = "symbol,ts_micros\nSYM1,42\nSYM2,43\n";
-        let rows = parse_csv_rows(input).expect("parse csv");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].get("symbol"),
-            Some(&JsonValue::String("SYM1".to_string()))
-        );
-        assert_eq!(
-            rows[0].get("ts_micros"),
-            Some(&JsonValue::Number(42.into()))
-        );
+        let columns = vec!["symbol".to_string(), "ts_micros".to_string()];
+        let rows = parse_csv_rows(input, &columns).expect("parse csv");
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.columns, columns);
+        assert_eq!(rows.rows[0][0], ScalarValue::String("SYM1".to_string()));
+        assert_eq!(rows.rows[0][1], ScalarValue::Int64(42));
     }
 }

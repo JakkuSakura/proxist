@@ -10,6 +10,7 @@ END_MICROS="${PROXIST_BENCH_END_MICROS:-1704103205000000}"
 PROXIST_PG_PORT="${PROXIST_PG_PORT:-15432}"
 PROXIST_PG_ADDR="127.0.0.1:${PROXIST_PG_PORT}"
 PROXIST_PG_USER="${PROXIST_PG_USER:-postgres}"
+PROXIST_CLICKHOUSE_NATIVE_URL="${PROXIST_CLICKHOUSE_NATIVE_URL:-tcp://127.0.0.1:19000/proxist}"
 TOTAL_ROWS="${PROXIST_BENCH_TOTAL_ROWS:-20000000}"
 if [[ "${TOTAL_ROWS}" -le 0 ]]; then
   echo "TOTAL_ROWS must be > 0" >&2
@@ -114,11 +115,12 @@ start_proxistd() {
     PROXIST_CLICKHOUSE_ENDPOINT="http://127.0.0.1:18123" \
     PROXIST_CLICKHOUSE_DATABASE="proxist" \
     PROXIST_CLICKHOUSE_TABLE="ticks" \
+    PROXIST_CLICKHOUSE_NATIVE_URL="${PROXIST_CLICKHOUSE_NATIVE_URL}" \
     PROXIST_WAL_DIR="${WAL_DIR}" \
     PROXIST_WAL_REPLAY_PERSIST="${replay_persist}" \
     PROXIST_PERSISTED_CUTOFF_OVERRIDE_MICROS="${cutoff}" \
     RUST_LOG="debug" \
-    cargo run --quiet --release --bin proxistd
+    cargo run --quiet --release --bin proxistd --features clickhouse-native
   ) >"${PROXIST_LOG}" 2>&1 &
   PROXIST_PID=$!
 

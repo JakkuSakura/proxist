@@ -53,6 +53,7 @@ fn build_fixture(cutoff_micros: i64) -> Fixture {
                 pg_url: None,
             },
             None,
+            None,
             Some(hot_store),
         ))
         .expect("scheduler");

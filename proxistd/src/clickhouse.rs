@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::debug;
 
+#[cfg(feature = "clickhouse-native")]
+use clickhouse_rs::types::{Block, Complex, SqlType};
+#[cfg(feature = "clickhouse-native")]
+use clickhouse_rs::Pool;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClickhouseConfig {
     pub endpoint: String,
@@ -200,12 +205,184 @@ pub struct ClickhouseHttpClient {
     config: ClickhouseConfig,
 }
 
+#[derive(Clone)]
+pub struct ClickhouseNativeClient {
+    #[cfg(feature = "clickhouse-native")]
+    pool: Pool,
+}
+
+impl ClickhouseNativeClient {
+    pub fn new(url: &str) -> anyhow::Result<Self> {
+        #[cfg(feature = "clickhouse-native")]
+        {
+            Ok(Self {
+                pool: Pool::new(url),
+            })
+        }
+        #[cfg(not(feature = "clickhouse-native"))]
+        {
+            let _ = url;
+            anyhow::bail!("clickhouse-native feature not enabled");
+        }
+    }
+
+    pub async fn query_rowset(
+        &self,
+        sql: &str,
+    ) -> anyhow::Result<crate::scheduler::RowSet> {
+        #[cfg(feature = "clickhouse-native")]
+        {
+            let mut handle = self.pool.get_handle().await?;
+            let block = handle.query(sql).fetch_all().await?;
+            block_to_rowset(&block)
+        }
+        #[cfg(not(feature = "clickhouse-native"))]
+        {
+            let _ = sql;
+            anyhow::bail!("clickhouse-native feature not enabled");
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClickhouseQueryRow {
     pub symbol: String,
     #[serde(deserialize_with = "deserialize_i64_any")]
     pub ts_micros: i64,
     pub payload_base64: String,
+}
+
+#[cfg(feature = "clickhouse-native")]
+fn block_to_rowset(block: &Block<Complex>) -> anyhow::Result<crate::scheduler::RowSet> {
+    let columns = block
+        .columns()
+        .iter()
+        .map(|col| col.name().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut column_values = Vec::with_capacity(block.columns().len());
+    for col in block.columns() {
+        column_values.push(column_to_values(col)?);
+    }
+
+    let row_count = block.row_count();
+    let mut rows = Vec::with_capacity(row_count);
+    for row_idx in 0..row_count {
+        let mut row = Vec::with_capacity(columns.len());
+        for col in &column_values {
+            row.push(col[row_idx].clone());
+        }
+        rows.push(row);
+    }
+    Ok(crate::scheduler::RowSet { columns, rows })
+}
+
+#[cfg(feature = "clickhouse-native")]
+fn column_to_values(
+    column: &clickhouse_rs::types::Column<Complex>,
+) -> anyhow::Result<Vec<crate::scheduler::ScalarValue>> {
+    use crate::scheduler::ScalarValue;
+    match column.sql_type() {
+        SqlType::String | SqlType::FixedString(_) => {
+            let iter = column.iter::<&[u8]>()?;
+            Ok(iter
+                .map(|v| ScalarValue::String(String::from_utf8_lossy(v).to_string()))
+                .collect())
+        }
+        SqlType::Int64 => {
+            let iter = column.iter::<i64>()?;
+            Ok(iter.map(|v| ScalarValue::Int64(*v)).collect())
+        }
+        SqlType::Int32 => {
+            let iter = column.iter::<i32>()?;
+            Ok(iter.map(|v| ScalarValue::Int64(i64::from(*v))).collect())
+        }
+        SqlType::Int16 => {
+            let iter = column.iter::<i16>()?;
+            Ok(iter.map(|v| ScalarValue::Int64(i64::from(*v))).collect())
+        }
+        SqlType::Int8 => {
+            let iter = column.iter::<i8>()?;
+            Ok(iter.map(|v| ScalarValue::Int64(i64::from(*v))).collect())
+        }
+        SqlType::UInt64 => {
+            let iter = column.iter::<u64>()?;
+            Ok(iter
+                .map(|v| {
+                    i64::try_from(*v)
+                        .map(ScalarValue::Int64)
+                        .unwrap_or_else(|_| ScalarValue::String(v.to_string()))
+                })
+                .collect())
+        }
+        SqlType::UInt32 => {
+            let iter = column.iter::<u32>()?;
+            Ok(iter.map(|v| ScalarValue::Int64(i64::from(*v))).collect())
+        }
+        SqlType::UInt16 => {
+            let iter = column.iter::<u16>()?;
+            Ok(iter.map(|v| ScalarValue::Int64(i64::from(*v))).collect())
+        }
+        SqlType::UInt8 => {
+            let iter = column.iter::<u8>()?;
+            Ok(iter.map(|v| ScalarValue::Int64(i64::from(*v))).collect())
+        }
+        SqlType::Float64 => {
+            let iter = column.iter::<f64>()?;
+            Ok(iter.map(|v| ScalarValue::Float64(*v)).collect())
+        }
+        SqlType::Float32 => {
+            let iter = column.iter::<f32>()?;
+            Ok(iter.map(|v| ScalarValue::Float64(f64::from(*v))).collect())
+        }
+        SqlType::Bool => {
+            let iter = column.iter::<bool>()?;
+            Ok(iter.map(|v| ScalarValue::Bool(*v)).collect())
+        }
+        SqlType::Nullable(inner) => match *inner {
+            SqlType::String | SqlType::FixedString(_) => {
+                let iter = column.iter::<Option<&[u8]>>()?;
+                Ok(iter
+                    .map(|v| {
+                        v.map(|s| ScalarValue::String(String::from_utf8_lossy(s).to_string()))
+                            .unwrap_or(ScalarValue::Null)
+                    })
+                    .collect())
+            }
+            SqlType::Int64 => {
+                let iter = column.iter::<Option<i64>>()?;
+                Ok(iter
+                    .map(|v| v.map(|num| ScalarValue::Int64(*num)).unwrap_or(ScalarValue::Null))
+                    .collect())
+            }
+            SqlType::UInt64 => {
+                let iter = column.iter::<Option<u64>>()?;
+                Ok(iter
+                    .map(|v| {
+                        v.map(|num| {
+                            i64::try_from(*num)
+                                .map(ScalarValue::Int64)
+                                .unwrap_or_else(|_| ScalarValue::String(num.to_string()))
+                        })
+                        .unwrap_or(ScalarValue::Null)
+                    })
+                    .collect())
+            }
+            SqlType::Float64 => {
+                let iter = column.iter::<Option<f64>>()?;
+                Ok(iter
+                    .map(|v| v.map(|num| ScalarValue::Float64(*num)).unwrap_or(ScalarValue::Null))
+                    .collect())
+            }
+            SqlType::Bool => {
+                let iter = column.iter::<Option<bool>>()?;
+                Ok(iter
+                    .map(|v| v.map(|num| ScalarValue::Bool(*num)).unwrap_or(ScalarValue::Null))
+                    .collect())
+            }
+            _ => anyhow::bail!("unsupported nullable column type {inner:?}"),
+        },
+        other => anyhow::bail!("unsupported column type {other:?}"),
+    }
 }
 
 fn deserialize_i64_any<'de, D>(deserializer: D) -> Result<i64, D::Error>

@@ -16,7 +16,9 @@ use serde_json::{Map, Value as JsonValue};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::{execute_sql_batch, AppError, AppState, DialectMode, SqlBatchResult, SqlResult};
+use crate::{
+    execute_sql_batch, AppError, AppState, DialectMode, ScalarValue, SqlBatchResult, SqlResult,
+};
 
 pub async fn serve(
     addr: SocketAddr,
@@ -63,6 +65,7 @@ impl SimpleQueryHandler for PgHandler {
                 SqlBatchResult::Text(text) => text_response(text),
                 SqlBatchResult::Scheduler(result) => match result {
                     SqlResult::Rows(rows) => rows_response(rows),
+                    SqlResult::TypedRows(rows) => rows_response_typed(rows),
                     SqlResult::Text(text) => text_response(text),
                     SqlResult::Clickhouse(wire) => match wire.format {
                         crate::scheduler::ClickhouseWireFormat::JsonEachRow => {
@@ -175,6 +178,28 @@ fn rows_response(rows: Vec<Map<String, JsonValue>>) -> Response<'static> {
     Response::Query(QueryResponse::new(schema, stream))
 }
 
+fn rows_response_typed(rows: crate::RowSet) -> Response<'static> {
+    let schema = Arc::new(
+        rows.columns
+            .iter()
+            .map(|name| FieldInfo::new(name.clone(), None, None, Type::VARCHAR, FieldFormat::Text))
+            .collect::<Vec<_>>(),
+    );
+
+    let columns = rows.columns;
+    let data = rows.rows.into_iter();
+    let schema_ref = schema.clone();
+    let stream = stream::iter(data).map(move |row| {
+        let mut encoder = DataRowEncoder::new(schema_ref.clone());
+        for (idx, _col) in columns.iter().enumerate() {
+            let value = row.get(idx).and_then(scalar_value_to_string);
+            encoder.encode_field(&value)?;
+        }
+        encoder.finish()
+    });
+    Response::Query(QueryResponse::new(schema, stream))
+}
+
 fn extract_columns(rows: &[Map<String, JsonValue>]) -> Vec<String> {
     if let Some(first) = rows.first() {
         let mut cols = first.keys().cloned().collect::<Vec<_>>();
@@ -194,5 +219,15 @@ fn json_value_to_string(value: &JsonValue) -> Option<String> {
         JsonValue::Array(_) | JsonValue::Object(_) => {
             serde_json::to_string(value).ok()
         }
+    }
+}
+
+fn scalar_value_to_string(value: &ScalarValue) -> Option<String> {
+    match value {
+        ScalarValue::Null => None,
+        ScalarValue::String(s) => Some(s.clone()),
+        ScalarValue::Int64(v) => Some(v.to_string()),
+        ScalarValue::Float64(v) => Some(v.to_string()),
+        ScalarValue::Bool(v) => Some(v.to_string()),
     }
 }

@@ -11,11 +11,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::clickhouse::{
-    ClickhouseConfig, ClickhouseHttpClient, ClickhouseHttpSink, ClickhouseQueryRow, ClickhouseSink,
+    ClickhouseConfig, ClickhouseHttpClient, ClickhouseHttpSink, ClickhouseNativeClient,
+    ClickhouseQueryRow, ClickhouseSink,
 };
 use crate::metadata_sqlite::SqliteMetadataStore;
 use crate::scheduler::{
-    ClickhouseWire, ClickhouseWireFormat, ExecutorConfig, ProxistScheduler, SqlExecutor, SqlResult,
+    ClickhouseWire, ClickhouseWireFormat, ExecutorConfig, ProxistScheduler, RowSet, ScalarValue,
+    SqlExecutor, SqlResult,
 };
 use anyhow::{anyhow, bail, Context};
 use axum::{
@@ -99,6 +101,7 @@ struct DaemonConfig {
     pg_addr: Option<SocketAddr>,
     pg_dialect: DialectMode,
     clickhouse: Option<ClickhouseConfig>,
+    clickhouse_native_url: Option<String>,
     api_token: Option<String>,
     pg_url: Option<String>,
     wal_dir: Option<String>,
@@ -122,6 +125,7 @@ impl DaemonConfig {
         let pg_dialect =
             parse_dialect_mode(std::env::var("PROXIST_PG_DIALECT").ok(), DialectDefault::Pg)?;
         let clickhouse = load_clickhouse_config();
+        let clickhouse_native_url = std::env::var("PROXIST_CLICKHOUSE_NATIVE_URL").ok();
         let api_token = if let Ok(token_path) = std::env::var("PROXIST_API_TOKEN_FILE") {
             let contents = std::fs::read_to_string(&token_path)
                 .with_context(|| format!("read API token file at {}", token_path))?;
@@ -140,6 +144,7 @@ impl DaemonConfig {
             pg_addr,
             pg_dialect,
             clickhouse,
+            clickhouse_native_url,
             api_token,
             pg_url: std::env::var("PROXIST_PG_URL").ok(),
             wal_dir: std::env::var("PROXIST_WAL_DIR").ok(),
@@ -524,6 +529,37 @@ fn render_rows_as_jsoneachrow(rows: Vec<serde_json::Map<String, serde_json::Valu
     out
 }
 
+fn render_typed_rows_as_jsoneachrow(rows: &RowSet) -> String {
+    let mut out = String::new();
+    for row in &rows.rows {
+        let mut map = serde_json::Map::new();
+        for (idx, col) in rows.columns.iter().enumerate() {
+            let value = row
+                .get(idx)
+                .map(scalar_value_to_json)
+                .unwrap_or(serde_json::Value::Null);
+            map.insert(col.clone(), value);
+        }
+        out.push_str(&serde_json::Value::Object(map).to_string());
+        out.push('\n');
+    }
+    out
+}
+
+fn scalar_value_to_json(value: &ScalarValue) -> serde_json::Value {
+    match value {
+        ScalarValue::Null => serde_json::Value::Null,
+        ScalarValue::String(s) => serde_json::Value::String(s.clone()),
+        ScalarValue::Int64(v) => serde_json::Value::Number((*v).into()),
+        ScalarValue::Float64(v) => {
+            serde_json::Number::from_f64(*v)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        ScalarValue::Bool(v) => serde_json::Value::Bool(*v),
+    }
+}
+
 enum SqlBatchResult {
     Text(String),
     Scheduler(SqlResult),
@@ -540,6 +576,7 @@ async fn forward_sql_to_scheduler(state: &AppState, sql: &str) -> Result<String,
         }
         SqlResult::Text(s) => s,
         SqlResult::Rows(rows) => render_rows_as_jsoneachrow(rows),
+        SqlResult::TypedRows(rows) => render_typed_rows_as_jsoneachrow(&rows),
     };
     Ok(body)
 }
@@ -953,12 +990,23 @@ impl ProxistDaemon {
 
         // Build in-memory scheduler with SQLite + optional ClickHouse
         let ch_client = clickhouse_bundle.as_ref().map(|(_, _, c)| Arc::clone(c));
+        let ch_native = match config.clickhouse_native_url.as_deref() {
+            Some(url) => match ClickhouseNativeClient::new(url) {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to initialize ClickHouse native client");
+                    None
+                }
+            },
+            None => None,
+        };
         let scheduler = ProxistScheduler::new(
             ExecutorConfig {
                 sqlite_path: Some(config.metadata_path.clone()),
                 pg_url: config.pg_url.clone(),
             },
             ch_client.map(|c| (*c).clone()),
+            ch_native,
             Some(Arc::clone(&hot_store)),
         )
         .await?;
@@ -1178,6 +1226,7 @@ impl ProxistDaemon {
                         }
                         SqlResult::Text(text) => text,
                         SqlResult::Rows(rows) => render_rows_as_jsoneachrow(rows),
+                        SqlResult::TypedRows(rows) => render_typed_rows_as_jsoneachrow(&rows),
                     },
                 };
                 body.push_str(&chunk);
@@ -1731,6 +1780,7 @@ mod ingest_tests {
                     pg_url: None,
                 },
                 None,
+                None,
                 Some(hot_store.clone()),
             )
             .await?,
@@ -1809,6 +1859,7 @@ mod ingest_tests {
                     sqlite_path: None,
                     pg_url: None,
                 },
+                None,
                 None,
                 Some(hot_store.clone()),
             )
