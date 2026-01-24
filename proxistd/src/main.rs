@@ -533,7 +533,7 @@ async fn forward_sql_to_scheduler(state: &AppState, sql: &str) -> Result<String,
     let result = state.scheduler.execute(sql).await?;
     let body = match result {
         SqlResult::Clickhouse(ClickhouseWire { format, body }) => {
-            if let ClickhouseWireFormat::Unknown = format {
+            if matches!(format, ClickhouseWireFormat::Unknown | ClickhouseWireFormat::Other) {
                 // Future formats will be exposed once the API supports them.
             }
             body
@@ -1168,7 +1168,10 @@ impl ProxistDaemon {
                     SqlBatchResult::Text(text) => text,
                     SqlBatchResult::Scheduler(result) => match result {
                         SqlResult::Clickhouse(ClickhouseWire { format, body }) => {
-                            if let ClickhouseWireFormat::Unknown = format {
+                            if matches!(
+                                format,
+                                ClickhouseWireFormat::Unknown | ClickhouseWireFormat::Other
+                            ) {
                                 // Future formats will be exposed once the API supports them.
                             }
                             body

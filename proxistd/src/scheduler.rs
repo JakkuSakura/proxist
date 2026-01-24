@@ -34,6 +34,7 @@ pub trait SqlExecutor: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickhouseWireFormat {
     JsonEachRow,
+    Other,
     Unknown,
 }
 
@@ -247,16 +248,17 @@ impl SqlExecutor for ProxistScheduler {
 
                             if need_cold && start_u <= cutoff {
                                 let cold_end = cutoff.min(end_u);
-                                if let Some(cold_sql) = rewrite_with_bounds(
-                                    sql,
-                                    &plan.cfg.order_col,
-                                    Some(start_u),
-                                    Some(cold_end),
-                                    limit_hint,
-                                ) {
-                                    if let Some(ch) = &self.clickhouse {
-                                        let text = ch.execute_raw(&cold_sql).await?;
-                                        cold_rows = parse_json_rows(&text)?;
+                                    if let Some(cold_sql) = rewrite_with_bounds(
+                                        sql,
+                                        &plan.cfg.order_col,
+                                        Some(start_u),
+                                        Some(cold_end),
+                                        limit_hint,
+                                    ) {
+                                        let cold_sql = ensure_jsoneachrow(&cold_sql);
+                                        if let Some(ch) = &self.clickhouse {
+                                            let text = ch.execute_raw(&cold_sql).await?;
+                                            cold_rows = parse_json_rows(&text)?;
                                     } else {
                                         plan_failed = true;
                                     }
@@ -741,7 +743,9 @@ fn format_json_rows_as_clickhouse(
     }
     match format {
         ClickhouseWireFormat::JsonEachRow => ClickhouseWire::jsoneachrow(body),
-        ClickhouseWireFormat::Unknown => ClickhouseWire::with_unknown(body),
+        ClickhouseWireFormat::Other | ClickhouseWireFormat::Unknown => {
+            ClickhouseWire::with_unknown(body)
+        }
     }
 }
 
@@ -775,10 +779,24 @@ fn detect_wire_format(sql: &str) -> ClickhouseWireFormat {
             if token == "jsoneachrow" {
                 return ClickhouseWireFormat::JsonEachRow;
             }
-            break;
+            return ClickhouseWireFormat::Other;
         }
     }
     ClickhouseWireFormat::Unknown
+}
+
+fn ensure_jsoneachrow(sql: &str) -> String {
+    match detect_wire_format(sql) {
+        ClickhouseWireFormat::JsonEachRow => sql.to_string(),
+        ClickhouseWireFormat::Other => sql.to_string(),
+        ClickhouseWireFormat::Unknown => {
+            if let Some(stripped) = sql.strip_suffix(';') {
+                format!("{} FORMAT JSONEachRow;", stripped.trim_end())
+            } else {
+                format!("{} FORMAT JSONEachRow", sql.trim_end())
+            }
+        }
+    }
 }
 
 struct TableAnnotation {
@@ -862,6 +880,12 @@ mod scheduler_tests {
             detect_wire_format(sql),
             ClickhouseWireFormat::Unknown
         ));
+    }
+
+    #[test]
+    fn detect_wire_format_handles_other_format() {
+        let sql = "SELECT * FROM foo FORMAT CSV";
+        assert!(matches!(detect_wire_format(sql), ClickhouseWireFormat::Other));
     }
 
     #[tokio::test]

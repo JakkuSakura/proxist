@@ -71,7 +71,8 @@ impl SimpleQueryHandler for PgHandler {
                                 Err(err) => return Err(app_error_to_pg(AppError(err))),
                             }
                         }
-                        crate::scheduler::ClickhouseWireFormat::Unknown => {
+                        crate::scheduler::ClickhouseWireFormat::Other
+                        | crate::scheduler::ClickhouseWireFormat::Unknown => {
                             text_response(wire.body)
                         }
                     },
