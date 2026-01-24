@@ -4,7 +4,9 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use base64::Engine as _;
 mod plan;
-use plan::{build_table_plan, parse_table_schema_from_ddl, rewrite_with_bounds, OrderItem, Predicate};
+use plan::{
+    build_table_plan, parse_table_schema_from_ddl, rewrite_with_bounds, OrderItem, Predicate,
+};
 use proxist_core::query::QueryRange;
 use proxist_mem::{HotColumnStore, HotSymbolSummary};
 use serde_json::{Map, Value as JsonValue};
@@ -248,17 +250,29 @@ impl SqlExecutor for ProxistScheduler {
 
                             if need_cold && start_u <= cutoff {
                                 let cold_end = cutoff.min(end_u);
-                                    if let Some(cold_sql) = rewrite_with_bounds(
-                                        sql,
-                                        &plan.cfg.order_col,
-                                        Some(start_u),
-                                        Some(cold_end),
-                                        limit_hint,
-                                    ) {
-                                        let cold_sql = ensure_jsoneachrow(&cold_sql);
-                                        if let Some(ch) = &self.clickhouse {
-                                            let text = ch.execute_raw(&cold_sql).await?;
-                                            cold_rows = parse_json_rows(&text)?;
+                                if let Some(cold_sql) = rewrite_with_bounds(
+                                    sql,
+                                    &plan.cfg.order_col,
+                                    Some(start_u),
+                                    Some(cold_end),
+                                    limit_hint,
+                                ) {
+                                    if let Some(ch) = &self.clickhouse {
+                                        match requested_format {
+                                            ClickhouseWireFormat::JsonEachRow => {
+                                                let cold_sql = ensure_jsoneachrow(&cold_sql);
+                                                let text = ch.execute_raw(&cold_sql).await?;
+                                                cold_rows = parse_json_rows(&text)?;
+                                            }
+                                            ClickhouseWireFormat::Other => {
+                                                plan_failed = true;
+                                            }
+                                            ClickhouseWireFormat::Unknown => {
+                                                let cold_sql = ensure_csv_with_names(&cold_sql);
+                                                let text = ch.execute_raw(&cold_sql).await?;
+                                                cold_rows = parse_csv_rows(&text)?;
+                                            }
+                                        }
                                     } else {
                                         plan_failed = true;
                                     }
@@ -293,13 +307,8 @@ impl SqlExecutor for ProxistScheduler {
 
                         if !plan_failed && (!cold_rows.is_empty() || !hot_rows.is_empty()) {
                             let merged = merge_rows(cold_rows, hot_rows, &plan)?;
-                            let wire = format_json_rows_as_clickhouse(
-                                &merged,
-                                plan.offset,
-                                plan.limit,
-                                ClickhouseWireFormat::JsonEachRow,
-                            );
-                            return Ok(SqlResult::Clickhouse(wire));
+                            let sliced = apply_offset_limit(merged, plan.offset, plan.limit);
+                            return Ok(SqlResult::Rows(sliced));
                         }
                     }
                 }
@@ -597,19 +606,58 @@ fn micros_to_system_time(micros: i64) -> SystemTime {
     }
 }
 
-fn parse_json_rows(text: &str) -> anyhow::Result<Vec<JsonValue>> {
+fn parse_csv_rows(text: &str) -> anyhow::Result<Vec<Map<String, JsonValue>>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(text.as_bytes());
+    let headers = reader
+        .headers()
+        .map(|h| h.iter().map(|v| v.to_string()).collect::<Vec<_>>())?;
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        let record = record?;
+        let mut map = Map::new();
+        for (idx, col) in headers.iter().enumerate() {
+            let value = record.get(idx).unwrap_or("");
+            let json_value = parse_scalar_value(value);
+            map.insert(col.clone(), json_value);
+        }
+        rows.push(map);
+    }
+    Ok(rows)
+}
+
+fn parse_json_rows(text: &str) -> anyhow::Result<Vec<Map<String, JsonValue>>> {
     let mut rows = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        rows.push(serde_json::from_str(trimmed)?);
+        let value: JsonValue = serde_json::from_str(trimmed)?;
+        match value {
+            JsonValue::Object(map) => rows.push(map),
+            other => {
+                let mut map = Map::new();
+                map.insert("value".to_string(), other);
+                rows.push(map);
+            }
+        }
     }
     Ok(rows)
 }
 
-fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> Vec<JsonValue> {
+fn parse_scalar_value(value: &str) -> JsonValue {
+    if value.is_empty() {
+        return JsonValue::Null;
+    }
+    if let Ok(num) = value.parse::<i64>() {
+        return JsonValue::Number(num.into());
+    }
+    JsonValue::String(value.to_string())
+}
+
+fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> Vec<Map<String, JsonValue>> {
     let mut rows = rows;
     if let Some(order) = plan.order_by.first() {
         let descending = order.descending;
@@ -662,17 +710,16 @@ fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> Vec<JsonValue
             };
             map.insert(col.clone(), value);
         }
-        out.push(JsonValue::Object(map));
+        out.push(map);
     }
     out
 }
 
-
 fn merge_rows(
-    mut cold: Vec<JsonValue>,
-    mut hot: Vec<JsonValue>,
+    mut cold: Vec<Map<String, JsonValue>>,
+    mut hot: Vec<Map<String, JsonValue>>,
     plan: &PlanAnalysis,
-) -> anyhow::Result<Vec<JsonValue>> {
+) -> anyhow::Result<Vec<Map<String, JsonValue>>> {
     if let Some(order) = plan.order_by.first() {
         let descending = order.descending;
         let column = &plan.cfg.order_col;
@@ -721,35 +768,20 @@ fn merge_rows(
     }
 }
 
-fn format_json_rows_as_clickhouse(
-    rows: &[JsonValue],
+fn apply_offset_limit(
+    rows: Vec<Map<String, JsonValue>>,
     offset: Option<usize>,
     limit: Option<usize>,
-    format: ClickhouseWireFormat,
-) -> ClickhouseWire {
-    let iter = rows.iter().skip(offset.unwrap_or(0));
-    let rows: Vec<_> = if let Some(limit) = limit {
-        iter.take(limit).cloned().collect()
+) -> Vec<Map<String, JsonValue>> {
+    let iter = rows.into_iter().skip(offset.unwrap_or(0));
+    if let Some(limit) = limit {
+        iter.take(limit).collect()
     } else {
-        iter.cloned().collect()
-    };
-
-    let mut body = String::new();
-    for value in rows {
-        if let Ok(line) = serde_json::to_string(&value) {
-            body.push_str(&line);
-            body.push('\n');
-        }
-    }
-    match format {
-        ClickhouseWireFormat::JsonEachRow => ClickhouseWire::jsoneachrow(body),
-        ClickhouseWireFormat::Other | ClickhouseWireFormat::Unknown => {
-            ClickhouseWire::with_unknown(body)
-        }
+        iter.collect()
     }
 }
 
-fn extract_order_key(row: &JsonValue, column: &str) -> anyhow::Result<i64> {
+fn extract_order_key(row: &Map<String, JsonValue>, column: &str) -> anyhow::Result<i64> {
     let value = row
         .get(column)
         .ok_or_else(|| anyhow!("missing order column {} in result row", column))?;
@@ -794,6 +826,20 @@ fn ensure_jsoneachrow(sql: &str) -> String {
                 format!("{} FORMAT JSONEachRow;", stripped.trim_end())
             } else {
                 format!("{} FORMAT JSONEachRow", sql.trim_end())
+            }
+        }
+    }
+}
+
+fn ensure_csv_with_names(sql: &str) -> String {
+    match detect_wire_format(sql) {
+        ClickhouseWireFormat::JsonEachRow => sql.to_string(),
+        ClickhouseWireFormat::Other => sql.to_string(),
+        ClickhouseWireFormat::Unknown => {
+            if let Some(stripped) = sql.strip_suffix(';') {
+                format!("{} FORMAT CSVWithNames;", stripped.trim_end())
+            } else {
+                format!("{} FORMAT CSVWithNames", sql.trim_end())
             }
         }
     }
@@ -885,7 +931,10 @@ mod scheduler_tests {
     #[test]
     fn detect_wire_format_handles_other_format() {
         let sql = "SELECT * FROM foo FORMAT CSV";
-        assert!(matches!(detect_wire_format(sql), ClickhouseWireFormat::Other));
+        assert!(matches!(
+            detect_wire_format(sql),
+            ClickhouseWireFormat::Other
+        ));
     }
 
     #[tokio::test]
@@ -919,15 +968,21 @@ mod scheduler_tests {
 
         scheduler.update_hot_stats(&stats).await;
 
-        assert!(scheduler
-            .hot_covers_window("alpha", &vec!["SYM1".to_string()], 120, 180)
-            .await);
-        assert!(!scheduler
-            .hot_covers_window("alpha", &vec!["SYM1".to_string()], 90, 180)
-            .await);
-        assert!(!scheduler
-            .hot_covers_window("alpha", &vec!["SYM3".to_string()], 120, 180)
-            .await);
+        assert!(
+            scheduler
+                .hot_covers_window("alpha", &vec!["SYM1".to_string()], 120, 180)
+                .await
+        );
+        assert!(
+            !scheduler
+                .hot_covers_window("alpha", &vec!["SYM1".to_string()], 90, 180)
+                .await
+        );
+        assert!(
+            !scheduler
+                .hot_covers_window("alpha", &vec!["SYM3".to_string()], 120, 180)
+                .await
+        );
     }
 
     #[test]
@@ -982,15 +1037,27 @@ mod scheduler_tests {
 
         let projected = project_hot_rows(rows, &plan);
         assert_eq!(projected.len(), 2);
-        let first = projected[0].as_object().expect("object");
+        let first = &projected[0];
         assert_eq!(
             first.get("symbol"),
             Some(&JsonValue::String("SYM1".to_string()))
         );
-        assert_eq!(
-            first.get("ts_micros"),
-            Some(&JsonValue::Number(1.into()))
-        );
+        assert_eq!(first.get("ts_micros"), Some(&JsonValue::Number(1.into())));
         assert_eq!(first.len(), 2);
+    }
+
+    #[test]
+    fn parse_csv_rows_with_names() {
+        let input = "symbol,ts_micros\nSYM1,42\nSYM2,43\n";
+        let rows = parse_csv_rows(input).expect("parse csv");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get("symbol"),
+            Some(&JsonValue::String("SYM1".to_string()))
+        );
+        assert_eq!(
+            rows[0].get("ts_micros"),
+            Some(&JsonValue::Number(42.into()))
+        );
     }
 }
