@@ -4,14 +4,9 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use base64::Engine as _;
 mod plan;
-use plan::{
-    build_table_plan, parse_table_schema_from_ddl, rewrite_with_bounds, strip_limit_offset,
-    OrderItem, Predicate,
-};
+use plan::{build_table_plan, parse_table_schema_from_ddl, rewrite_with_bounds, OrderItem, Predicate};
 use proxist_core::query::QueryRange;
 use proxist_mem::{HotColumnStore, HotSymbolSummary};
-#[cfg(feature = "duckdb")]
-use serde_json::Number as JsonNumber;
 use serde_json::{Map, Value as JsonValue};
 use sqlx::{Column, Row};
 use std::collections::HashMap;
@@ -28,7 +23,6 @@ use tokio_postgres;
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
     pub sqlite_path: Option<String>,
-    pub duckdb_path: Option<String>,
     pub pg_url: Option<String>,
 }
 
@@ -72,10 +66,8 @@ pub enum SqlResult {
     Rows(Vec<Map<String, JsonValue>>),
 }
 
-#[cfg_attr(not(feature = "duckdb"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct TableConfig {
-    pub ddl: String,
     pub order_col: String,
     pub payload_col: String,
     pub filter_cols: Vec<String>,
@@ -86,7 +78,6 @@ pub struct TableConfig {
 pub struct ProxistScheduler {
     sqlite: Option<SqliteExecutor>,
     clickhouse: Option<ClickhouseHttpClient>,
-    duckdb: Option<DuckDbExecutor>,
     postgres: Option<PostgresExecutor>,
     hot_store: Option<Arc<dyn HotColumnStore>>,
     tables: Arc<Mutex<HashMap<String, TableConfig>>>,
@@ -108,13 +99,11 @@ impl ProxistScheduler {
             ),
             None => None,
         };
-        let duckdb = DuckDbExecutor::maybe_connect(cfg.duckdb_path.as_deref()).await?;
         let postgres = PostgresExecutor::maybe_connect(cfg.pg_url.as_deref()).await?;
 
         Ok(Self {
             sqlite,
             clickhouse,
-            duckdb,
             postgres,
             hot_store,
             tables: Arc::new(Mutex::new(HashMap::new())),
@@ -140,7 +129,6 @@ impl ProxistScheduler {
         self.register_table(
             table,
             TableConfig {
-                ddl: ddl_sql.to_string(),
                 order_col: annotation.order_col,
                 payload_col: annotation.payload_col,
                 filter_cols: annotation.filter_cols,
@@ -178,24 +166,6 @@ impl ProxistScheduler {
         }
     }
 
-    #[cfg(feature = "duckdb")]
-    pub fn clear_duckdb_table(&self, table: &str) -> anyhow::Result<()> {
-        let sanitized = table.replace('"', "");
-        unsafe {
-            let exec = DUCK_EXEC
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("duckdb connection not initialized"))?;
-            let sql = format!("DELETE FROM \"{}\"", sanitized);
-            let _ = exec.conn.execute(&sql, []);
-        }
-        Ok(())
-    }
-
-    #[cfg(not(feature = "duckdb"))]
-    pub fn clear_duckdb_table(&self, _table: &str) -> anyhow::Result<()> {
-        anyhow::bail!("duckdb executor not enabled at compile time")
-    }
-
     async fn hot_covers_window(
         &self,
         tenant: &str,
@@ -228,7 +198,7 @@ impl SqlExecutor for ProxistScheduler {
         let normalized = sql.trim().to_ascii_lowercase();
 
         if normalized.starts_with("select") || normalized.starts_with("with") {
-            if let (Some(duck), Some(hot)) = (&self.duckdb, &self.hot_store) {
+            if let Some(hot) = &self.hot_store {
                 let plan = {
                     let guard = self.tables.lock().unwrap();
                     analyze_select(sql, &*guard)
@@ -252,94 +222,82 @@ impl SqlExecutor for ProxistScheduler {
                             .limit
                             .map(|limit| limit.saturating_add(plan.offset.unwrap_or(0)));
 
-                        if let Some(hot_sql) = strip_limit_offset(sql, limit_hint) {
-                            let cutoff = self.persisted_cutoff_micros.load(Ordering::SeqCst);
-                            let mut cold_rows = Vec::new();
-                            let mut hot_rows = Vec::new();
-                            let mut plan_failed = false;
+                        let cutoff = self.persisted_cutoff_micros.load(Ordering::SeqCst);
+                        let mut cold_rows = Vec::new();
+                        let mut hot_rows = Vec::new();
+                        let mut plan_failed = false;
 
-                            if cutoff >= 0 {
-                                let start_u = system_time_to_micros(plan.select.start);
-                                let end_u = system_time_to_micros(plan.select.end);
-                                let mut need_cold = start_u <= cutoff;
+                        if cutoff >= 0 {
+                            let start_u = system_time_to_micros(plan.select.start);
+                            let end_u = system_time_to_micros(plan.select.end);
+                            let mut need_cold = start_u <= cutoff;
 
-                                if need_cold
-                                    && self
-                                        .hot_covers_window(
-                                            &plan.select.key0,
-                                            &plan.select.key1_list,
-                                            start_u,
-                                            end_u,
-                                        )
-                                        .await
-                                {
-                                    need_cold = false;
-                                }
+                            if need_cold
+                                && self
+                                    .hot_covers_window(
+                                        &plan.select.key0,
+                                        &plan.select.key1_list,
+                                        start_u,
+                                        end_u,
+                                    )
+                                    .await
+                            {
+                                need_cold = false;
+                            }
 
-                                if need_cold && start_u <= cutoff {
-                                    let cold_end = cutoff.min(end_u);
-                                    if let Some(cold_sql) = rewrite_with_bounds(
-                                        sql,
-                                        &plan.cfg.order_col,
-                                        Some(start_u),
-                                        Some(cold_end),
-                                        limit_hint,
-                                    ) {
-                                        if let Some(ch) = &self.clickhouse {
-                                            let text = ch.execute_raw(&cold_sql).await?;
-                                            cold_rows = parse_json_rows(&text)?;
-                                        } else {
-                                            plan_failed = true;
-                                        }
+                            if need_cold && start_u <= cutoff {
+                                let cold_end = cutoff.min(end_u);
+                                if let Some(cold_sql) = rewrite_with_bounds(
+                                    sql,
+                                    &plan.cfg.order_col,
+                                    Some(start_u),
+                                    Some(cold_end),
+                                    limit_hint,
+                                ) {
+                                    if let Some(ch) = &self.clickhouse {
+                                        let text = ch.execute_raw(&cold_sql).await?;
+                                        cold_rows = parse_json_rows(&text)?;
                                     } else {
                                         plan_failed = true;
                                     }
+                                } else {
+                                    plan_failed = true;
                                 }
+                            }
 
-                                if !plan_failed && (end_u > cutoff || !need_cold) {
-                                    let hot_lo = if need_cold {
-                                        if start_u > cutoff {
-                                            start_u
-                                        } else {
-                                            cutoff + 1
-                                        }
-                                    } else {
+                            if !plan_failed && (end_u > cutoff || !need_cold) {
+                                let hot_lo = if need_cold {
+                                    if start_u > cutoff {
                                         start_u
-                                    };
-                                    let mut select = plan.select.clone();
-                                    select.start = micros_to_system_time(hot_lo);
-                                    let rows = load_hot_rows(hot, &select).await?;
-                                    if !rows.is_empty() {
-                                        hot_rows = duck.load_table_and_execute(
-                                            &plan.cfg,
-                                            &select.table,
-                                            &rows,
-                                            &hot_sql,
-                                        )?;
+                                    } else {
+                                        cutoff + 1
                                     }
-                                }
-                            } else {
-                                let rows = load_hot_rows(hot, &plan.select).await?;
+                                } else {
+                                    start_u
+                                };
+                                let mut select = plan.select.clone();
+                                select.start = micros_to_system_time(hot_lo);
+                                let rows = load_hot_rows(hot, &select).await?;
                                 if !rows.is_empty() {
-                                    hot_rows = duck.load_table_and_execute(
-                                        &plan.cfg,
-                                        &plan.select.table,
-                                        &rows,
-                                        &hot_sql,
-                                    )?;
+                                    hot_rows = project_hot_rows(rows, &plan);
                                 }
                             }
-
-                            if !plan_failed && (!cold_rows.is_empty() || !hot_rows.is_empty()) {
-                                let merged = merge_rows(cold_rows, hot_rows, &plan)?;
-                                let wire = format_json_rows_as_clickhouse(
-                                    &merged,
-                                    plan.offset,
-                                    plan.limit,
-                                    ClickhouseWireFormat::JsonEachRow,
-                                );
-                                return Ok(SqlResult::Clickhouse(wire));
+                        } else {
+                            let rows = load_hot_rows(hot, &plan.select).await?;
+                            if !rows.is_empty() {
+                                hot_rows = project_hot_rows(rows, &plan);
                             }
+                        }
+
+                        if !plan_failed && (!cold_rows.is_empty() || !hot_rows.is_empty()) {
+                            let merged = merge_rows(cold_rows, hot_rows, &plan)?;
+                            let wire = format_json_rows_as_clickhouse(
+                                &merged,
+                                plan.offset,
+                                plan.limit,
+                                ClickhouseWireFormat::JsonEachRow,
+                            );
+                            return Ok(SqlResult::Clickhouse(wire));
                         }
                     }
                 }
@@ -418,178 +376,6 @@ impl SqlExecutor for SqliteExecutor {
     }
 }
 
-struct DuckDbExecutor;
-
-#[async_trait]
-impl SqlExecutor for DuckDbExecutor {
-    async fn execute(&self, _sql: &str) -> anyhow::Result<SqlResult> {
-        anyhow::bail!("duckdb executor not enabled at compile time")
-    }
-}
-
-#[cfg(feature = "duckdb")]
-struct DuckDbExecutorImpl {
-    conn: duckdb::Connection,
-}
-
-#[cfg(feature = "duckdb")]
-static mut DUCK_EXEC: Option<DuckDbExecutorImpl> = None;
-
-#[cfg(feature = "duckdb")]
-impl DuckDbExecutorImpl {
-    fn new(path: &str) -> anyhow::Result<Self> {
-        Ok(Self {
-            conn: duckdb::Connection::open(path)?,
-        })
-    }
-
-    fn ensure_table(&mut self, ddl: &str) -> anyhow::Result<()> {
-        self.conn.execute(ddl, [])?;
-        Ok(())
-    }
-
-    fn insert_rows(
-        &mut self,
-        table: &str,
-        cfg: &TableConfig,
-        rows: &[HotRowFlat],
-    ) -> anyhow::Result<()> {
-        let tx = self.conn.transaction()?;
-        let mut cols = Vec::new();
-        if let Some(c0) = cfg.filter_cols.get(0) {
-            cols.push(c0.as_str());
-        }
-        if let Some(c1) = cfg.filter_cols.get(1) {
-            cols.push(c1.as_str());
-        }
-        cols.push(&cfg.order_col);
-        cols.push(&cfg.payload_col);
-        if let Some(seq) = &cfg.seq_col {
-            cols.push(seq.as_str());
-        }
-
-        let placeholders: Vec<_> = (1..=cols.len()).map(|idx| format!("?{}", idx)).collect();
-        let sql = format!(
-            "INSERT INTO \"{}\" ({}) VALUES ({})",
-            table.replace('"', ""),
-            cols.iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", "),
-            placeholders.join(", "),
-        );
-
-        let mut stmt = tx.prepare(&sql)?;
-        for row in rows {
-            if cfg.seq_col.is_some() {
-                stmt.execute(duckdb::params![
-                    &row.k0,
-                    &row.k1,
-                    &row.ord_micros,
-                    &row.payload_base64,
-                    &row.seq
-                ])?;
-            } else {
-                stmt.execute(duckdb::params![
-                    &row.k0,
-                    &row.k1,
-                    &row.ord_micros,
-                    &row.payload_base64
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn query_rows(&self, sql: &str) -> anyhow::Result<Vec<JsonValue>> {
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query([])?;
-        let column_names: Vec<String> = rows
-            .as_ref()
-            .map(|stmt| {
-                (0..stmt.column_count())
-                    .map(|idx| {
-                        stmt.column_name(idx)
-                            .map(|name| name.to_string())
-                            .unwrap_or_default()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            let mut map = Map::new();
-            for (idx, name) in column_names.iter().enumerate() {
-                if let Ok(v) = row.get::<usize, String>(idx) {
-                    map.insert(name.clone(), JsonValue::String(v));
-                } else if let Ok(v) = row.get::<usize, i64>(idx) {
-                    map.insert(name.clone(), JsonValue::Number(v.into()));
-                } else if let Ok(v) = row.get::<usize, f64>(idx) {
-                    if let Some(num) = JsonNumber::from_f64(v) {
-                        map.insert(name.clone(), JsonValue::Number(num));
-                    } else {
-                        map.insert(name.clone(), JsonValue::Null);
-                    }
-                } else {
-                    map.insert(name.clone(), JsonValue::Null);
-                }
-            }
-            out.push(JsonValue::Object(map));
-        }
-        Ok(out)
-    }
-}
-
-#[cfg(feature = "duckdb")]
-impl DuckDbExecutor {
-    fn load_table_and_execute(
-        &self,
-        cfg: &TableConfig,
-        table: &str,
-        rows: &[HotRowFlat],
-        sql: &str,
-    ) -> anyhow::Result<Vec<JsonValue>> {
-        unsafe {
-            let exec = DUCK_EXEC
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("duckdb connection not initialized"))?;
-            exec.ensure_table(&cfg.ddl)?;
-            exec.insert_rows(table, cfg, rows)?;
-            exec.query_rows(sql)
-        }
-    }
-
-    async fn maybe_connect(path: Option<&str>) -> anyhow::Result<Option<Self>> {
-        if let Some(p) = path {
-            unsafe {
-                DUCK_EXEC = Some(DuckDbExecutorImpl::new(p)?);
-            }
-            Ok(Some(Self))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-#[cfg(not(feature = "duckdb"))]
-impl DuckDbExecutor {
-    fn load_table_and_execute(
-        &self,
-        _cfg: &TableConfig,
-        _table: &str,
-        _rows: &[HotRowFlat],
-        _sql: &str,
-    ) -> anyhow::Result<Vec<JsonValue>> {
-        anyhow::bail!("duckdb executor not enabled at compile time")
-    }
-
-    async fn maybe_connect(_path: Option<&str>) -> anyhow::Result<Option<Self>> {
-        Ok(None)
-    }
-}
-
 pub struct PostgresExecutor;
 
 #[async_trait]
@@ -627,7 +413,6 @@ impl PostgresExecutor {
     }
 }
 
-#[cfg_attr(not(feature = "duckdb"), allow(dead_code))]
 #[derive(Clone)]
 struct HotRowFlat {
     k0: String,
@@ -639,7 +424,6 @@ struct HotRowFlat {
 
 #[derive(Clone)]
 struct SimpleSelect {
-    table: String,
     key0: String,
     key1_list: Vec<String>,
     start: SystemTime,
@@ -651,6 +435,8 @@ struct PlanAnalysis {
     cfg: TableConfig,
     select: SimpleSelect,
     order_by: Vec<OrderItem>,
+    select_cols: Vec<String>,
+    has_wildcard: bool,
     offset: Option<usize>,
     limit: Option<usize>,
 }
@@ -740,16 +526,34 @@ fn analyze_select(sql: &str, tables: &HashMap<String, TableConfig>) -> Option<Pl
         }
     }
 
+    let select_cols = plan.select_cols.clone();
+    let has_wildcard = plan.has_wildcard;
+
+    if !has_wildcard {
+        if select_cols.is_empty() {
+            return None;
+        }
+        for col in &select_cols {
+            if !cfg.columns.contains(col) {
+                return None;
+            }
+        }
+        if !plan.order_by.is_empty() && !select_cols.contains(&order_col) {
+            return None;
+        }
+    }
+
     Some(PlanAnalysis {
         cfg,
         select: SimpleSelect {
-            table: plan.table,
             key0,
             key1_list: key1_values,
             start,
             end,
         },
         order_by: plan.order_by,
+        select_cols,
+        has_wildcard,
         offset: plan.offset,
         limit: plan.limit,
     })
@@ -801,6 +605,64 @@ fn parse_json_rows(text: &str) -> anyhow::Result<Vec<JsonValue>> {
         rows.push(serde_json::from_str(trimmed)?);
     }
     Ok(rows)
+}
+
+fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> Vec<JsonValue> {
+    let mut rows = rows;
+    if let Some(order) = plan.order_by.first() {
+        let descending = order.descending;
+        rows.sort_by(|a, b| {
+            if descending {
+                b.ord_micros.cmp(&a.ord_micros)
+            } else {
+                a.ord_micros.cmp(&b.ord_micros)
+            }
+        });
+    }
+
+    let columns = if plan.has_wildcard || plan.select_cols.is_empty() {
+        plan.cfg.columns.clone()
+    } else {
+        plan.select_cols.clone()
+    };
+    let filter0 = plan
+        .cfg
+        .filter_cols
+        .get(0)
+        .map(|c| c.to_ascii_lowercase())
+        .unwrap_or_default();
+    let filter1 = plan
+        .cfg
+        .filter_cols
+        .get(1)
+        .map(|c| c.to_ascii_lowercase())
+        .unwrap_or_default();
+    let order_col = plan.cfg.order_col.to_ascii_lowercase();
+    let payload_col = plan.cfg.payload_col.to_ascii_lowercase();
+    let seq_col = plan.cfg.seq_col.as_ref().map(|c| c.to_ascii_lowercase());
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut map = Map::new();
+        for col in &columns {
+            let value = if *col == filter0 {
+                JsonValue::String(row.k0.clone())
+            } else if *col == filter1 {
+                JsonValue::String(row.k1.clone())
+            } else if *col == order_col {
+                JsonValue::Number(row.ord_micros.into())
+            } else if *col == payload_col {
+                JsonValue::String(row.payload_base64.clone())
+            } else if seq_col.as_ref().map(|s| s == col).unwrap_or(false) {
+                JsonValue::Number(row.seq.into())
+            } else {
+                JsonValue::Null
+            };
+            map.insert(col.clone(), value);
+        }
+        out.push(JsonValue::Object(map));
+    }
+    out
 }
 
 
@@ -1007,7 +869,6 @@ mod scheduler_tests {
         let scheduler = ProxistScheduler {
             sqlite: None,
             clickhouse: None,
-            duckdb: None,
             postgres: None,
             hot_store: None,
             tables: Arc::new(Mutex::new(HashMap::new())),
@@ -1043,5 +904,69 @@ mod scheduler_tests {
         assert!(!scheduler
             .hot_covers_window("alpha", &vec!["SYM3".to_string()], 120, 180)
             .await);
+    }
+
+    #[test]
+    fn project_hot_rows_sorts_and_projects() {
+        let cfg = TableConfig {
+            order_col: "ts_micros".to_string(),
+            payload_col: "payload_base64".to_string(),
+            filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
+            seq_col: Some("seq".to_string()),
+            columns: vec![
+                "tenant".to_string(),
+                "symbol".to_string(),
+                "ts_micros".to_string(),
+                "payload_base64".to_string(),
+                "seq".to_string(),
+            ],
+        };
+        let plan = PlanAnalysis {
+            cfg,
+            select: SimpleSelect {
+                key0: "alpha".to_string(),
+                key1_list: vec!["SYM1".to_string()],
+                start: SystemTime::UNIX_EPOCH,
+                end: SystemTime::UNIX_EPOCH,
+            },
+            order_by: vec![OrderItem {
+                column: "ts_micros".to_string(),
+                descending: false,
+            }],
+            select_cols: vec!["symbol".to_string(), "ts_micros".to_string()],
+            has_wildcard: false,
+            offset: None,
+            limit: None,
+        };
+
+        let rows = vec![
+            HotRowFlat {
+                k0: "alpha".to_string(),
+                k1: "SYM1".to_string(),
+                ord_micros: 2,
+                payload_base64: "b".to_string(),
+                seq: 1,
+            },
+            HotRowFlat {
+                k0: "alpha".to_string(),
+                k1: "SYM1".to_string(),
+                ord_micros: 1,
+                payload_base64: "a".to_string(),
+                seq: 0,
+            },
+        ];
+
+        let projected = project_hot_rows(rows, &plan);
+        assert_eq!(projected.len(), 2);
+        let first = projected[0].as_object().expect("object");
+        assert_eq!(
+            first.get("symbol"),
+            Some(&JsonValue::String("SYM1".to_string()))
+        );
+        assert_eq!(
+            first.get("ts_micros"),
+            Some(&JsonValue::Number(1.into()))
+        );
+        assert_eq!(first.len(), 2);
     }
 }

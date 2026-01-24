@@ -1,6 +1,7 @@
 use fp_sql::{
     ast::{
-        BinaryOperator as BinOp, Expr, GroupByExpr, Ident, SetExpr, Statement, TableFactor, Value,
+        BinaryOperator as BinOp, Expr, GroupByExpr, Ident, SelectItem, SetExpr, Statement,
+        TableFactor, Value, WildcardAdditionalOptions,
     },
     dialect::ClickHouseDialect,
     parser::Parser,
@@ -11,6 +12,8 @@ pub struct TablePlan {
     pub table: String,
     pub filters: Vec<Predicate>,
     pub order_by: Vec<OrderItem>,
+    pub select_cols: Vec<String>,
+    pub has_wildcard: bool,
     pub offset: Option<usize>,
     pub limit: Option<usize>,
     pub supports_hot: bool,
@@ -95,26 +98,6 @@ pub fn rewrite_with_bounds(
     }
 
     Some(stmt.to_string())
-}
-
-pub fn strip_limit_offset(sql: &str, limit_hint: Option<usize>) -> Option<String> {
-    let mut stmts = Parser::parse_sql(&ClickHouseDialect {}, sql).ok()?;
-    if stmts.is_empty() {
-        return None;
-    }
-    let mut stmt = stmts.remove(0);
-
-    if let Statement::Query(q) = &mut stmt {
-        if let Some(limit) = limit_hint {
-            q.limit = Some(Expr::Value(Value::Number(limit.to_string(), false)));
-        } else {
-            q.limit = None;
-        }
-        q.offset = None;
-        return Some(stmt.to_string());
-    }
-
-    None
 }
 
 pub fn parse_table_schema_from_ddl(sql: &str) -> Option<(String, Vec<String>)> {
@@ -216,6 +199,37 @@ pub fn build_table_plan(sql: &str) -> Option<TablePlan> {
         true
     };
 
+    let mut select_cols = Vec::new();
+    let mut has_wildcard = false;
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(opts) | SelectItem::QualifiedWildcard(_, opts) => {
+                if wildcard_has_options(opts) {
+                    return Some(TablePlan::unsupported(table));
+                }
+                has_wildcard = true;
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                if let Some(column) = order_expr_ident(expr) {
+                    select_cols.push(column);
+                } else {
+                    return Some(TablePlan::unsupported(table));
+                }
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if let Some(column) = order_expr_ident(expr) {
+                    let alias_lower = alias.value.to_ascii_lowercase();
+                    if alias_lower != column {
+                        return Some(TablePlan::unsupported(table));
+                    }
+                    select_cols.push(column);
+                } else {
+                    return Some(TablePlan::unsupported(table));
+                }
+            }
+        }
+    }
+
     let mut order_supported = true;
     let mut order_by = Vec::with_capacity(query.order_by.len());
     for expr in &query.order_by {
@@ -252,6 +266,8 @@ pub fn build_table_plan(sql: &str) -> Option<TablePlan> {
         table,
         filters,
         order_by,
+        select_cols,
+        has_wildcard,
         offset,
         limit,
         supports_hot,
@@ -281,6 +297,8 @@ impl TablePlan {
             table: String::new(),
             filters: Vec::new(),
             order_by: Vec::new(),
+            select_cols: Vec::new(),
+            has_wildcard: false,
             offset: None,
             limit: None,
             supports_hot: false,
@@ -292,11 +310,20 @@ impl TablePlan {
             table,
             filters: Vec::new(),
             order_by: Vec::new(),
+            select_cols: Vec::new(),
+            has_wildcard: false,
             offset: None,
             limit: None,
             supports_hot: false,
         }
     }
+}
+
+fn wildcard_has_options(opts: &WildcardAdditionalOptions) -> bool {
+    opts.opt_exclude.is_some()
+        || opts.opt_except.is_some()
+        || opts.opt_rename.is_some()
+        || opts.opt_replace.is_some()
 }
 
 fn predicate_supported(predicate: &Predicate) -> bool {
@@ -481,15 +508,6 @@ mod tests {
             predicate,
             Predicate::RangeUpper { column, bound, .. } if column == "ts" && *bound == 100
         )));
-    }
-
-    #[test]
-    fn strip_limit_offset_rewrites_pagination() {
-        let sql = "SELECT * FROM data ORDER BY ts LIMIT 5 OFFSET 2";
-        let rewritten = strip_limit_offset(sql, Some(7)).expect("rewrite");
-        let lower = rewritten.to_ascii_lowercase();
-        assert!(lower.contains("limit 7"));
-        assert!(!lower.contains("offset"));
     }
 
     #[test]

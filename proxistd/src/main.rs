@@ -100,7 +100,6 @@ struct DaemonConfig {
     pg_dialect: DialectMode,
     clickhouse: Option<ClickhouseConfig>,
     api_token: Option<String>,
-    duckdb_path: Option<String>,
     pg_url: Option<String>,
     wal_dir: Option<String>,
     wal_segment_bytes: u64,
@@ -142,7 +141,6 @@ impl DaemonConfig {
             pg_dialect,
             clickhouse,
             api_token,
-            duckdb_path: std::env::var("PROXIST_DUCKDB_PATH").ok(),
             pg_url: std::env::var("PROXIST_PG_URL").ok(),
             wal_dir: std::env::var("PROXIST_WAL_DIR").ok(),
             wal_segment_bytes: std::env::var("PROXIST_WAL_SEGMENT_BYTES")
@@ -958,7 +956,6 @@ impl ProxistDaemon {
         let scheduler = ProxistScheduler::new(
             ExecutorConfig {
                 sqlite_path: Some(config.metadata_path.clone()),
-                duckdb_path: config.duckdb_path.clone(),
                 pg_url: config.pg_url.clone(),
             },
             ch_client.map(|c| (*c).clone()),
@@ -1662,7 +1659,7 @@ mod ingest_tests {
         let sql = "INSERT INTO ticks (tenant_key, symbol_key, ts_micros, payload_b64, seq_no) \
                    VALUES ('alpha', 'AAPL', 42, 'AQID', 7)";
         let dialect = DialectMode::Sql(SqlDialect::ClickHouse);
-        let mut parsed = parse_sql_with_dialect(&dialect, sql)?;
+        let mut parsed = parse_sql_with_dialect(&dialect, sql).map_err(|err| err.0)?;
         let stmt = parsed.remove(0);
         let (columns, values) = match stmt {
             Statement::Insert { columns, source, .. } => match source.map(|q| *q.body) {
@@ -1673,7 +1670,6 @@ mod ingest_tests {
         };
 
         let cfg = crate::scheduler::TableConfig {
-            ddl: "CREATE TABLE ticks (tenant_key String, symbol_key String, ts_micros Int64, payload_b64 String, seq_no UInt64)".to_string(),
             order_col: "ts_micros".to_string(),
             payload_col: "payload_b64".to_string(),
             filter_cols: vec!["tenant_key".to_string(), "symbol_key".to_string()],
@@ -1729,7 +1725,6 @@ mod ingest_tests {
             ProxistScheduler::new(
                 ExecutorConfig {
                     sqlite_path: None,
-                    duckdb_path: None,
                     pg_url: None,
                 },
                 None,
@@ -1809,7 +1804,6 @@ mod ingest_tests {
             ProxistScheduler::new(
                 ExecutorConfig {
                     sqlite_path: None,
-                    duckdb_path: None,
                     pg_url: None,
                 },
                 None,

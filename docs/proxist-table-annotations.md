@@ -1,7 +1,7 @@
 Proxist Table Annotations
 
 Overview
-- Proxist routes read queries between DuckDB (hot) and ClickHouse (cold) by analyzing query predicates and a lightweight table mapping provided inline with your DDL.
+- Proxist routes read queries between the in-memory hot store and ClickHouse (cold) by analyzing query predicates and a lightweight table mapping provided inline with your DDL.
 - You do not need a separate API to register tables; just send your CREATE TABLE DDL through the existing SQL endpoint. Proxist will parse an annotation comment and remember the mapping.
 
 Annotating DDL
@@ -21,11 +21,10 @@ How It’s Used
   - filter_cols[0] equality
   - filter_cols[1] IN (...) or equality
   - order_col range (Between or >= / > and < / <=)
-- If a persisted cutoff watermark is set and the query window is hot-only, rows are loaded from the in-memory store into DuckDB using your DDL and column names, and the query runs locally.
+- If a persisted cutoff watermark is set and the query window is hot-only, rows are loaded from the in-memory store and projected locally using your DDL column mapping.
 - Otherwise, the query is forwarded to ClickHouse.
 
 Notes
 - No table names or column names are hard-coded in Proxist. Your DDL + proxist annotation fully determines mapping.
 - For complex queries or joins, Proxist will fall back to ClickHouse.
 - We will expand predicate support and seam-aware union as needed while keeping configuration declarative via the DDL annotation.
-

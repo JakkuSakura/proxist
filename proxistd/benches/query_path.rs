@@ -50,7 +50,6 @@ fn build_fixture(cutoff_micros: i64) -> Fixture {
         .block_on(ProxistScheduler::new(
             ExecutorConfig {
                 sqlite_path: None,
-                duckdb_path: Some(":memory:".to_string()),
                 pg_url: None,
             },
             None,
@@ -58,19 +57,9 @@ fn build_fixture(cutoff_micros: i64) -> Fixture {
         ))
         .expect("scheduler");
 
-    let ddl = r#"
-CREATE TABLE ticks (
-  tenant VARCHAR,
-  symbol VARCHAR,
-  ts_micros BIGINT,
-  payload_base64 VARCHAR,
-  seq BIGINT
-)
-"#;
     scheduler.register_table(
         "ticks",
         TableConfig {
-            ddl: ddl.to_string(),
             order_col: "ts_micros".to_string(),
             payload_col: "payload_base64".to_string(),
             filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
@@ -128,13 +117,7 @@ fn bench_query_paths(c: &mut Criterion) {
     group.bench_function("hot_only", |b| {
         let fixture = RefCell::new(build_fixture(999_999));
         b.iter_batched(
-            || {
-                fixture
-                    .borrow()
-                    .scheduler
-                    .clear_duckdb_table("ticks")
-                    .expect("clear table");
-            },
+            || (),
             |_| {
                 let fixture = fixture.borrow();
                 fixture
@@ -149,13 +132,7 @@ fn bench_query_paths(c: &mut Criterion) {
     group.bench_function("mixed_skip_cold", |b| {
         let fixture = RefCell::new(build_fixture(1_100_000));
         b.iter_batched(
-            || {
-                fixture
-                    .borrow()
-                    .scheduler
-                    .clear_duckdb_table("ticks")
-                    .expect("clear table");
-            },
+            || (),
             |_| {
                 let fixture = fixture.borrow();
                 fixture
