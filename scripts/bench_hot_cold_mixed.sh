@@ -179,7 +179,7 @@ for i in range(batch_size):
     ts=batch_start+i+1
     sym=symbols[i % len(symbols)]
     rows.append(f"('alpha','{sym}',{ts},'AQ==',{seq_start+i})")
-print("INSERT INTO ticks (tenant, symbol, ts_micros, payload_base64, seq) VALUES " + ",".join(rows))
+print("INSERT INTO proxist.ticks (tenant, symbol, ts_micros, payload_base64, seq) VALUES " + ",".join(rows))
 PY
 )
   if ! psql -h 127.0.0.1 -p "${PROXIST_PG_PORT}" -U "${PROXIST_PG_USER}" -d postgres -c "${sql}" >/dev/null 2>&1; then
@@ -212,7 +212,7 @@ append_hot_rows() {
 build_query() {
   cat <<SQL
 SELECT symbol, ts_micros, payload_base64
-FROM ticks
+FROM proxist.ticks
 WHERE tenant = 'alpha'
   AND symbol IN ('SYM1','SYM2','SYM3')
   AND ts_micros BETWEEN ${WINDOW_START} AND ${WINDOW_END}
