@@ -4,12 +4,12 @@ Proxist is a Rust-native time-series proxy that keeps the hot working set in mem
 
 ## Implementation Status
 
-- **Working today**: HTTP control surface (`/query`, `/status`, `/assignments`, `/health`), disk or in-memory WAL with replay snapshots, hot column store, ClickHouse persistence with retry/backoff, SQLite-backed metadata + persistence trackers, metadata-driven ingest wiring, `pxctl` CLI (status/apply/query/rolling windows), and Docker-based integration test harness.
+- **Working today**: HTTP control surface (`/query`, `/status`, `/assignments`, `/health`) plus ClickHouse-compatible SQL ingest, disk or in-memory WAL with replay snapshots, hot column store, ClickHouse persistence with retry/backoff, SQLite-backed metadata + persistence trackers, metadata-driven ingest wiring via DDL annotations, `pxctl` CLI (status/apply/query/rolling windows), and Docker-based integration test harness.
 - **MVP outstanding**: none — core durability, seam-aware queries, metadata workflows, observability, and regression coverage are in place.
 
 ## High-Level Components
 
-1. **Ingress API (gRPC/arrow/http)** — accepts tick streams, batches, and control messages.
+1. **SQL Ingest (ClickHouse-compatible HTTP)** — accepts DDL and INSERT statements; ingest mapping is driven by `proxist:` annotations.
 2. **Hot Set Store (`proxist-mem`)** — columnar, time-sorted storage optimized for sub-millisecond reads; maintains symbol dictionaries and per-symbol indexes.
 3. **Write-Ahead Log (`proxist-wal`)** — append-only, checksum-protected log on local NVMe; forms the durability boundary for acknowledgments.
 4. **Persistence Sink (`proxist-ch`)** — micro-batches log segments to ClickHouse using ordered inserts and deduplication guards.
@@ -21,11 +21,11 @@ Proxist is a Rust-native time-series proxy that keeps the hot working set in mem
 
 ### Ingest Path
 
-1. Client submits ticks to an ingress endpoint with tenant and table metadata.
-2. `proxistd` validates schema/version via the metadata store and enriches ticks with symbol IDs.
+1. Client submits CREATE TABLE (with `proxist:` annotation) and INSERT statements through the SQL endpoint.
+2. `proxistd` derives the ingest mapping from the annotation (order/payload/filter/seq columns).
 3. Data is appended into the WAL (disk-backed when `PROXIST_WAL_DIR` is set, in-memory otherwise) and streamed into the hot column store.
 4. Acknowledgment returns as soon as the WAL fsync completes (target < 100 µs).
-5. The metadata service updates per-table high-watermarks, out-of-order buffers, and ingress metrics.
+5. The metadata service updates per-table high-watermarks, out-of-order buffers, and ingest metrics.
 
 ### Persistence Path
 
@@ -47,7 +47,7 @@ Proxist is a Rust-native time-series proxy that keeps the hot working set in mem
 
 Each shard maintains a lightweight state machine around `T_persisted`:
 
-1. **Capture** — ingest ticks, append to WAL, mark `T_wal` high-watermark.
+1. **Capture** — ingest rows from SQL INSERT, append to WAL, mark `T_wal` high-watermark.
 2. **FlushReady** — once batch thresholds met, segment transitions to ready state.
 3. **Persisting** — ClickHouse insert in flight; metadata records pending batch ID.
 4. **Committed** — ClickHouse confirms insert; `T_persisted` advances to the batch end timestamp.

@@ -663,7 +663,7 @@ async fn execute_sql_batch(
                                     &mut seq_counter,
                                 )?;
                                 if !records.is_empty() {
-                                    state.ingest.ingest(records).await?;
+                                    state.ingest.ingest_records(records).await?;
                                 }
                                 outputs.push(SqlBatchResult::Text("Ok.\n".to_string()));
                             } else {
@@ -1747,7 +1747,7 @@ mod ingest_tests {
             payload: vec![1],
             seq: 1,
         }];
-        service.ingest(records).await?;
+        service.ingest_records(records).await?;
 
         let state = AppState {
             metadata: metadata.clone(),
@@ -1820,7 +1820,7 @@ mod ingest_tests {
 
         let ts = SystemTime::UNIX_EPOCH + Duration::from_millis(500);
         service
-            .ingest(vec![IngestRecord {
+            .ingest_records(vec![IngestRecord {
                 tenant: "alpha".into(),
                 shard_id: String::new(),
                 symbol: "AAPL".into(),
@@ -1895,7 +1895,7 @@ mod wal_replay_tests {
 
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
         service
-            .ingest(vec![IngestRecord {
+            .ingest_records(vec![IngestRecord {
                 tenant: "alpha".into(),
                 shard_id: String::new(),
                 symbol: "AAPL".into(),

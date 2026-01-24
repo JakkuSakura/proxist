@@ -370,7 +370,7 @@ impl IngestService {
         Ok(())
     }
 
-    pub async fn ingest(&self, records: Vec<IngestRecord>) -> Result<()> {
+    pub async fn ingest_records(&self, records: Vec<IngestRecord>) -> Result<()> {
         let start = Instant::now();
         let mut rows_written = 0_u64;
         let span = tracing::info_span!("ingest", rows = records.len());
@@ -938,7 +938,7 @@ mod tests {
             seq: 7,
         }];
 
-        service.ingest(records).await?;
+        service.ingest_records(records).await?;
 
         let rows = hot_store.rows.lock().await.clone();
         assert_eq!(rows.len(), 1);
@@ -1018,7 +1018,7 @@ mod tests {
             },
         ];
 
-        service.ingest(records).await?;
+        service.ingest_records(records).await?;
 
         // Hot store should have both rows available via range query.
         let hot_rows = hot_store
@@ -1105,7 +1105,7 @@ mod tests {
             },
         ];
 
-        service.ingest(records).await?;
+        service.ingest_records(records).await?;
         let summary = service.hot_cold_summary().await?;
 
         let mut map = std::collections::HashMap::new();

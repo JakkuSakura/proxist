@@ -47,7 +47,7 @@ For the full design matrix, see `docs/design-goals.md`.
 - HTTP daemon (`proxistd`) exposes `/query`, `/status`, `/assignments`, and `/health` (ingest via SQL INSERT).
 - Ingest pipeline appends to an in-memory WAL, writes into the hot column store, and optionally flushes batches to ClickHouse via JSONEachRow.
 - Metadata lives in SQLite with shard assignments, symbol dictionaries, and shard health snapshots surfaced through `/status`.
-- `pxctl` CLI drives status, ingest, query, seam inspection, and assignment workflows over REST (e.g., `pxctl query --tenant alpha --symbols AAPL --op last_by --end-micros …`).
+- `pxctl` CLI drives status, query, seam inspection, and assignment workflows over REST (e.g., `pxctl query --tenant alpha --symbols AAPL --op last_by --end-micros …`).
 - `pxctl hot-summary` surfaces proxist’s seam state, returning per-symbol in-memory row counts and persistence watermarks (add `--json` for machine consumption).
 - `pxctl` queries support `range`, `last_by`, and `asof`, with optional `--include-cold` to merge ClickHouse history across the persistence watermark.
 

@@ -6,8 +6,8 @@ deterministically so callers always see a single, ordered timeline.
 
 ## Ingest Flow
 
-1. **Append** – writes are appended to the WAL and inserted into the in-memory
-   column store.
+1. **Append** – SQL INSERTs are appended to the WAL and inserted into the
+   in-memory column store.
 2. **Persist** – background flush batches ship those rows to ClickHouse. Once
    ClickHouse confirms the batch, the shard’s persistence tracker advances its
    persisted watermark.

@@ -19,7 +19,6 @@ struct Fixture {
     rt: tokio::runtime::Runtime,
     scheduler: ProxistScheduler,
     sql: String,
-    _tmp: tempfile::TempDir,
 }
 
 fn build_fixture(cutoff_micros: i64) -> Fixture {
@@ -47,13 +46,11 @@ fn build_fixture(cutoff_micros: i64) -> Fixture {
         }
     });
 
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let duckdb_path = tmp.path().join("bench.duckdb");
     let scheduler = rt
         .block_on(ProxistScheduler::new(
             ExecutorConfig {
                 sqlite_path: None,
-                duckdb_path: Some(duckdb_path.to_string_lossy().to_string()),
+                duckdb_path: Some(":memory:".to_string()),
                 pg_url: None,
             },
             None,
@@ -113,12 +110,7 @@ CREATE TABLE ticks (
         end = end_micros
     );
 
-    Fixture {
-        rt,
-        scheduler,
-        sql,
-        _tmp: tmp,
-    }
+    Fixture { rt, scheduler, sql }
 }
 
 fn run_query(fixture: Fixture) {
