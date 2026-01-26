@@ -1250,7 +1250,11 @@ impl ProxistDaemon {
             persisted_cutoff_override: self.config.persisted_cutoff_override,
             http_dialect: self.config.http_dialect.clone(),
             pg_binary: self.config.pg_binary,
-            default_table: self.config.clickhouse.as_ref().map(|cfg| cfg.table.clone()),
+            default_table: self
+                .config
+                .clickhouse
+                .as_ref()
+                .map(|cfg| format!("{}.{}", cfg.database, cfg.table)),
         };
 
         async fn status_handler(
@@ -1479,7 +1483,11 @@ impl ProxistDaemon {
             persisted_cutoff_override: self.config.persisted_cutoff_override,
             http_dialect: self.config.http_dialect.clone(),
             pg_binary: self.config.pg_binary,
-            default_table: self.config.clickhouse.as_ref().map(|cfg| cfg.table.clone()),
+            default_table: self
+                .config
+                .clickhouse
+                .as_ref()
+                .map(|cfg| format!("{}.{}", cfg.database, cfg.table)),
         };
         pgwire_server::serve(pg_addr, Arc::new(state), self.config.pg_dialect.clone()).await
     }

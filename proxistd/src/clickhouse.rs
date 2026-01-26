@@ -112,7 +112,9 @@ impl ClickhouseSink for ClickhouseHttpSink {
             ));
 
             for record in chunk {
-                if record.table != self.config.table {
+                let expected = self.config.table.as_str();
+                let qualified = format!("{}.{}", self.config.database, self.config.table);
+                if record.table != expected && record.table != qualified {
                     anyhow::bail!(
                         "ingest row table {} does not match ClickHouse sink table {}",
                         record.table,
