@@ -62,15 +62,21 @@ fn build_fixture(cutoff_micros: i64) -> Fixture {
         "ticks",
         TableConfig {
             order_col: "ts_micros".to_string(),
-            payload_col: "payload_base64".to_string(),
             filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
             seq_col: Some("seq".to_string()),
             columns: vec![
                 "tenant".to_string(),
                 "symbol".to_string(),
                 "ts_micros".to_string(),
-                "payload_base64".to_string(),
+                "payload".to_string(),
                 "seq".to_string(),
+            ],
+            column_types: vec![
+                proxistd::scheduler::ColumnType::Text,
+                proxistd::scheduler::ColumnType::Text,
+                proxistd::scheduler::ColumnType::Int64,
+                proxistd::scheduler::ColumnType::Text,
+                proxistd::scheduler::ColumnType::Int64,
             ],
         },
     );
@@ -89,7 +95,7 @@ fn build_fixture(cutoff_micros: i64) -> Fixture {
     rt.block_on(scheduler.update_hot_stats(&stats));
 
     let sql = format!(
-        "SELECT symbol, ts_micros, payload_base64 \
+        "SELECT symbol, ts_micros, payload \
          FROM ticks \
          WHERE tenant = '{tenant}' \
            AND symbol IN ('SYM1','SYM2','SYM3') \

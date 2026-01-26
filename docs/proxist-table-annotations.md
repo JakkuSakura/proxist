@@ -8,11 +8,10 @@ Annotating DDL
 - Add a single-line SQL comment anywhere in your DDL with a `proxist:` directive. Keys are comma-separated.
 
 Example
--- proxist: order_col=ts_micros, payload_col=payload_base64, filter_cols=group_key,entity_key, seq_col=seq
+-- proxist: order_col=ts_micros, filter_cols=group_key,entity_key, seq_col=seq
 
 Keys
 - order_col: Name of the column used for range predicates (e.g., time or monotonic order column).
-- payload_col: Name of the column holding the payload bytes (encoded base64 in ClickHouse).
 - filter_cols: Comma-separated list of key columns (minimum two). The first is the group/partition key; the second is the per-entity selector.
 - seq_col (optional): Sequence column name if applicable.
 

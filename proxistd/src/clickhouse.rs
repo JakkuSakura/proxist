@@ -2,7 +2,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use proxist_core::ingest::IngestSegment;
 use reqwest::Client;
 use serde::de::{self, Visitor};
@@ -112,14 +111,15 @@ impl ClickhouseSink for ClickhouseHttpSink {
             ));
 
             for record in chunk {
-                let payload_base64 = BASE64_STANDARD.encode(&record.payload);
+                let payload = std::str::from_utf8(&record.payload)
+                    .context("payload must be valid UTF-8 for ClickHouse HTTP ingest")?;
                 let micros = system_time_to_micros(record.timestamp);
                 let row = json!({
                     "tenant": record.tenant,
                     "shard_id": record.shard_id,
                     "symbol": record.symbol,
                     "ts_micros": micros,
-                    "payload_base64": payload_base64,
+                    "payload": payload,
                     "seq": record.seq,
                 });
                 let line = serde_json::to_string(&row).context("serialize ClickHouse row")?;
@@ -249,7 +249,7 @@ pub struct ClickhouseQueryRow {
     pub symbol: String,
     #[serde(deserialize_with = "deserialize_i64_any")]
     pub ts_micros: i64,
-    pub payload_base64: String,
+    pub payload: String,
 }
 
 #[cfg(feature = "clickhouse-native")]
@@ -258,6 +258,11 @@ fn block_to_rowset(block: &Block<Complex>) -> anyhow::Result<crate::scheduler::R
         .columns()
         .iter()
         .map(|col| col.name().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let column_types = block
+        .columns()
+        .iter()
+        .map(|col| map_sql_type_to_column_type(col.sql_type()))
         .collect::<Vec<_>>();
     let mut column_values = Vec::with_capacity(block.columns().len());
     for col in block.columns() {
@@ -273,7 +278,11 @@ fn block_to_rowset(block: &Block<Complex>) -> anyhow::Result<crate::scheduler::R
         }
         rows.push(row);
     }
-    Ok(crate::scheduler::RowSet { columns, rows })
+    Ok(crate::scheduler::RowSet {
+        columns,
+        column_types,
+        rows,
+    })
 }
 
 #[cfg(feature = "clickhouse-native")]
@@ -382,6 +391,26 @@ fn column_to_values(
             _ => anyhow::bail!("unsupported nullable column type {inner:?}"),
         },
         other => anyhow::bail!("unsupported column type {other:?}"),
+    }
+}
+
+#[cfg(feature = "clickhouse-native")]
+fn map_sql_type_to_column_type(sql_type: SqlType) -> crate::scheduler::ColumnType {
+    use crate::scheduler::ColumnType;
+    match sql_type {
+        SqlType::Int8
+        | SqlType::Int16
+        | SqlType::Int32
+        | SqlType::Int64
+        | SqlType::UInt8
+        | SqlType::UInt16
+        | SqlType::UInt32
+        | SqlType::UInt64 => ColumnType::Int64,
+        SqlType::Float32 | SqlType::Float64 => ColumnType::Float64,
+        SqlType::Bool => ColumnType::Bool,
+        SqlType::Nullable(inner) => map_sql_type_to_column_type(inner.clone()),
+        SqlType::String | SqlType::FixedString(_) => ColumnType::Text,
+        _ => ColumnType::Text,
     }
 }
 
@@ -519,7 +548,7 @@ impl ClickhouseHttpClient {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT symbol, ts_micros, payload_base64 \
+            "SELECT symbol, ts_micros, payload \
              FROM {table} \
              WHERE tenant = '{tenant}' \
                AND symbol IN ({symbols}) \
@@ -551,7 +580,7 @@ impl ClickhouseHttpClient {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT symbol, ts_micros, payload_base64 \
+            "SELECT symbol, ts_micros, payload \
              FROM {table} \
              WHERE tenant = '{tenant}' \
                AND symbol IN ({symbols}) \

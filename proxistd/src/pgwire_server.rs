@@ -16,16 +16,19 @@ use serde_json::{Map, Value as JsonValue};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::{
-    execute_sql_batch, AppError, AppState, DialectMode, ScalarValue, SqlBatchResult, SqlResult,
-};
+use crate::{execute_sql_batch, AppError, AppState, DialectMode, SqlBatchResult, SqlResult};
+use crate::scheduler::{ColumnType, ScalarValue};
 
 pub async fn serve(
     addr: SocketAddr,
     state: Arc<AppState>,
     dialect: DialectMode,
 ) -> anyhow::Result<()> {
-    let handler = Arc::new(PgHandler { state, dialect });
+    let handler = Arc::new(PgHandler {
+        binary: state.pg_binary,
+        state,
+        dialect,
+    });
     let factory = Arc::new(PgHandlerFactory { handler });
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "postgres wire listener started");
@@ -43,6 +46,7 @@ pub async fn serve(
 struct PgHandler {
     state: Arc<AppState>,
     dialect: DialectMode,
+    binary: bool,
 }
 
 #[async_trait]
@@ -65,7 +69,7 @@ impl SimpleQueryHandler for PgHandler {
                 SqlBatchResult::Text(text) => text_response(text),
                 SqlBatchResult::Scheduler(result) => match result {
                     SqlResult::Rows(rows) => rows_response(rows),
-                    SqlResult::TypedRows(rows) => rows_response_typed(rows),
+                    SqlResult::TypedRows(rows) => rows_response_typed(rows, self.binary),
                     SqlResult::Text(text) => text_response(text),
                     SqlResult::Clickhouse(wire) => match wire.format {
                         crate::scheduler::ClickhouseWireFormat::JsonEachRow => {
@@ -178,22 +182,42 @@ fn rows_response(rows: Vec<Map<String, JsonValue>>) -> Response<'static> {
     Response::Query(QueryResponse::new(schema, stream))
 }
 
-fn rows_response_typed(rows: crate::RowSet) -> Response<'static> {
+fn rows_response_typed(rows: crate::RowSet, binary: bool) -> Response<'static> {
+    let format = if binary {
+        FieldFormat::Binary
+    } else {
+        FieldFormat::Text
+    };
     let schema = Arc::new(
         rows.columns
             .iter()
-            .map(|name| FieldInfo::new(name.clone(), None, None, Type::VARCHAR, FieldFormat::Text))
+            .enumerate()
+            .map(|(idx, name)| {
+                let col_type = rows
+                    .column_types
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(ColumnType::Text);
+                FieldInfo::new(name.clone(), None, None, column_type_to_pg(col_type), format)
+            })
             .collect::<Vec<_>>(),
     );
 
     let columns = rows.columns;
+    let types = rows.column_types;
     let data = rows.rows.into_iter();
     let schema_ref = schema.clone();
     let stream = stream::iter(data).map(move |row| {
         let mut encoder = DataRowEncoder::new(schema_ref.clone());
         for (idx, _col) in columns.iter().enumerate() {
-            let value = row.get(idx).and_then(scalar_value_to_string);
-            encoder.encode_field(&value)?;
+            let ty = types.get(idx).copied().unwrap_or(ColumnType::Text);
+            let value = row.get(idx);
+            if binary {
+                encode_scalar_binary(&mut encoder, ty, value)?;
+            } else {
+                let text = value.and_then(scalar_value_to_string);
+                encoder.encode_field(&text)?;
+            }
         }
         encoder.finish()
     });
@@ -229,5 +253,133 @@ fn scalar_value_to_string(value: &ScalarValue) -> Option<String> {
         ScalarValue::Int64(v) => Some(v.to_string()),
         ScalarValue::Float64(v) => Some(v.to_string()),
         ScalarValue::Bool(v) => Some(v.to_string()),
+    }
+}
+
+fn encode_scalar_binary(
+    encoder: &mut DataRowEncoder,
+    ty: ColumnType,
+    value: Option<&ScalarValue>,
+) -> PgWireResult<()> {
+    match ty {
+        ColumnType::Int64 => match value {
+            Some(ScalarValue::Int64(v)) => {
+                encoder.encode_field_with_type_and_format(&v, &Type::INT8, FieldFormat::Binary)
+            }
+            Some(ScalarValue::Float64(v)) => {
+                let v = *v as i64;
+                encoder.encode_field_with_type_and_format(&v, &Type::INT8, FieldFormat::Binary)
+            }
+            Some(ScalarValue::String(s)) => {
+                let parsed = s.parse::<i64>().unwrap_or_default();
+                encoder.encode_field_with_type_and_format(&parsed, &Type::INT8, FieldFormat::Binary)
+            }
+            Some(ScalarValue::Bool(v)) => {
+                let mapped = if *v { 1_i64 } else { 0_i64 };
+                encoder.encode_field_with_type_and_format(
+                    &mapped,
+                    &Type::INT8,
+                    FieldFormat::Binary,
+                )
+            }
+            _ => encoder.encode_field_with_type_and_format(
+                &Option::<i64>::None,
+                &Type::INT8,
+                FieldFormat::Binary,
+            ),
+        },
+        ColumnType::Float64 => match value {
+            Some(ScalarValue::Float64(v)) => encoder.encode_field_with_type_and_format(
+                &v,
+                &Type::FLOAT8,
+                FieldFormat::Binary,
+            ),
+            Some(ScalarValue::Int64(v)) => {
+                let mapped = *v as f64;
+                encoder.encode_field_with_type_and_format(
+                    &mapped,
+                    &Type::FLOAT8,
+                    FieldFormat::Binary,
+                )
+            }
+            Some(ScalarValue::String(s)) => {
+                let parsed = s.parse::<f64>().unwrap_or_default();
+                encoder.encode_field_with_type_and_format(
+                    &parsed,
+                    &Type::FLOAT8,
+                    FieldFormat::Binary,
+                )
+            }
+            _ => encoder.encode_field_with_type_and_format(
+                &Option::<f64>::None,
+                &Type::FLOAT8,
+                FieldFormat::Binary,
+            ),
+        },
+        ColumnType::Bool => match value {
+            Some(ScalarValue::Bool(v)) => encoder.encode_field_with_type_and_format(
+                &v,
+                &Type::BOOL,
+                FieldFormat::Binary,
+            ),
+            Some(ScalarValue::String(s)) => {
+                let mapped = s.eq_ignore_ascii_case("true");
+                encoder.encode_field_with_type_and_format(
+                    &mapped,
+                    &Type::BOOL,
+                    FieldFormat::Binary,
+                )
+            }
+            _ => encoder.encode_field_with_type_and_format(
+                &Option::<bool>::None,
+                &Type::BOOL,
+                FieldFormat::Binary,
+            ),
+        },
+        ColumnType::Text => match value {
+            Some(ScalarValue::String(s)) => encoder.encode_field_with_type_and_format(
+                s,
+                &Type::VARCHAR,
+                FieldFormat::Binary,
+            ),
+            Some(ScalarValue::Int64(v)) => {
+                let s = v.to_string();
+                encoder.encode_field_with_type_and_format(
+                    &s,
+                    &Type::VARCHAR,
+                    FieldFormat::Binary,
+                )
+            }
+            Some(ScalarValue::Float64(v)) => {
+                let s = v.to_string();
+                encoder.encode_field_with_type_and_format(
+                    &s,
+                    &Type::VARCHAR,
+                    FieldFormat::Binary,
+                )
+            }
+            Some(ScalarValue::Bool(v)) => {
+                let s = v.to_string();
+                encoder.encode_field_with_type_and_format(
+                    &s,
+                    &Type::VARCHAR,
+                    FieldFormat::Binary,
+                )
+            }
+            _ => encoder.encode_field_with_type_and_format(
+                &Option::<&str>::None,
+                &Type::VARCHAR,
+                FieldFormat::Binary,
+            ),
+        },
+    }
+}
+
+fn column_type_to_pg(ty: ColumnType) -> Type {
+    match ty {
+        ColumnType::Int64 => Type::INT8,
+        ColumnType::Float64 => Type::FLOAT8,
+        ColumnType::Bool => Type::BOOL,
+        ColumnType::Text => Type::VARCHAR,
     }
 }

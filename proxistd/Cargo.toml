@@ -19,7 +19,6 @@ proxist-mem = { path = "../proxist-mem" }
 proxist-wal = { path = "../proxist-wal" }
 serde_bytes.workspace = true
 tempfile.workspace = true
-base64.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 chrono = { version = "=0.4.31", default-features = false, features = ["std"] }

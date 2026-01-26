@@ -100,19 +100,36 @@ pub fn rewrite_with_bounds(
     Some(stmt.to_string())
 }
 
-pub fn parse_table_schema_from_ddl(sql: &str) -> Option<(String, Vec<String>)> {
+pub fn parse_table_schema_from_ddl(sql: &str) -> Option<(String, Vec<(String, super::ColumnType)>)> {
     let mut stmts = Parser::parse_sql(&ClickHouseDialect {}, sql).ok()?;
     for stmt in stmts.drain(..) {
         if let Statement::CreateTable { name, columns, .. } = stmt {
             let table = name.to_string().to_ascii_lowercase();
             let cols = columns
                 .into_iter()
-                .map(|col| col.name.value.to_ascii_lowercase())
+                .map(|col| {
+                    let name = col.name.value.to_ascii_lowercase();
+                    let ty = map_data_type(&col.data_type);
+                    (name, ty)
+                })
                 .collect::<Vec<_>>();
             return Some((table, cols));
         }
     }
     None
+}
+
+fn map_data_type(data_type: &fp_sql::ast::DataType) -> super::ColumnType {
+    let lowered = data_type.to_string().to_ascii_lowercase();
+    if lowered.contains("int") {
+        super::ColumnType::Int64
+    } else if lowered.contains("float") || lowered.contains("double") {
+        super::ColumnType::Float64
+    } else if lowered.contains("bool") {
+        super::ColumnType::Bool
+    } else {
+        super::ColumnType::Text
+    }
 }
 
 #[derive(Debug, Clone)]

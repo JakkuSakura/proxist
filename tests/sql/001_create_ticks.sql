@@ -5,7 +5,7 @@ CREATE TABLE ticks
     shard_id String,
     symbol String,
     ts_micros Int64,
-    payload_base64 String,
+    payload String,
     seq UInt64
 ) ENGINE = MixedMergeTree
 ORDER BY (tenant, symbol, ts_micros);

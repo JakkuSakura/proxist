@@ -28,7 +28,6 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "macros", "sqlite"] }
-base64 = "0.21"
 tempfile = "3"
 metrics = "0.21"
 metrics-exporter-prometheus = "0.13"

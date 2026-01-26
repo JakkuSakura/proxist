@@ -10,6 +10,7 @@ END_MICROS="${PROXIST_BENCH_END_MICROS:-1704103205000000}"
 PROXIST_PG_PORT="${PROXIST_PG_PORT:-15432}"
 PROXIST_PG_ADDR="127.0.0.1:${PROXIST_PG_PORT}"
 PROXIST_PG_USER="${PROXIST_PG_USER:-postgres}"
+PROXIST_PG_BINARY="${PROXIST_PG_BINARY:-1}"
 PROXIST_CLICKHOUSE_NATIVE_URL="${PROXIST_CLICKHOUSE_NATIVE_URL:-tcp://127.0.0.1:19000/proxist}"
 TOTAL_ROWS="${PROXIST_BENCH_TOTAL_ROWS:-20000000}"
 if [[ "${TOTAL_ROWS}" -le 0 ]]; then
@@ -112,6 +113,7 @@ start_proxistd() {
     PROXIST_HTTP_ADDR="${PROXIST_ADDR}" \
     PROXIST_PG_ADDR="${PROXIST_PG_ADDR}" \
     PROXIST_PG_DIALECT="clickhouse" \
+    PROXIST_PG_BINARY="${PROXIST_PG_BINARY}" \
     PROXIST_CLICKHOUSE_ENDPOINT="http://127.0.0.1:18123" \
     PROXIST_CLICKHOUSE_DATABASE="proxist" \
     PROXIST_CLICKHOUSE_TABLE="ticks" \
@@ -180,8 +182,8 @@ rows=[]
 for i in range(batch_size):
     ts=batch_start+i+1
     sym=symbols[i % len(symbols)]
-    rows.append(f"('alpha','{sym}',{ts},'AQ==',{seq_start+i})")
-print("INSERT INTO proxist.ticks (tenant, symbol, ts_micros, payload_base64, seq) VALUES " + ",".join(rows))
+    rows.append(f"('alpha','{sym}',{ts},'1',{seq_start+i})")
+print("INSERT INTO proxist.ticks (tenant, symbol, ts_micros, payload, seq) VALUES " + ",".join(rows))
 PY
 )
   if ! psql -h 127.0.0.1 -p "${PROXIST_PG_PORT}" -U "${PROXIST_PG_USER}" -d postgres -c "${sql}" >/dev/null 2>&1; then
@@ -213,7 +215,7 @@ append_hot_rows() {
 
 build_query() {
   cat <<SQL
-SELECT symbol, ts_micros, payload_base64
+SELECT symbol, ts_micros, payload
 FROM proxist.ticks
 WHERE tenant = 'alpha'
   AND symbol IN ('SYM1','SYM2','SYM3')
@@ -330,11 +332,11 @@ CREATE TABLE proxist.ticks (
   shard_id String,
   symbol String,
   ts_micros Int64,
-  payload_base64 String,
+  payload String,
   seq UInt64
 ) ENGINE = MergeTree
 ORDER BY (tenant, symbol, ts_micros)
-COMMENT 'proxist: order_col=ts_micros, payload_col=payload_base64, filter_cols=tenant symbol; seq_col=seq'
+COMMENT 'proxist: order_col=ts_micros, filter_cols=tenant symbol; seq_col=seq'
 SQL
 )
   CREATE_OUT="$(mktemp)"
@@ -356,7 +358,7 @@ INSERT INTO proxist.ticks SELECT
   'alpha-shard' AS shard_id,
   concat('SYM', toString((number % 3) + 1)) AS symbol,
   ${BASE_MICROS} + number AS ts_micros,
-  base64Encode(toString(number)) AS payload_base64,
+  toString(number) AS payload,
   number AS seq
 FROM numbers(${cold_rows});
 SQL
@@ -365,7 +367,7 @@ SQL
 
   if [[ "${PROXIST_BENCH_DEBUG_CH:-0}" == "1" ]]; then
     CH_SAMPLE_FILE="$(mktemp)"
-    "${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "SELECT symbol, ts_micros, payload_base64 FROM proxist.ticks WHERE tenant = 'alpha' AND symbol IN ('SYM1','SYM2','SYM3') AND ts_micros BETWEEN ${WINDOW_START} AND ${WINDOW_END} ORDER BY ts_micros ASC FORMAT JSONEachRow" >"${CH_SAMPLE_FILE}"
+    "${COMPOSE_CMD[@]}" exec -T clickhouse clickhouse-client --query "SELECT symbol, ts_micros, payload FROM proxist.ticks WHERE tenant = 'alpha' AND symbol IN ('SYM1','SYM2','SYM3') AND ts_micros BETWEEN ${WINDOW_START} AND ${WINDOW_END} ORDER BY ts_micros ASC FORMAT JSONEachRow" >"${CH_SAMPLE_FILE}"
     echo "ClickHouse sample output saved to ${CH_SAMPLE_FILE}"
     head -n 5 "${CH_SAMPLE_FILE}"
   fi

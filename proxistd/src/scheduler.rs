@@ -2,7 +2,6 @@ use crate::clickhouse::{ClickhouseHttpClient, ClickhouseNativeClient};
 use crate::metadata_sqlite::SqliteMetadataStore;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use base64::Engine as _;
 mod plan;
 use plan::{
     build_table_plan, parse_table_schema_from_ddl, rewrite_with_bounds, OrderItem, Predicate,
@@ -79,19 +78,30 @@ pub enum ScalarValue {
     Bool(bool),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnType {
+    Text,
+    Int64,
+    Float64,
+    Bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct RowSet {
     pub columns: Vec<String>,
+    pub column_types: Vec<ColumnType>,
     pub rows: Vec<Vec<ScalarValue>>,
 }
+
+const DEFAULT_PAYLOAD_COLUMN: &str = "payload";
 
 #[derive(Debug, Clone)]
 pub struct TableConfig {
     pub order_col: String,
-    pub payload_col: String,
     pub filter_cols: Vec<String>,
     pub seq_col: Option<String>,
     pub columns: Vec<String>,
+    pub column_types: Vec<ColumnType>,
 }
 
 pub struct ProxistScheduler {
@@ -148,14 +158,20 @@ impl ProxistScheduler {
         if columns.is_empty() {
             anyhow::bail!("proxist annotation requires explicit column definitions");
         }
+        let mut column_names = Vec::with_capacity(columns.len());
+        let mut column_types = Vec::with_capacity(columns.len());
+        for (name, ty) in columns {
+            column_names.push(name);
+            column_types.push(ty);
+        }
         self.register_table(
             table,
             TableConfig {
                 order_col: annotation.order_col,
-                payload_col: annotation.payload_col,
                 filter_cols: annotation.filter_cols,
                 seq_col: annotation.seq_col,
-                columns,
+                columns: column_names,
+                column_types,
             },
         );
         Ok(())
@@ -277,12 +293,17 @@ impl SqlExecutor for ProxistScheduler {
                                     limit_hint,
                                 ) {
                                     let columns = expected_columns(&plan);
+                                    let column_types = expected_column_types(&plan);
                                     match requested_format {
                                         ClickhouseWireFormat::JsonEachRow => {
                                             if let Some(ch) = &self.clickhouse {
                                                 let cold_sql = ensure_jsoneachrow(&cold_sql);
                                                 let text = ch.execute_raw(&cold_sql).await?;
-                                                cold_rows = Some(parse_json_rows(&text, &columns)?);
+                                                cold_rows = Some(parse_json_rows(
+                                                    &text,
+                                                    &columns,
+                                                    &column_types,
+                                                )?);
                                             } else {
                                                 plan_failed = true;
                                             }
@@ -305,7 +326,9 @@ impl SqlExecutor for ProxistScheduler {
                                                             let text =
                                                                 ch.execute_raw(&cold_sql).await?;
                                                             cold_rows = Some(parse_csv_rows(
-                                                                &text, &columns,
+                                                                &text,
+                                                                &columns,
+                                                                &column_types,
                                                             )?);
                                                         } else {
                                                             plan_failed = true;
@@ -315,8 +338,11 @@ impl SqlExecutor for ProxistScheduler {
                                             } else if let Some(ch) = &self.clickhouse {
                                                 let cold_sql = ensure_csv_with_names(&cold_sql);
                                                 let text = ch.execute_raw(&cold_sql).await?;
-                                                cold_rows =
-                                                    Some(parse_csv_rows(&text, &columns)?);
+                                                cold_rows = Some(parse_csv_rows(
+                                                    &text,
+                                                    &columns,
+                                                    &column_types,
+                                                )?);
                                             } else {
                                                 plan_failed = true;
                                             }
@@ -352,7 +378,8 @@ impl SqlExecutor for ProxistScheduler {
                         }
 
                         if !plan_failed && (cold_rows.is_some() || hot_rows.is_some()) {
-                            let merged = merge_rows(cold_rows, hot_rows, &plan)?;
+                            let cold_sorted = plan.order_by.first().is_some();
+                            let merged = merge_rows(cold_rows, hot_rows, &plan, cold_sorted)?;
                             let sliced = apply_offset_limit(merged, plan.offset, plan.limit);
                             return Ok(SqlResult::TypedRows(sliced));
                         }
@@ -475,7 +502,7 @@ struct HotRowFlat {
     k0: String,
     k1: String,
     ord_micros: i64,
-    payload_base64: String,
+    payload: Vec<u8>,
     seq: i64,
 }
 
@@ -628,7 +655,7 @@ async fn load_hot_rows(
             k0: sel.key0.clone(),
             k1: row.symbol,
             ord_micros: system_time_to_micros(row.timestamp),
-            payload_base64: base64::engine::general_purpose::STANDARD.encode(&row.payload),
+            payload: row.payload,
             seq: 0,
         });
     }
@@ -652,7 +679,11 @@ fn micros_to_system_time(micros: i64) -> SystemTime {
     }
 }
 
-fn parse_csv_rows(text: &str, columns: &[String]) -> anyhow::Result<RowSet> {
+fn parse_csv_rows(
+    text: &str,
+    columns: &[String],
+    column_types: &[ColumnType],
+) -> anyhow::Result<RowSet> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .from_reader(text.as_bytes());
@@ -670,21 +701,30 @@ fn parse_csv_rows(text: &str, columns: &[String]) -> anyhow::Result<RowSet> {
     for record in reader.records() {
         let record = record?;
         let mut row = Vec::with_capacity(columns.len());
-        for idx in &positions {
+        for (pos_idx, idx) in positions.iter().enumerate() {
             let value = idx
                 .and_then(|pos| record.get(pos))
                 .unwrap_or("");
-            row.push(parse_scalar_value(value));
+            let ty = column_types
+                .get(pos_idx)
+                .copied()
+                .unwrap_or(ColumnType::Text);
+            row.push(parse_scalar_value(value, ty));
         }
         rows.push(row);
     }
     Ok(RowSet {
         columns: columns.to_vec(),
+        column_types: column_types.to_vec(),
         rows,
     })
 }
 
-fn parse_json_rows(text: &str, columns: &[String]) -> anyhow::Result<RowSet> {
+fn parse_json_rows(
+    text: &str,
+    columns: &[String],
+    column_types: &[ColumnType],
+) -> anyhow::Result<RowSet> {
     let mut rows = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
@@ -695,16 +735,24 @@ fn parse_json_rows(text: &str, columns: &[String]) -> anyhow::Result<RowSet> {
         match value {
             JsonValue::Object(map) => {
                 let mut row = Vec::with_capacity(columns.len());
-                for col in columns {
+                for (idx, col) in columns.iter().enumerate() {
                     let value = map.get(col).cloned().unwrap_or(JsonValue::Null);
-                    row.push(json_to_scalar(value));
+                    let ty = column_types
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(ColumnType::Text);
+                    row.push(json_to_scalar(value, ty));
                 }
                 rows.push(row);
             }
             other => {
                 let mut row = Vec::with_capacity(columns.len());
                 if columns.len() == 1 {
-                    row.push(json_to_scalar(other));
+                    let ty = column_types
+                        .get(0)
+                        .copied()
+                        .unwrap_or(ColumnType::Text);
+                    row.push(json_to_scalar(other, ty));
                 } else {
                     row.resize(columns.len(), ScalarValue::Null);
                 }
@@ -714,67 +762,84 @@ fn parse_json_rows(text: &str, columns: &[String]) -> anyhow::Result<RowSet> {
     }
     Ok(RowSet {
         columns: columns.to_vec(),
+        column_types: column_types.to_vec(),
         rows,
     })
 }
 
-fn parse_scalar_value(value: &str) -> ScalarValue {
+fn parse_scalar_value(value: &str, ty: ColumnType) -> ScalarValue {
     if value.is_empty() {
         return ScalarValue::Null;
     }
-    if let Ok(num) = value.parse::<i64>() {
-        return ScalarValue::Int64(num);
+    match ty {
+        ColumnType::Int64 => value
+            .parse::<i64>()
+            .map(ScalarValue::Int64)
+            .unwrap_or_else(|_| ScalarValue::String(value.to_string())),
+        ColumnType::Float64 => value
+            .parse::<f64>()
+            .map(ScalarValue::Float64)
+            .unwrap_or_else(|_| ScalarValue::String(value.to_string())),
+        ColumnType::Bool => {
+            if value.eq_ignore_ascii_case("true") {
+                ScalarValue::Bool(true)
+            } else if value.eq_ignore_ascii_case("false") {
+                ScalarValue::Bool(false)
+            } else {
+                ScalarValue::String(value.to_string())
+            }
+        }
+        ColumnType::Text => ScalarValue::String(value.to_string()),
     }
-    if let Ok(num) = value.parse::<f64>() {
-        return ScalarValue::Float64(num);
-    }
-    if value.eq_ignore_ascii_case("true") {
-        return ScalarValue::Bool(true);
-    }
-    if value.eq_ignore_ascii_case("false") {
-        return ScalarValue::Bool(false);
-    }
-    ScalarValue::String(value.to_string())
 }
 
-fn json_to_scalar(value: JsonValue) -> ScalarValue {
+fn json_to_scalar(value: JsonValue, ty: ColumnType) -> ScalarValue {
     match value {
         JsonValue::Null => ScalarValue::Null,
-        JsonValue::Bool(v) => ScalarValue::Bool(v),
-        JsonValue::Number(v) => {
-            if let Some(num) = v.as_i64() {
-                ScalarValue::Int64(num)
-            } else if let Some(num) = v.as_f64() {
-                ScalarValue::Float64(num)
-            } else {
-                ScalarValue::Null
+        JsonValue::Bool(v) => match ty {
+            ColumnType::Bool => ScalarValue::Bool(v),
+            _ => ScalarValue::String(v.to_string()),
+        },
+        JsonValue::Number(v) => match ty {
+            ColumnType::Float64 => v
+                .as_f64()
+                .map(ScalarValue::Float64)
+                .unwrap_or(ScalarValue::Null),
+            ColumnType::Int64 => v
+                .as_i64()
+                .map(ScalarValue::Int64)
+                .or_else(|| v.as_f64().map(|f| ScalarValue::Int64(f as i64)))
+                .unwrap_or(ScalarValue::Null),
+            _ => ScalarValue::String(v.to_string()),
+        },
+        JsonValue::String(v) => match ty {
+            ColumnType::Int64 => v
+                .parse::<i64>()
+                .map(ScalarValue::Int64)
+                .unwrap_or_else(|_| ScalarValue::String(v)),
+            ColumnType::Float64 => v
+                .parse::<f64>()
+                .map(ScalarValue::Float64)
+                .unwrap_or_else(|_| ScalarValue::String(v)),
+            ColumnType::Bool => {
+                if v.eq_ignore_ascii_case("true") {
+                    ScalarValue::Bool(true)
+                } else if v.eq_ignore_ascii_case("false") {
+                    ScalarValue::Bool(false)
+                } else {
+                    ScalarValue::String(v)
+                }
             }
-        }
-        JsonValue::String(v) => ScalarValue::String(v),
-        JsonValue::Array(_) | JsonValue::Object(_) => {
-            ScalarValue::String(value.to_string())
-        }
+            _ => ScalarValue::String(v),
+        },
+        JsonValue::Array(_) | JsonValue::Object(_) => ScalarValue::String(value.to_string()),
     }
 }
 
-fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> RowSet {
-    let mut rows = rows;
-    if let Some(order) = plan.order_by.first() {
-        let descending = order.descending;
-        rows.sort_by(|a, b| {
-            if descending {
-                b.ord_micros.cmp(&a.ord_micros)
-            } else {
-                a.ord_micros.cmp(&b.ord_micros)
-            }
-        });
-    }
 
-    let columns = if plan.has_wildcard || plan.select_cols.is_empty() {
-        plan.cfg.columns.clone()
-    } else {
-        plan.select_cols.clone()
-    };
+fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> RowSet {
+    let columns = expected_columns(plan);
+    let column_types = expected_column_types(plan);
     let filter0 = plan
         .cfg
         .filter_cols
@@ -788,7 +853,7 @@ fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> RowSet {
         .map(|c| c.to_ascii_lowercase())
         .unwrap_or_default();
     let order_col = plan.cfg.order_col.to_ascii_lowercase();
-    let payload_col = plan.cfg.payload_col.to_ascii_lowercase();
+    let payload_col = DEFAULT_PAYLOAD_COLUMN.to_ascii_lowercase();
     let seq_col = plan.cfg.seq_col.as_ref().map(|c| c.to_ascii_lowercase());
 
     let mut out = Vec::with_capacity(rows.len());
@@ -802,7 +867,7 @@ fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> RowSet {
             } else if *col == order_col {
                 ScalarValue::Int64(row.ord_micros)
             } else if *col == payload_col {
-                ScalarValue::String(row.payload_base64.clone())
+                ScalarValue::String(String::from_utf8_lossy(&row.payload).to_string())
             } else if seq_col.as_ref().map(|s| s == col).unwrap_or(false) {
                 ScalarValue::Int64(row.seq)
             } else {
@@ -814,6 +879,7 @@ fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> RowSet {
     }
     RowSet {
         columns,
+        column_types,
         rows: out,
     }
 }
@@ -826,9 +892,27 @@ fn expected_columns(plan: &PlanAnalysis) -> Vec<String> {
     }
 }
 
+fn expected_column_types(plan: &PlanAnalysis) -> Vec<ColumnType> {
+    let columns = expected_columns(plan);
+    columns
+        .iter()
+        .map(|col| {
+            plan.cfg
+                .columns
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(col))
+                .and_then(|idx| plan.cfg.column_types.get(idx).copied())
+                .unwrap_or(ColumnType::Text)
+        })
+        .collect()
+}
+
 fn align_rowset_columns(mut rowset: RowSet, columns: &[String]) -> anyhow::Result<RowSet> {
     if rowset.columns.is_empty() {
         rowset.columns = columns.to_vec();
+        if rowset.column_types.len() != columns.len() {
+            rowset.column_types = vec![ColumnType::Text; columns.len()];
+        }
         return Ok(rowset);
     }
     if rowset.columns == columns {
@@ -841,6 +925,13 @@ fn align_rowset_columns(mut rowset: RowSet, columns: &[String]) -> anyhow::Resul
             .iter()
             .position(|name| name.eq_ignore_ascii_case(col));
         indices.push(idx);
+    }
+    let mut types = Vec::with_capacity(columns.len());
+    for idx in &indices {
+        let ty = idx
+            .and_then(|pos| rowset.column_types.get(pos).copied())
+            .unwrap_or(ColumnType::Text);
+        types.push(ty);
     }
     let mut rows = Vec::with_capacity(rowset.rows.len());
     for row in rowset.rows.into_iter() {
@@ -855,6 +946,7 @@ fn align_rowset_columns(mut rowset: RowSet, columns: &[String]) -> anyhow::Resul
     }
     Ok(RowSet {
         columns: columns.to_vec(),
+        column_types: types,
         rows,
     })
 }
@@ -863,24 +955,36 @@ fn merge_rows(
     cold: Option<RowSet>,
     hot: Option<RowSet>,
     plan: &PlanAnalysis,
+    cold_sorted: bool,
 ) -> anyhow::Result<RowSet> {
     let expected = expected_columns(plan);
+    let expected_types = expected_column_types(plan);
     let mut cold = cold.unwrap_or_else(|| RowSet {
         columns: expected.clone(),
+        column_types: expected_types.clone(),
         rows: Vec::new(),
     });
     let mut hot = hot.unwrap_or_else(|| RowSet {
         columns: expected.clone(),
+        column_types: expected_types.clone(),
         rows: Vec::new(),
     });
 
     if cold.columns.is_empty() {
         cold.columns = expected.clone();
+        cold.column_types = expected_types.clone();
     }
     if hot.columns.is_empty() {
         hot.columns = expected.clone();
+        hot.column_types = expected_types.clone();
     }
-    if cold.columns != hot.columns {
+    if cold.columns == expected && cold.column_types != expected_types {
+        cold.column_types = expected_types.clone();
+    }
+    if hot.columns == expected && hot.column_types != expected_types {
+        hot.column_types = expected_types.clone();
+    }
+    if cold.columns != hot.columns || cold.column_types != hot.column_types {
         anyhow::bail!("hot/cold column mismatch");
     }
 
@@ -892,15 +996,17 @@ fn merge_rows(
             .position(|col| col == &plan.cfg.order_col)
             .ok_or_else(|| anyhow!("missing order column in result set"))?;
 
-        cold.rows.sort_by(|a, b| {
-            let ka = extract_order_key(a, order_idx).unwrap_or_default();
-            let kb = extract_order_key(b, order_idx).unwrap_or_default();
-            if descending {
-                kb.cmp(&ka)
-            } else {
-                ka.cmp(&kb)
-            }
-        });
+        if !cold_sorted {
+            cold.rows.sort_by(|a, b| {
+                let ka = extract_order_key(a, order_idx).unwrap_or_default();
+                let kb = extract_order_key(b, order_idx).unwrap_or_default();
+                if descending {
+                    kb.cmp(&ka)
+                } else {
+                    ka.cmp(&kb)
+                }
+            });
+        }
 
         hot.rows.sort_by(|a, b| {
             let ka = extract_order_key(a, order_idx).unwrap_or_default();
@@ -931,6 +1037,7 @@ fn merge_rows(
         merged.extend_from_slice(&hot.rows[j..]);
         Ok(RowSet {
             columns: cold.columns,
+            column_types: cold.column_types,
             rows: merged,
         })
     } else {
@@ -938,6 +1045,7 @@ fn merge_rows(
         merged.extend(hot.rows.into_iter());
         Ok(RowSet {
             columns: cold.columns,
+            column_types: cold.column_types,
             rows: merged,
         })
     }
@@ -952,6 +1060,7 @@ fn apply_offset_limit(rows: RowSet, offset: Option<usize>, limit: Option<usize>)
     };
     RowSet {
         columns: rows.columns,
+        column_types: rows.column_types,
         rows: sliced,
     }
 }
@@ -1020,7 +1129,6 @@ fn ensure_csv_with_names(sql: &str) -> String {
 
 struct TableAnnotation {
     order_col: String,
-    payload_col: String,
     filter_cols: Vec<String>,
     seq_col: Option<String>,
 }
@@ -1038,7 +1146,6 @@ fn parse_proxist_table_config(sql: &str) -> anyhow::Result<Option<TableAnnotatio
     let body = tail[..end].trim();
 
     let mut order_col = None;
-    let mut payload_col = None;
     let mut filter_cols = Vec::new();
     let mut seq_col = None;
 
@@ -1048,7 +1155,6 @@ fn parse_proxist_table_config(sql: &str) -> anyhow::Result<Option<TableAnnotatio
         let value = kv.next().unwrap_or("");
         match key.as_str() {
             "order_col" => order_col = Some(value.to_string()),
-            "payload_col" => payload_col = Some(value.to_string()),
             "filter_cols" => {
                 filter_cols = value
                     .split(|c| c == ',' || c == ' ')
@@ -1063,8 +1169,6 @@ fn parse_proxist_table_config(sql: &str) -> anyhow::Result<Option<TableAnnotatio
     }
 
     let order_col = order_col.ok_or_else(|| anyhow!("proxist annotation missing order_col"))?;
-    let payload_col =
-        payload_col.ok_or_else(|| anyhow!("proxist annotation missing payload_col"))?;
     if filter_cols.len() < 2 {
         anyhow::bail!(
             "proxist annotation must specify at least two filter_cols (group key and entity key)"
@@ -1073,7 +1177,6 @@ fn parse_proxist_table_config(sql: &str) -> anyhow::Result<Option<TableAnnotatio
 
     Ok(Some(TableAnnotation {
         order_col,
-        payload_col,
         filter_cols,
         seq_col,
     }))
@@ -1160,18 +1263,24 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn project_hot_rows_sorts_and_projects() {
-        let cfg = TableConfig {
+    fn project_hot_rows_projects_columns() {
+    let cfg = TableConfig {
             order_col: "ts_micros".to_string(),
-            payload_col: "payload_base64".to_string(),
             filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
             seq_col: Some("seq".to_string()),
             columns: vec![
                 "tenant".to_string(),
                 "symbol".to_string(),
                 "ts_micros".to_string(),
-                "payload_base64".to_string(),
+                "payload".to_string(),
                 "seq".to_string(),
+            ],
+            column_types: vec![
+                ColumnType::Text,
+                ColumnType::Text,
+                ColumnType::Int64,
+                ColumnType::Text,
+                ColumnType::Int64,
             ],
         };
         let plan = PlanAnalysis {
@@ -1197,14 +1306,14 @@ mod scheduler_tests {
                 k0: "alpha".to_string(),
                 k1: "SYM1".to_string(),
                 ord_micros: 2,
-                payload_base64: "b".to_string(),
+                payload: vec![0x62],
                 seq: 1,
             },
             HotRowFlat {
                 k0: "alpha".to_string(),
                 k1: "SYM1".to_string(),
                 ord_micros: 1,
-                payload_base64: "a".to_string(),
+                payload: vec![0x61],
                 seq: 0,
             },
         ];
@@ -1217,17 +1326,104 @@ mod scheduler_tests {
         );
         let first = &projected.rows[0];
         assert_eq!(first[0], ScalarValue::String("SYM1".to_string()));
-        assert_eq!(first[1], ScalarValue::Int64(1));
+        assert_eq!(first[1], ScalarValue::Int64(2));
     }
 
     #[test]
     fn parse_csv_rows_with_names() {
         let input = "symbol,ts_micros\nSYM1,42\nSYM2,43\n";
         let columns = vec!["symbol".to_string(), "ts_micros".to_string()];
-        let rows = parse_csv_rows(input, &columns).expect("parse csv");
+        let types = vec![ColumnType::Text, ColumnType::Int64];
+        let rows = parse_csv_rows(input, &columns, &types).expect("parse csv");
         assert_eq!(rows.rows.len(), 2);
         assert_eq!(rows.columns, columns);
+        assert_eq!(rows.column_types, types);
         assert_eq!(rows.rows[0][0], ScalarValue::String("SYM1".to_string()));
         assert_eq!(rows.rows[0][1], ScalarValue::Int64(42));
+    }
+
+    #[test]
+    fn merge_rows_keeps_cold_order_and_sorts_hot() {
+        let plan = PlanAnalysis {
+            cfg: TableConfig {
+                order_col: "ts_micros".to_string(),
+                filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
+                seq_col: Some("seq".to_string()),
+                columns: vec![
+                    "symbol".to_string(),
+                    "ts_micros".to_string(),
+                    "payload".to_string(),
+                ],
+                column_types: vec![
+                    ColumnType::Text,
+                    ColumnType::Int64,
+                    ColumnType::Text,
+                ],
+            },
+            select: SimpleSelect {
+                key0: "alpha".to_string(),
+                key1_list: vec!["SYM1".to_string()],
+                start: SystemTime::UNIX_EPOCH,
+                end: SystemTime::UNIX_EPOCH,
+            },
+            order_by: vec![OrderItem {
+                column: "ts_micros".to_string(),
+                descending: false,
+            }],
+            select_cols: vec![],
+            has_wildcard: true,
+            offset: None,
+            limit: None,
+        };
+
+        let columns = vec![
+            "symbol".to_string(),
+            "ts_micros".to_string(),
+            "payload".to_string(),
+        ];
+        let types = vec![ColumnType::Text, ColumnType::Int64, ColumnType::Text];
+        let cold = RowSet {
+            columns: columns.clone(),
+            column_types: types.clone(),
+            rows: vec![
+                vec![
+                    ScalarValue::String("SYM1".to_string()),
+                    ScalarValue::Int64(1),
+                    ScalarValue::String("a".to_string()),
+                ],
+                vec![
+                    ScalarValue::String("SYM1".to_string()),
+                    ScalarValue::Int64(3),
+                    ScalarValue::String("c".to_string()),
+                ],
+            ],
+        };
+        let hot = RowSet {
+            columns,
+            column_types: types,
+            rows: vec![
+                vec![
+                    ScalarValue::String("SYM1".to_string()),
+                    ScalarValue::Int64(4),
+                    ScalarValue::String("d".to_string()),
+                ],
+                vec![
+                    ScalarValue::String("SYM1".to_string()),
+                    ScalarValue::Int64(2),
+                    ScalarValue::String("b".to_string()),
+                ],
+            ],
+        };
+
+        let merged = merge_rows(Some(cold), Some(hot), &plan, true).expect("merge");
+        let ords: Vec<i64> = merged
+            .rows
+            .iter()
+            .map(|row| match row[1] {
+                ScalarValue::Int64(v) => v,
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(ords, vec![1, 2, 3, 4]);
     }
 }

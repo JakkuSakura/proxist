@@ -29,7 +29,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::NaiveDateTime;
 use ingest::{HotColdSummaryRow, IngestService};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -100,6 +99,7 @@ struct DaemonConfig {
     http_dialect: DialectMode,
     pg_addr: Option<SocketAddr>,
     pg_dialect: DialectMode,
+    pg_binary: bool,
     clickhouse: Option<ClickhouseConfig>,
     clickhouse_native_url: Option<String>,
     api_token: Option<String>,
@@ -124,6 +124,10 @@ impl DaemonConfig {
         let pg_addr = std::env::var("PROXIST_PG_ADDR").ok().map(|value| value.parse()).transpose()?;
         let pg_dialect =
             parse_dialect_mode(std::env::var("PROXIST_PG_DIALECT").ok(), DialectDefault::Pg)?;
+        let pg_binary = std::env::var("PROXIST_PG_BINARY")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let clickhouse = load_clickhouse_config();
         let clickhouse_native_url = std::env::var("PROXIST_CLICKHOUSE_NATIVE_URL").ok();
         let api_token = if let Ok(token_path) = std::env::var("PROXIST_API_TOKEN_FILE") {
@@ -143,6 +147,7 @@ impl DaemonConfig {
             http_dialect,
             pg_addr,
             pg_dialect,
+            pg_binary,
             clickhouse,
             clickhouse_native_url,
             api_token,
@@ -281,6 +286,7 @@ struct AppState {
     api_token: Option<String>,
     persisted_cutoff_override: Option<SystemTime>,
     http_dialect: DialectMode,
+    pg_binary: bool,
 }
 
 #[derive(Debug)]
@@ -560,6 +566,7 @@ fn scalar_value_to_json(value: &ScalarValue) -> serde_json::Value {
     }
 }
 
+
 enum SqlBatchResult {
     Text(String),
     Scheduler(SqlResult),
@@ -739,16 +746,31 @@ fn build_ingest_records(
     };
 
     let mut records = Vec::new();
-    let tenant_col = cfg.filter_cols.get(0).map(|s| s.to_ascii_lowercase());
-    let symbol_col = cfg.filter_cols.get(1).map(|s| s.to_ascii_lowercase());
-    let order_col = cfg.order_col.to_ascii_lowercase();
-    let payload_col = cfg.payload_col.to_ascii_lowercase();
-    let seq_col = cfg.seq_col.as_ref().map(|s| s.to_ascii_lowercase());
+    let tenant_key = cfg
+        .filter_cols
+        .get(0)
+        .map(|s| s.to_ascii_lowercase())
+        .ok_or_else(|| anyhow!("proxist filter_cols missing tenant column"))?;
+    let symbol_key = cfg
+        .filter_cols
+        .get(1)
+        .map(|s| s.to_ascii_lowercase())
+        .ok_or_else(|| anyhow!("proxist filter_cols missing symbol column"))?;
+    let order_key = cfg.order_col.to_ascii_lowercase();
+    let seq_key = cfg.seq_col.as_ref().map(|s| s.to_ascii_lowercase());
 
-    let tenant_col =
-        tenant_col.ok_or_else(|| anyhow!("proxist filter_cols missing tenant column"))?;
-    let symbol_col =
-        symbol_col.ok_or_else(|| anyhow!("proxist filter_cols missing symbol column"))?;
+    let tenant_idx = column_names.iter().position(|c| c == &tenant_key);
+    let symbol_idx = column_names.iter().position(|c| c == &symbol_key);
+    let order_idx = column_names.iter().position(|c| c == &order_key);
+    let seq_idx = seq_key
+        .as_ref()
+        .and_then(|seq_key| column_names.iter().position(|c| c == seq_key));
+    let payload_idx = (0..column_names.len()).find(|idx| {
+        Some(*idx) != tenant_idx
+            && Some(*idx) != symbol_idx
+            && Some(*idx) != order_idx
+            && Some(*idx) != seq_idx
+    });
 
     for row in values.rows {
         if row.len() != column_names.len() {
@@ -765,17 +787,16 @@ fn build_ingest_records(
         let mut seq: Option<u64> = None;
         let mut payload_bytes: Option<Vec<u8>> = None;
 
-        for (col, expr) in column_names.iter().zip(row.iter()) {
-            let col_lower = col.to_ascii_lowercase();
-            if col_lower == tenant_col {
+        for (idx, expr) in row.iter().enumerate() {
+            if Some(idx) == tenant_idx {
                 tenant = Some(expr_to_string(expr)?);
-            } else if col_lower == symbol_col {
+            } else if Some(idx) == symbol_idx {
                 symbol = Some(expr_to_string(expr)?);
-            } else if col_lower == order_col {
+            } else if Some(idx) == order_idx {
                 timestamp = Some(expr_to_timestamp(expr)?);
-            } else if col_lower == payload_col {
-                payload_bytes = Some(expr_to_base64_bytes(expr)?);
-            } else if seq_col.as_deref() == Some(&col_lower) {
+            } else if Some(idx) == payload_idx {
+                payload_bytes = Some(expr_to_string(expr)?.into_bytes());
+            } else if Some(idx) == seq_idx {
                 seq = Some(expr_to_u64(expr)?);
             }
         }
@@ -808,13 +829,6 @@ fn expr_to_string(expr: &Expr) -> anyhow::Result<String> {
         Expr::Identifier(ident) => Ok(ident.value.clone()),
         _ => Err(anyhow!("expected string literal")),
     }
-}
-
-fn expr_to_base64_bytes(expr: &Expr) -> anyhow::Result<Vec<u8>> {
-    let text = expr_to_string(expr)?;
-    BASE64_STANDARD
-        .decode(text.as_bytes())
-        .map_err(|err| anyhow!("invalid base64 payload: {err}"))
 }
 
 fn expr_to_u64(expr: &Expr) -> anyhow::Result<u64> {
@@ -894,13 +908,10 @@ fn query_operation_label(op: &QueryOperation) -> &'static str {
 }
 
 fn clickhouse_row_to_query_row(row: ClickhouseQueryRow) -> anyhow::Result<QueryRow> {
-    let payload = BASE64_STANDARD
-        .decode(row.payload_base64.as_bytes())
-        .context("decode ClickHouse payload")?;
     Ok(QueryRow {
         symbol: row.symbol,
         timestamp: micros_to_system_time(row.ts_micros),
-        payload: ByteBuf::from(payload),
+        payload: ByteBuf::from(row.payload.into_bytes()),
     })
 }
 
@@ -1122,6 +1133,7 @@ impl ProxistDaemon {
             api_token: self.config.api_token.clone(),
             persisted_cutoff_override: self.config.persisted_cutoff_override,
             http_dialect: self.config.http_dialect.clone(),
+            pg_binary: self.config.pg_binary,
         };
 
         async fn status_handler(
@@ -1349,6 +1361,7 @@ impl ProxistDaemon {
             api_token: self.config.api_token.clone(),
             persisted_cutoff_override: self.config.persisted_cutoff_override,
             http_dialect: self.config.http_dialect.clone(),
+            pg_binary: self.config.pg_binary,
         };
         pgwire_server::serve(pg_addr, Arc::new(state), self.config.pg_dialect.clone()).await
     }
@@ -1708,8 +1721,8 @@ mod ingest_tests {
 
     #[test]
     fn build_ingest_records_maps_annotation_columns() -> anyhow::Result<()> {
-        let sql = "INSERT INTO ticks (tenant_key, symbol_key, ts_micros, payload_b64, seq_no) \
-                   VALUES ('alpha', 'AAPL', 42, 'AQID', 7)";
+        let sql = "INSERT INTO ticks (tenant_key, symbol_key, ts_micros, payload, seq_no) \
+                   VALUES ('alpha', 'AAPL', 42, 'abc', 7)";
         let dialect = DialectMode::Sql(SqlDialect::ClickHouse);
         let mut parsed = parse_sql_with_dialect(&dialect, sql).map_err(|err| err.0)?;
         let stmt = parsed.remove(0);
@@ -1723,15 +1736,21 @@ mod ingest_tests {
 
         let cfg = crate::scheduler::TableConfig {
             order_col: "ts_micros".to_string(),
-            payload_col: "payload_b64".to_string(),
             filter_cols: vec!["tenant_key".to_string(), "symbol_key".to_string()],
             seq_col: Some("seq_no".to_string()),
             columns: vec![
                 "tenant_key".to_string(),
                 "symbol_key".to_string(),
                 "ts_micros".to_string(),
-                "payload_b64".to_string(),
+                "payload".to_string(),
                 "seq_no".to_string(),
+            ],
+            column_types: vec![
+                crate::scheduler::ColumnType::Text,
+                crate::scheduler::ColumnType::Text,
+                crate::scheduler::ColumnType::Int64,
+                crate::scheduler::ColumnType::Text,
+                crate::scheduler::ColumnType::Int64,
             ],
         };
 
@@ -1741,7 +1760,7 @@ mod ingest_tests {
         let record = &records[0];
         assert_eq!(record.tenant, "alpha");
         assert_eq!(record.symbol, "AAPL");
-        assert_eq!(record.payload, vec![1, 2, 3]);
+        assert_eq!(record.payload, b"abc");
         assert_eq!(record.seq, 7);
         assert_eq!(system_time_to_micros(record.timestamp), 42);
 
@@ -1807,6 +1826,7 @@ mod ingest_tests {
             api_token: None,
             persisted_cutoff_override: None,
             http_dialect: DialectMode::Sql(SqlDialect::ClickHouse),
+            pg_binary: false,
         };
 
         let range = QueryRange::new(ts - Duration::from_millis(1), ts + Duration::from_secs(1));
@@ -1888,6 +1908,7 @@ mod ingest_tests {
             api_token: None,
             persisted_cutoff_override: None,
             http_dialect: DialectMode::Sql(SqlDialect::ClickHouse),
+            pg_binary: false,
         };
 
         let bundle = compose_diagnostics(&state).await.map_err(|err| err.0)?;

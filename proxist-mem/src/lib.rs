@@ -228,11 +228,11 @@ impl HotColumnStore for InMemoryHotColumnStore {
             let end_idx = store.rows.partition_point(|row| row.micros < end_micros);
 
             for row in &store.rows[start_idx..end_idx] {
-                results.push(HotRow {
-                    symbol: symbol.clone(),
-                    timestamp: row.timestamp,
-                    payload: row.payload.clone(),
-                });
+                    results.push(HotRow {
+                        symbol: symbol.clone(),
+                        timestamp: row.timestamp,
+                        payload: row.payload.clone(),
+                    });
             }
         }
 
