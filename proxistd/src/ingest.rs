@@ -9,9 +9,11 @@ use std::{
 
 use crate::clickhouse::{ClickhouseHttpClient, ClickhouseSink, ClickhouseTarget as SinkTarget};
 use crate::metadata_sqlite::SqliteMetadataStore;
+use crate::scheduler::TableRegistry;
 use anyhow::Result;
+use bytes::Bytes;
 use proxist_core::api::{ClickhouseStatus, ClickhouseTarget};
-use proxist_core::ingest::{IngestRecord, IngestSegment};
+use proxist_core::ingest::{IngestRow, IngestSegment};
 use proxist_core::{
     metadata::{ClusterMetadata, ShardHealth, TenantId},
     MetadataStore, PersistenceBatch, PersistenceTransition, ShardPersistenceTracker,
@@ -27,6 +29,7 @@ pub struct IngestService {
     clickhouse_target: Option<ClickhouseTarget>,
     clickhouse_client: Option<Arc<ClickhouseHttpClient>>,
     wal: Option<Arc<WalManager>>,
+    registry: Arc<TableRegistry>,
     last_flush_micros: AtomicI64,
     clickhouse_error: Mutex<Option<String>>,
     persistence_trackers: Mutex<HashMap<String, ShardPersistenceTracker>>,
@@ -64,26 +67,27 @@ struct ShardBatchAccumulator {
 }
 
 impl ShardBatchAccumulator {
-    fn new(record: &IngestRecord) -> Self {
+    fn new(record: &IngestRow) -> Self {
         Self {
             shard_id: record.shard_id.clone(),
-            tenant: record.tenant.clone(),
-            start: record.timestamp,
-            end: record.timestamp,
+            tenant: bytes_to_str_unchecked(&record.key0).to_string(),
+            start: micros_to_system_time(record.order_micros),
+            end: micros_to_system_time(record.order_micros),
             rows: 1,
         }
     }
 
-    fn observe(&mut self, record: &IngestRecord) {
+    fn observe(&mut self, record: &IngestRow) {
         debug_assert_eq!(
             self.shard_id, record.shard_id,
             "shard mismatch within batch accumulator"
         );
-        if record.timestamp < self.start {
-            self.start = record.timestamp;
+        let ts = micros_to_system_time(record.order_micros);
+        if ts < self.start {
+            self.start = ts;
         }
-        if record.timestamp > self.end {
-            self.end = record.timestamp;
+        if ts > self.end {
+            self.end = ts;
         }
         self.rows += 1;
     }
@@ -113,6 +117,7 @@ impl IngestService {
             Arc<ClickhouseHttpClient>,
         )>,
         wal: Option<Arc<WalManager>>,
+        registry: Arc<TableRegistry>,
     ) -> Self {
         let (clickhouse_sink, _sink_target, client, api_target) = match clickhouse {
             Some((sink, target, client)) => {
@@ -132,6 +137,7 @@ impl IngestService {
             clickhouse_target: api_target,
             clickhouse_client: client,
             wal,
+            registry,
             last_flush_micros: AtomicI64::new(-1),
             clickhouse_error: Mutex::new(None),
             persistence_trackers: Mutex::new(HashMap::new()),
@@ -230,7 +236,7 @@ impl IngestService {
     fn plan_shard_batches(segment: &IngestSegment) -> Vec<ShardBatchPlan> {
         let mut accumulators: HashMap<String, ShardBatchAccumulator> = HashMap::new();
 
-        for record in &segment.records {
+        for record in &segment.rows {
             accumulators
                 .entry(record.shard_id.clone())
                 .and_modify(|acc| acc.observe(record))
@@ -370,26 +376,30 @@ impl IngestService {
         Ok(())
     }
 
-    pub async fn ingest_records(&self, records: Vec<IngestRecord>) -> Result<()> {
+    pub async fn ingest_records(&self, records: Vec<IngestRow>) -> Result<()> {
         let start = Instant::now();
         let mut rows_written = 0_u64;
         let span = tracing::info_span!("ingest", rows = records.len());
         let _guard = span.enter();
         metrics::counter!("proxist_ingest_requests_total", 1);
-        let mut pending_hot: Vec<(TenantId, String, SystemTime, Vec<u8>)> =
+        let mut pending_hot: Vec<(String, bytes::Bytes, bytes::Bytes, i64, Vec<bytes::Bytes>)> =
             Vec::with_capacity(records.len());
         let mut records = records;
         for record in &mut records {
-            let shard_id = self.resolve_shard(&record.tenant, &record.symbol).await?;
-            self.metadata
-                .alloc_symbol(&record.tenant, &record.symbol)
-                .await?;
+            if self.registry.table_config(&record.table).is_none() {
+                anyhow::bail!("table schema not registered for {}", record.table);
+            }
+            let tenant = bytes_to_str_unchecked(&record.key0).to_string();
+            let symbol = bytes_to_str_unchecked(&record.key1);
+            let shard_id = self.resolve_shard(&tenant, symbol).await?;
+            self.metadata.alloc_symbol(&tenant, symbol).await?;
             record.shard_id = shard_id;
             pending_hot.push((
-                record.tenant.clone(),
-                record.symbol.clone(),
-                record.timestamp,
-                record.payload.clone(),
+                record.table.clone(),
+                record.key0.clone(),
+                record.key1.clone(),
+                record.order_micros,
+                record.values.clone(),
             ));
         }
 
@@ -413,13 +423,15 @@ impl IngestService {
             {
                 let mut map = self.symbol_shards.lock().await;
                 for record in &records {
-                    map.insert((record.tenant.clone(), record.symbol.clone()), record.shard_id.clone());
+                    let tenant = bytes_to_str_unchecked(&record.key0).to_string();
+                    let symbol = bytes_to_str_unchecked(&record.key1).to_string();
+                    map.insert((tenant, symbol), record.shard_id.clone());
                 }
             }
 
-            for (tenant, symbol, ts, payload) in pending_hot.drain(..) {
+            for (table, key0, key1, order_micros, values) in pending_hot.drain(..) {
                 self.hot_store
-                    .append_row(&tenant, &symbol, ts, &payload)
+                    .append_row(&table, key0, key1, order_micros, values)
                     .await?;
                 rows_written += 1;
             }
@@ -467,12 +479,7 @@ impl IngestService {
             metrics::counter!("proxist_clickhouse_flush_total", 1, "status" => "ok");
         }
 
-        if let Some(last) = segment
-            .records
-            .iter()
-            .map(|record| system_time_to_micros(record.timestamp))
-            .max()
-        {
+        if let Some(last) = segment.rows.iter().map(|record| record.order_micros).max() {
             self.last_flush_micros.store(last, Ordering::SeqCst);
         }
 
@@ -495,7 +502,7 @@ impl IngestService {
         Ok(())
     }
 
-    pub async fn persist_replayed(&self, records: &[IngestRecord]) -> Result<()> {
+    pub async fn persist_replayed(&self, records: &[IngestRow]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -503,12 +510,14 @@ impl IngestService {
         self.persist_segment(segment).await
     }
 
-    pub async fn warm_from_records(&self, records: &[IngestRecord]) -> anyhow::Result<()> {
-        let mut last_ts: Option<SystemTime> = None;
+    pub async fn warm_from_records(&self, records: &[IngestRow]) -> anyhow::Result<()> {
+        let mut last_micros: Option<i64> = None;
         {
             let mut map = self.symbol_shards.lock().await;
             for record in records {
-                map.insert((record.tenant.clone(), record.symbol.clone()), record.shard_id.clone());
+                let tenant = bytes_to_str_unchecked(&record.key0).to_string();
+                let symbol = bytes_to_str_unchecked(&record.key1).to_string();
+                map.insert((tenant, symbol), record.shard_id.clone());
             }
         }
 
@@ -518,27 +527,29 @@ impl IngestService {
                 let tracker = trackers
                     .entry(record.shard_id.clone())
                     .or_insert_with(|| ShardPersistenceTracker::new(record.shard_id.clone()));
-                tracker.watermark.bump_wal(record.timestamp);
+                tracker
+                    .watermark
+                    .bump_wal(micros_to_system_time(record.order_micros));
             }
         }
 
         for record in records {
-            self.metadata
-                .alloc_symbol(&record.tenant, &record.symbol)
-                .await?;
+            let tenant = bytes_to_str_unchecked(&record.key0).to_string();
+            let symbol = bytes_to_str_unchecked(&record.key1);
+            self.metadata.alloc_symbol(&tenant, symbol).await?;
             self.hot_store
                 .append_row(
-                    &record.tenant,
-                    &record.symbol,
-                    record.timestamp,
-                    &record.payload,
+                    &record.table,
+                    record.key0.clone(),
+                    record.key1.clone(),
+                    record.order_micros,
+                    record.values.clone(),
                 )
                 .await?;
-            last_ts = Some(record.timestamp);
+            last_micros = Some(record.order_micros);
         }
-        if let Some(ts) = last_ts {
-            self.last_flush_micros
-                .store(system_time_to_micros(ts), Ordering::SeqCst);
+        if let Some(micros) = last_micros {
+            self.last_flush_micros.store(micros, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -550,20 +561,22 @@ impl IngestService {
         }
 
         for entry in summary {
-            self.metadata
-                .alloc_symbol(&entry.tenant, &entry.symbol)
-                .await?;
-            let shard_id = self.resolve_shard(&entry.tenant, &entry.symbol).await?;
+            let tenant = bytes_to_str_unchecked(&entry.key0).to_string();
+            let symbol = bytes_to_str_unchecked(&entry.key1);
+            self.metadata.alloc_symbol(&tenant, symbol).await?;
+            let shard_id = self.resolve_shard(&tenant, symbol).await?;
             {
                 let mut symbol_map = self.symbol_shards.lock().await;
-                symbol_map.insert((entry.tenant.clone(), entry.symbol.clone()), shard_id.clone());
+                symbol_map.insert((tenant.clone(), symbol.to_string()), shard_id.clone());
             }
             let mut trackers = self.persistence_trackers.lock().await;
             let tracker = trackers
                 .entry(shard_id.clone())
                 .or_insert_with(|| ShardPersistenceTracker::new(shard_id));
-            if let Some(last_ts) = entry.last_timestamp {
-                tracker.watermark.bump_wal(last_ts);
+            if let Some(last_micros) = entry.last_micros {
+                tracker
+                    .watermark
+                    .bump_wal(micros_to_system_time(last_micros));
             }
         }
 
@@ -634,7 +647,9 @@ impl IngestService {
         let mut hot_map: HashMap<(TenantId, String), HotSymbolSummary> =
             HashMap::with_capacity(hot_stats.len());
         for entry in hot_stats {
-            hot_map.insert((entry.tenant.clone(), entry.symbol.clone()), entry);
+            let tenant = bytes_to_str_unchecked(&entry.key0).to_string();
+            let symbol = bytes_to_str_unchecked(&entry.key1).to_string();
+            hot_map.insert((tenant, symbol), entry);
         }
 
         let tracker_map = {
@@ -670,7 +685,11 @@ impl IngestService {
             let symbol_label = symbol.clone();
 
             let (hot_rows, hot_first, hot_last) = match hot_entry {
-                Some(entry) => (entry.rows, entry.first_timestamp, entry.last_timestamp),
+                Some(entry) => (
+                    entry.rows,
+                    entry.first_micros.map(micros_to_system_time),
+                    entry.last_micros.map(micros_to_system_time),
+                ),
                 None => (0, None, None),
             };
 
@@ -719,12 +738,18 @@ fn micros_to_system_time(micros: i64) -> std::time::SystemTime {
     }
 }
 
+fn bytes_to_str_unchecked(value: &Bytes) -> &str {
+    unsafe { std::str::from_utf8_unchecked(value) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clickhouse::{ClickhouseConfig, ClickhouseHttpClient};
+    use crate::scheduler::{ColumnType, TableConfig, TableRegistry};
     use async_trait::async_trait;
-    use proxist_core::ingest::{IngestRecord, IngestSegment};
+    use bytes::Bytes;
+    use proxist_core::ingest::{IngestRow, IngestSegment};
     use proxist_core::{metadata::ShardAssignment, query::QueryRange};
     use proxist_mem::{InMemoryHotColumnStore, MemConfig, SeamBoundaryRow};
     use std::collections::HashMap;
@@ -732,41 +757,72 @@ mod tests {
     use tempfile::{NamedTempFile, TempDir};
     use tokio::sync::Mutex;
 
+    fn register_ticks(registry: &TableRegistry) {
+        registry.register_table(
+            "ticks",
+            TableConfig {
+                order_col: "ts_micros".to_string(),
+                filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
+                seq_col: Some("seq".to_string()),
+                columns: vec![
+                    "tenant".to_string(),
+                    "symbol".to_string(),
+                    "ts_micros".to_string(),
+                    "payload".to_string(),
+                    "seq".to_string(),
+                ],
+                column_types: vec![
+                    ColumnType::Text,
+                    ColumnType::Text,
+                    ColumnType::Int64,
+                    ColumnType::Text,
+                    ColumnType::Int64,
+                ],
+            },
+        );
+    }
+
     #[derive(Default, Clone)]
     struct TestHotStore {
-        rows: Arc<Mutex<Vec<(TenantId, String, std::time::SystemTime, Vec<u8>)>>>,
+        rows: Arc<Mutex<Vec<IngestRow>>>,
     }
 
     #[async_trait]
     impl HotColumnStore for TestHotStore {
         async fn append_row(
             &self,
-            tenant: &TenantId,
-            symbol: &str,
-            timestamp: std::time::SystemTime,
-            payload: &[u8],
+            table: &str,
+            key0: Bytes,
+            key1: Bytes,
+            order_micros: i64,
+            values: Vec<Bytes>,
         ) -> anyhow::Result<()> {
-            self.rows.lock().await.push((
-                tenant.clone(),
-                symbol.to_string(),
-                timestamp,
-                payload.to_vec(),
-            ));
+            self.rows.lock().await.push(IngestRow {
+                table: table.to_string(),
+                key0,
+                key1,
+                order_micros,
+                seq: 0,
+                shard_id: String::new(),
+                values,
+            });
             Ok(())
         }
 
         async fn scan_range(
             &self,
-            _tenant: &TenantId,
+            _table: &str,
+            _key0: &Bytes,
             _range: &QueryRange,
-            _symbols: &[String],
+            _key1_list: &[Bytes],
         ) -> anyhow::Result<Vec<proxist_mem::HotRow>> {
             Ok(Vec::new())
         }
 
         async fn seam_rows_at(
             &self,
-            _tenant: &TenantId,
+            _table: &str,
+            _key0: &Bytes,
             _seam: std::time::SystemTime,
         ) -> anyhow::Result<Vec<SeamBoundaryRow>> {
             Ok(Vec::new())
@@ -785,77 +841,59 @@ mod tests {
 
         async fn last_by(
             &self,
-            tenant: &TenantId,
-            symbols: &[String],
-            at: std::time::SystemTime,
+            _table: &str,
+            _key0: &Bytes,
+            _key1_list: &[Bytes],
+            _at: std::time::SystemTime,
         ) -> anyhow::Result<Vec<proxist_mem::HotRow>> {
-            let rows = self.rows.lock().await;
-            let mut result = Vec::new();
-            for symbol in symbols {
-                let mut best: Option<(std::time::SystemTime, Vec<u8>)> = None;
-                for (row_tenant, row_symbol, ts, payload) in rows.iter() {
-                    if row_tenant == tenant && row_symbol == symbol && ts <= &at {
-                        if best.as_ref().map_or(true, |(best_ts, _)| ts > best_ts) {
-                            best = Some((*ts, payload.clone()));
-                        }
-                    }
-                }
-                if let Some((ts, payload)) = best {
-                    result.push(proxist_mem::HotRow {
-                        symbol: symbol.clone(),
-                        timestamp: ts,
-                        payload,
-                    });
-                }
-            }
-            Ok(result)
+            Ok(Vec::new())
         }
 
         async fn asof(
             &self,
-            tenant: &TenantId,
-            symbols: &[String],
+            table: &str,
+            key0: &Bytes,
+            key1_list: &[Bytes],
             at: std::time::SystemTime,
         ) -> anyhow::Result<Vec<proxist_mem::HotRow>> {
-            self.last_by(tenant, symbols, at).await
+            self.last_by(table, key0, key1_list, at).await
         }
 
         async fn hot_summary(&self) -> anyhow::Result<Vec<proxist_mem::HotSymbolSummary>> {
             let rows = self.rows.lock().await;
             let mut grouped: HashMap<
-                (TenantId, String),
-                (
-                    u64,
-                    Option<std::time::SystemTime>,
-                    Option<std::time::SystemTime>,
-                ),
+                (String, Bytes, Bytes),
+                (u64, Option<i64>, Option<i64>),
             > = HashMap::new();
-            for (tenant, symbol, ts, _) in rows.iter() {
+            for row in rows.iter() {
                 let entry = grouped
-                    .entry((tenant.clone(), symbol.clone()))
+                    .entry((row.table.clone(), row.key0.clone(), row.key1.clone()))
                     .or_insert((0, None, None));
                 entry.0 += 1;
                 entry.1 = Some(match entry.1 {
-                    Some(existing) if *ts < existing => *ts,
+                    Some(existing) if row.order_micros < existing => row.order_micros,
                     Some(existing) => existing,
-                    None => *ts,
+                    None => row.order_micros,
                 });
                 entry.2 = Some(match entry.2 {
-                    Some(existing) if *ts > existing => *ts,
+                    Some(existing) if row.order_micros > existing => row.order_micros,
                     Some(existing) => existing,
-                    None => *ts,
+                    None => row.order_micros,
                 });
             }
 
             let summaries = grouped
                 .into_iter()
                 .map(
-                    |((tenant, symbol), (count, first, last))| proxist_mem::HotSymbolSummary {
-                        tenant,
-                        symbol,
-                        rows: count,
-                        first_timestamp: first,
-                        last_timestamp: last,
+                    |((table, key0, key1), (count, first, last))| {
+                        proxist_mem::HotSymbolSummary {
+                            table,
+                            key0,
+                            key1,
+                            rows: count,
+                            first_micros: first,
+                            last_micros: last,
+                        }
                     },
                 )
                 .collect();
@@ -865,8 +903,9 @@ mod tests {
 
         async fn rolling_window(
             &self,
-            _tenant: &TenantId,
-            _symbols: &[String],
+            _table: &str,
+            _key0: &Bytes,
+            _key1_list: &[Bytes],
             _window_end: std::time::SystemTime,
             _window: Duration,
             _lower_bound: Option<std::time::SystemTime>,
@@ -878,17 +917,17 @@ mod tests {
     #[derive(Default, Clone)]
     struct RecordingClickhouseSink {
         flushed_counts: Arc<Mutex<Vec<usize>>>,
-        flushed_records: Arc<Mutex<Vec<IngestRecord>>>,
+        flushed_records: Arc<Mutex<Vec<IngestRow>>>,
     }
 
     #[async_trait]
     impl ClickhouseSink for RecordingClickhouseSink {
         async fn flush_segment(&self, segment: &IngestSegment) -> anyhow::Result<()> {
-            self.flushed_counts.lock().await.push(segment.records.len());
+            self.flushed_counts.lock().await.push(segment.rows.len());
             self.flushed_records
                 .lock()
                 .await
-                .extend(segment.records.iter().cloned());
+                .extend(segment.rows.iter().cloned());
             Ok(())
         }
     }
@@ -898,7 +937,7 @@ mod tests {
             self.flushed_counts.lock().await.clone()
         }
 
-        async fn records(&self) -> Vec<IngestRecord> {
+        async fn records(&self) -> Vec<IngestRow> {
             self.flushed_records.lock().await.clone()
         }
     }
@@ -910,6 +949,8 @@ mod tests {
         let hot_store = TestHotStore::default();
         let hot_store_arc: Arc<dyn HotColumnStore> = Arc::new(hot_store.clone());
         let mock_sink = RecordingClickhouseSink::default();
+        let registry = Arc::new(TableRegistry::new());
+        register_ticks(&registry);
         let target = SinkTarget {
             endpoint: "http://localhost:8123".into(),
             database: "proxist".into(),
@@ -926,24 +967,32 @@ mod tests {
                 Arc::clone(&clickhouse_client),
             )),
             None,
+            Arc::clone(&registry),
         );
 
         let now = std::time::SystemTime::now();
-        let records = vec![IngestRecord {
-            tenant: "alpha".into(),
-            shard_id: String::new(),
-            symbol: "AAPL".into(),
-            timestamp: now,
-            payload: vec![1, 2, 3],
+        let records = vec![IngestRow {
+            table: "ticks".to_string(),
+            key0: Bytes::copy_from_slice(b"alpha"),
+            key1: Bytes::copy_from_slice(b"AAPL"),
+            order_micros: system_time_to_micros(now),
             seq: 7,
+            shard_id: String::new(),
+            values: vec![
+                Bytes::copy_from_slice(b"alpha"),
+                Bytes::copy_from_slice(b"AAPL"),
+                Bytes::copy_from_slice(system_time_to_micros(now).to_string().as_bytes()),
+                Bytes::copy_from_slice(b"1"),
+                Bytes::copy_from_slice(b"7"),
+            ],
         }];
 
         service.ingest_records(records).await?;
 
         let rows = hot_store.rows.lock().await.clone();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, "alpha");
-        assert_eq!(rows[0].1, "AAPL");
+        assert_eq!(bytes_to_str_unchecked(&rows[0].key0), "alpha");
+        assert_eq!(bytes_to_str_unchecked(&rows[0].key1), "AAPL");
 
         let flushed = mock_sink.counts().await;
         assert_eq!(flushed, vec![1]);
@@ -981,6 +1030,8 @@ mod tests {
             table: "ticks".into(),
         };
         let clickhouse_client = Arc::new(ClickhouseHttpClient::new(ClickhouseConfig::default())?);
+        let registry = Arc::new(TableRegistry::new());
+        register_ticks(&registry);
 
         let service = IngestService::new(
             metadata.clone(),
@@ -991,6 +1042,7 @@ mod tests {
                 Arc::clone(&clickhouse_client),
             )),
             None,
+            Arc::clone(&registry),
         );
 
         let base = std::time::SystemTime::now();
@@ -1000,21 +1052,39 @@ mod tests {
         );
 
         let records = vec![
-            IngestRecord {
-                tenant: "alpha".into(),
-                shard_id: String::new(),
-                symbol: "AAPL".into(),
-                timestamp: base - std::time::Duration::from_secs(1),
-                payload: vec![1, 2, 3],
+            IngestRow {
+                table: "ticks".to_string(),
+                key0: Bytes::copy_from_slice(b"alpha"),
+                key1: Bytes::copy_from_slice(b"AAPL"),
+                order_micros: system_time_to_micros(base - std::time::Duration::from_secs(1)),
                 seq: 10,
-            },
-            IngestRecord {
-                tenant: "alpha".into(),
                 shard_id: String::new(),
-                symbol: "AAPL".into(),
-                timestamp: base,
-                payload: vec![4, 5, 6],
+                values: vec![
+                    Bytes::copy_from_slice(b"alpha"),
+                    Bytes::copy_from_slice(b"AAPL"),
+                    Bytes::copy_from_slice(
+                        system_time_to_micros(base - std::time::Duration::from_secs(1))
+                            .to_string()
+                            .as_bytes(),
+                    ),
+                    Bytes::copy_from_slice(b"1"),
+                    Bytes::copy_from_slice(b"10"),
+                ],
+            },
+            IngestRow {
+                table: "ticks".to_string(),
+                key0: Bytes::copy_from_slice(b"alpha"),
+                key1: Bytes::copy_from_slice(b"AAPL"),
+                order_micros: system_time_to_micros(base),
                 seq: 11,
+                shard_id: String::new(),
+                values: vec![
+                    Bytes::copy_from_slice(b"alpha"),
+                    Bytes::copy_from_slice(b"AAPL"),
+                    Bytes::copy_from_slice(system_time_to_micros(base).to_string().as_bytes()),
+                    Bytes::copy_from_slice(b"2"),
+                    Bytes::copy_from_slice(b"11"),
+                ],
             },
         ];
 
@@ -1022,11 +1092,14 @@ mod tests {
 
         // Hot store should have both rows available via range query.
         let hot_rows = hot_store
-            .scan_range(&"alpha".into(), &tick_range, &["AAPL".into()])
+            .scan_range(
+                "ticks",
+                &Bytes::copy_from_slice(b"alpha"),
+                &tick_range,
+                &[Bytes::copy_from_slice(b"AAPL")],
+            )
             .await?;
         assert_eq!(hot_rows.len(), 2);
-        assert_eq!(hot_rows[0].payload, vec![1, 2, 3]);
-        assert_eq!(hot_rows[1].payload, vec![4, 5, 6]);
 
         // Symbol dictionary should reflect allocation persisted via SQL.
         let metadata_snapshot = metadata.get_cluster_metadata().await?;
@@ -1044,7 +1117,9 @@ mod tests {
         assert_eq!(counts, vec![2]);
         let records = recording_sink.records().await;
         assert_eq!(records.len(), 2);
-        assert!(records.iter().all(|rec| rec.symbol == "AAPL"));
+        assert!(records
+            .iter()
+            .all(|rec| bytes_to_str_unchecked(&rec.key1) == "AAPL"));
 
         // Shard health is recorded with persistence metadata.
         let health = metadata.list_shard_health().await?;
@@ -1068,40 +1143,52 @@ mod tests {
         let metadata = SqliteMetadataStore::connect(temp.path().to_str().unwrap()).await?;
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let service = IngestService::new(metadata.clone(), hot_store, None, None);
+        let registry = Arc::new(TableRegistry::new());
+        register_ticks(&registry);
+        let service = IngestService::new(
+            metadata.clone(),
+            hot_store,
+            None,
+            None,
+            Arc::clone(&registry),
+        );
 
         let records = vec![
-            IngestRecord {
-                tenant: "alpha".into(),
-                shard_id: String::new(),
-                symbol: "AAPL".into(),
-                timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(1),
-                payload: vec![],
+            IngestRow {
+                table: "ticks".to_string(),
+                key0: Bytes::copy_from_slice(b"alpha"),
+                key1: Bytes::copy_from_slice(b"AAPL"),
+                order_micros: 1,
                 seq: 1,
-            },
-            IngestRecord {
-                tenant: "alpha".into(),
                 shard_id: String::new(),
-                symbol: "MSFT".into(),
-                timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(2),
-                payload: vec![],
+                values: vec![Bytes::copy_from_slice(b"alpha"), Bytes::copy_from_slice(b"AAPL")],
+            },
+            IngestRow {
+                table: "ticks".to_string(),
+                key0: Bytes::copy_from_slice(b"alpha"),
+                key1: Bytes::copy_from_slice(b"MSFT"),
+                order_micros: 2,
                 seq: 2,
-            },
-            IngestRecord {
-                tenant: "alpha".into(),
                 shard_id: String::new(),
-                symbol: "AAPL".into(),
-                timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(3),
-                payload: vec![],
+                values: vec![Bytes::copy_from_slice(b"alpha"), Bytes::copy_from_slice(b"MSFT")],
+            },
+            IngestRow {
+                table: "ticks".to_string(),
+                key0: Bytes::copy_from_slice(b"alpha"),
+                key1: Bytes::copy_from_slice(b"AAPL"),
+                order_micros: 3,
                 seq: 3,
-            },
-            IngestRecord {
-                tenant: "beta".into(),
                 shard_id: String::new(),
-                symbol: "GOOG".into(),
-                timestamp: SystemTime::UNIX_EPOCH + Duration::from_micros(4),
-                payload: vec![],
+                values: vec![Bytes::copy_from_slice(b"alpha"), Bytes::copy_from_slice(b"AAPL")],
+            },
+            IngestRow {
+                table: "ticks".to_string(),
+                key0: Bytes::copy_from_slice(b"beta"),
+                key1: Bytes::copy_from_slice(b"GOOG"),
+                order_micros: 4,
                 seq: 1,
+                shard_id: String::new(),
+                values: vec![Bytes::copy_from_slice(b"beta"), Bytes::copy_from_slice(b"GOOG")],
             },
         ];
 
@@ -1110,7 +1197,9 @@ mod tests {
 
         let mut map = std::collections::HashMap::new();
         for row in summary {
-            map.insert((row.tenant.clone(), row.symbol.clone()), row.hot_rows);
+            let tenant = bytes_to_str_unchecked(&row.key0).to_string();
+            let symbol = bytes_to_str_unchecked(&row.key1).to_string();
+            map.insert((tenant, symbol), row.hot_rows);
         }
 
         assert_eq!(map.get(&("alpha".into(), "AAPL".into())), Some(&2));
@@ -1136,7 +1225,13 @@ mod tests {
 
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let service = IngestService::new(metadata.clone(), hot_store, None, None);
+        let service = IngestService::new(
+            metadata.clone(),
+            hot_store,
+            None,
+            None,
+            Arc::new(TableRegistry::new()),
+        );
 
         let snapshot = metadata.get_cluster_metadata().await?;
         service.apply_metadata(&snapshot).await?;

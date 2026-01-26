@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use proxist_core::{metadata::TenantId, query::QueryRange, ShardPersistenceTracker};
+use bytes::Bytes;
+use proxist_core::{query::QueryRange, ShardPersistenceTracker};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -27,40 +28,39 @@ impl Default for MemConfig {
 /// Represents a row at the seam between hot and cold tiers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeamBoundaryRow {
-    pub symbol: String,
-    #[serde(with = "proxist_core::time::serde_micros")]
-    pub timestamp: SystemTime,
-    pub payload: Vec<u8>,
+    pub key1: Bytes,
+    pub order_micros: i64,
+    pub values: Vec<Bytes>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HotRow {
-    pub symbol: String,
-    pub timestamp: SystemTime,
-    pub payload: Vec<u8>,
+    pub key1: Bytes,
+    pub order_micros: i64,
+    pub values: Vec<Bytes>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HotSymbolSummary {
-    pub tenant: TenantId,
-    pub symbol: String,
+    pub table: String,
+    pub key0: Bytes,
+    pub key1: Bytes,
     pub rows: u64,
-    pub first_timestamp: Option<SystemTime>,
-    pub last_timestamp: Option<SystemTime>,
+    pub first_micros: Option<i64>,
+    pub last_micros: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RollingWindowRow {
-    pub symbol: String,
-    pub window_end: SystemTime,
+    pub key1: Bytes,
+    pub window_end_micros: i64,
     pub count: u64,
 }
 
 #[derive(Debug, Clone)]
 struct Row {
-    timestamp: SystemTime,
     micros: i64,
-    payload: Vec<u8>,
+    values: Vec<Bytes>,
 }
 
 #[derive(Default, Debug)]
@@ -70,14 +70,14 @@ struct SymbolStore {
 
 #[derive(Default, Debug)]
 struct TenantStore {
-    symbols: HashMap<String, SymbolStore>,
+    symbols: HashMap<Bytes, SymbolStore>,
     total_rows: u64,
 }
 
 #[derive(Debug)]
 pub struct InMemoryHotColumnStore {
     config: MemConfig,
-    inner: RwLock<HashMap<TenantId, TenantStore>>,
+    inner: RwLock<HashMap<(String, Bytes), TenantStore>>,
 }
 
 impl InMemoryHotColumnStore {
@@ -99,22 +99,25 @@ fn system_time_to_micros(ts: SystemTime) -> i64 {
 pub trait HotColumnStore: Send + Sync {
     async fn append_row(
         &self,
-        tenant: &TenantId,
-        symbol: &str,
-        timestamp: SystemTime,
-        payload: &[u8],
+        table: &str,
+        key0: Bytes,
+        key1: Bytes,
+        order_micros: i64,
+        values: Vec<Bytes>,
     ) -> anyhow::Result<()>;
 
     async fn scan_range(
         &self,
-        tenant: &TenantId,
+        table: &str,
+        key0: &Bytes,
         range: &QueryRange,
-        symbols: &[String],
+        key1_list: &[Bytes],
     ) -> anyhow::Result<Vec<HotRow>>;
 
     async fn seam_rows_at(
         &self,
-        tenant: &TenantId,
+        table: &str,
+        key0: &Bytes,
         seam: SystemTime,
     ) -> anyhow::Result<Vec<SeamBoundaryRow>>;
 
@@ -124,15 +127,17 @@ pub trait HotColumnStore: Send + Sync {
 
     async fn last_by(
         &self,
-        tenant: &TenantId,
-        symbols: &[String],
+        table: &str,
+        key0: &Bytes,
+        key1_list: &[Bytes],
         at: SystemTime,
     ) -> anyhow::Result<Vec<HotRow>>;
 
     async fn asof(
         &self,
-        tenant: &TenantId,
-        symbols: &[String],
+        table: &str,
+        key0: &Bytes,
+        key1_list: &[Bytes],
         at: SystemTime,
     ) -> anyhow::Result<Vec<HotRow>>;
 
@@ -140,8 +145,9 @@ pub trait HotColumnStore: Send + Sync {
 
     async fn rolling_window(
         &self,
-        tenant: &TenantId,
-        symbols: &[String],
+        table: &str,
+        key0: &Bytes,
+        key1_list: &[Bytes],
         window_end: SystemTime,
         window: Duration,
         lower_bound: Option<SystemTime>,
@@ -152,31 +158,30 @@ pub trait HotColumnStore: Send + Sync {
 impl HotColumnStore for InMemoryHotColumnStore {
     async fn append_row(
         &self,
-        tenant: &TenantId,
-        symbol: &str,
-        timestamp: SystemTime,
-        payload: &[u8],
+        table: &str,
+        key0: Bytes,
+        key1: Bytes,
+        order_micros: i64,
+        values: Vec<Bytes>,
     ) -> anyhow::Result<()> {
-        let micros = system_time_to_micros(timestamp);
         let mut guard = self.inner.write().await;
         let tenant_store = guard
-            .entry(tenant.clone())
+            .entry((table.to_string(), key0))
             .or_insert_with(TenantStore::default);
         let symbol_store = tenant_store
             .symbols
-            .entry(symbol.to_string())
+            .entry(key1)
             .or_insert_with(SymbolStore::default);
 
         let insert_idx = symbol_store
             .rows
-            .partition_point(|row| row.micros <= micros);
+            .partition_point(|row| row.micros <= order_micros);
 
         symbol_store.rows.insert(
             insert_idx,
             Row {
-                timestamp,
-                micros,
-                payload: payload.to_vec(),
+                micros: order_micros,
+                values,
             },
         );
 
@@ -184,10 +189,10 @@ impl HotColumnStore for InMemoryHotColumnStore {
 
         if tenant_store.total_rows > self.config.max_rows {
             warn!(
-                tenant = %tenant,
+                table = %table,
                 current_rows = tenant_store.total_rows,
                 max_rows = self.config.max_rows,
-                "tenant hot set exceeded max rows; consider increasing capacity"
+                "hot set exceeded max rows; consider increasing capacity"
             );
         }
 
@@ -196,24 +201,25 @@ impl HotColumnStore for InMemoryHotColumnStore {
 
     async fn scan_range(
         &self,
-        tenant: &TenantId,
+        table: &str,
+        key0: &Bytes,
         range: &QueryRange,
-        symbols: &[String],
+        key1_list: &[Bytes],
     ) -> anyhow::Result<Vec<HotRow>> {
         let start_micros = system_time_to_micros(range.start);
         let end_micros = system_time_to_micros(range.end);
 
         let guard = self.inner.read().await;
-        let Some(tenant_store) = guard.get(tenant) else {
+        let Some(tenant_store) = guard.get(&(table.to_string(), key0.clone())) else {
             return Ok(Vec::new());
         };
 
         let mut results = Vec::new();
 
-        let symbol_keys: Vec<&String> = if symbols.is_empty() {
+        let symbol_keys: Vec<&Bytes> = if key1_list.is_empty() {
             tenant_store.symbols.keys().collect()
         } else {
-            symbols
+            key1_list
                 .iter()
                 .filter(|sym| tenant_store.symbols.contains_key(*sym))
                 .collect()
@@ -229,9 +235,9 @@ impl HotColumnStore for InMemoryHotColumnStore {
 
             for row in &store.rows[start_idx..end_idx] {
                     results.push(HotRow {
-                        symbol: symbol.clone(),
-                        timestamp: row.timestamp,
-                        payload: row.payload.clone(),
+                        key1: symbol.clone(),
+                        order_micros: row.micros,
+                        values: row.values.clone(),
                     });
             }
         }
@@ -241,13 +247,14 @@ impl HotColumnStore for InMemoryHotColumnStore {
 
     async fn seam_rows_at(
         &self,
-        tenant: &TenantId,
+        table: &str,
+        key0: &Bytes,
         seam: SystemTime,
     ) -> anyhow::Result<Vec<SeamBoundaryRow>> {
         let boundary = system_time_to_micros(seam);
 
         let guard = self.inner.read().await;
-        let Some(tenant_store) = guard.get(tenant) else {
+        let Some(tenant_store) = guard.get(&(table.to_string(), key0.clone())) else {
             return Ok(Vec::new());
         };
 
@@ -260,9 +267,9 @@ impl HotColumnStore for InMemoryHotColumnStore {
             }
             let row = &store.rows[idx - 1];
             seam_rows.push(SeamBoundaryRow {
-                symbol: symbol.clone(),
-                timestamp: row.timestamp,
-                payload: row.payload.clone(),
+                key1: symbol.clone(),
+                order_micros: row.micros,
+                values: row.values.clone(),
             });
         }
 
@@ -272,32 +279,37 @@ impl HotColumnStore for InMemoryHotColumnStore {
     async fn snapshot(&self, _shard_tracker: &ShardPersistenceTracker) -> anyhow::Result<Vec<u8>> {
         #[derive(Serialize)]
         struct SnapshotRow<'a> {
-            symbol: &'a str,
-            timestamp_micros: i64,
-            payload: &'a [u8],
+            key1: &'a Bytes,
+            order_micros: i64,
+            values: &'a [Bytes],
         }
 
         #[derive(Serialize)]
         struct SnapshotTenant<'a> {
-            tenant: &'a str,
+            table: &'a str,
+            key0: &'a Bytes,
             rows: Vec<SnapshotRow<'a>>,
         }
 
         let guard = self.inner.read().await;
         let mut snapshot = Vec::new();
 
-        for (tenant, tenant_store) in guard.iter() {
+        for ((table, key0), tenant_store) in guard.iter() {
             let mut rows = Vec::new();
             for (symbol, store) in &tenant_store.symbols {
                 for row in &store.rows {
                     rows.push(SnapshotRow {
-                        symbol,
-                        timestamp_micros: row.micros,
-                        payload: &row.payload,
+                        key1: symbol,
+                        order_micros: row.micros,
+                        values: &row.values,
                     });
                 }
             }
-            snapshot.push(SnapshotTenant { tenant, rows });
+            snapshot.push(SnapshotTenant {
+                table,
+                key0,
+                rows,
+            });
         }
 
         let bytes = serde_json::to_vec(&snapshot)?;
@@ -312,15 +324,15 @@ impl HotColumnStore for InMemoryHotColumnStore {
     async fn restore_snapshot(&self, bytes: &[u8]) -> anyhow::Result<()> {
         #[derive(Deserialize)]
         struct SnapshotRow {
-            symbol: String,
-            timestamp_micros: i64,
-            #[serde(with = "serde_bytes")]
-            payload: Vec<u8>,
+            key1: Bytes,
+            order_micros: i64,
+            values: Vec<Bytes>,
         }
 
         #[derive(Deserialize)]
         struct SnapshotTenant {
-            tenant: String,
+            table: String,
+            key0: Bytes,
             rows: Vec<SnapshotRow>,
         }
 
@@ -329,24 +341,17 @@ impl HotColumnStore for InMemoryHotColumnStore {
         guard.clear();
 
         for tenant in tenants {
-            let tenant_id = tenant.tenant.clone();
             let tenant_store = guard
-                .entry(tenant_id.clone())
+                .entry((tenant.table.clone(), tenant.key0.clone()))
                 .or_insert_with(TenantStore::default);
             for row in tenant.rows {
                 let symbol_store = tenant_store
                     .symbols
-                    .entry(row.symbol.clone())
+                    .entry(row.key1.clone())
                     .or_insert_with(SymbolStore::default);
-                let timestamp = if row.timestamp_micros >= 0 {
-                    UNIX_EPOCH + Duration::from_micros(row.timestamp_micros as u64)
-                } else {
-                    UNIX_EPOCH - Duration::from_micros((-row.timestamp_micros) as u64)
-                };
                 symbol_store.rows.push(Row {
-                    timestamp,
-                    micros: row.timestamp_micros,
-                    payload: row.payload,
+                    micros: row.order_micros,
+                    values: row.values,
                 });
                 tenant_store.total_rows += 1;
             }
@@ -363,21 +368,22 @@ impl HotColumnStore for InMemoryHotColumnStore {
 
     async fn last_by(
         &self,
-        tenant: &TenantId,
-        symbols: &[String],
+        table: &str,
+        key0: &Bytes,
+        key1_list: &[Bytes],
         at: SystemTime,
     ) -> anyhow::Result<Vec<HotRow>> {
         let micros = system_time_to_micros(at);
         let guard = self.inner.read().await;
-        let Some(tenant_store) = guard.get(tenant) else {
+        let Some(tenant_store) = guard.get(&(table.to_string(), key0.clone())) else {
             return Ok(Vec::new());
         };
 
         let mut results = Vec::new();
-        let symbol_keys: Vec<&String> = if symbols.is_empty() {
+        let symbol_keys: Vec<&Bytes> = if key1_list.is_empty() {
             tenant_store.symbols.keys().collect()
         } else {
-            symbols
+            key1_list
                 .iter()
                 .filter(|sym| tenant_store.symbols.contains_key(*sym))
                 .collect()
@@ -387,9 +393,9 @@ impl HotColumnStore for InMemoryHotColumnStore {
             if let Some(store) = tenant_store.symbols.get(symbol) {
                 if let Some(row) = find_last_le(&store.rows, micros) {
                     results.push(HotRow {
-                        symbol: symbol.clone(),
-                        timestamp: row.timestamp,
-                        payload: row.payload.clone(),
+                        key1: symbol.clone(),
+                        order_micros: row.micros,
+                        values: row.values.clone(),
                     });
                 }
             }
@@ -400,40 +406,43 @@ impl HotColumnStore for InMemoryHotColumnStore {
 
     async fn asof(
         &self,
-        tenant: &TenantId,
-        symbols: &[String],
+        table: &str,
+        key0: &Bytes,
+        key1_list: &[Bytes],
         at: SystemTime,
     ) -> anyhow::Result<Vec<HotRow>> {
         // For hot data, ASOF behaves like last_by on the requested timestamp.
-        self.last_by(tenant, symbols, at).await
+        self.last_by(table, key0, key1_list, at).await
     }
 
     async fn hot_summary(&self) -> anyhow::Result<Vec<HotSymbolSummary>> {
         let guard = self.inner.read().await;
         let mut summaries = Vec::new();
 
-        for (tenant, tenant_store) in guard.iter() {
+        for ((table, key0), tenant_store) in guard.iter() {
             for (symbol, symbol_store) in tenant_store.symbols.iter() {
                 if symbol_store.rows.is_empty() {
                     summaries.push(HotSymbolSummary {
-                        tenant: tenant.clone(),
-                        symbol: symbol.clone(),
+                        table: table.clone(),
+                        key0: key0.clone(),
+                        key1: symbol.clone(),
                         rows: 0,
-                        first_timestamp: None,
-                        last_timestamp: None,
+                        first_micros: None,
+                        last_micros: None,
                     });
                     continue;
                 }
 
-                let first = symbol_store.rows.first().map(|row| row.timestamp);
-                let last = symbol_store.rows.last().map(|row| row.timestamp);
+                let first = symbol_store.rows.first().map(|row| row.micros);
+                let last = symbol_store.rows.last().map(|row| row.micros);
 
                 summaries.push(HotSymbolSummary {
-                    tenant: tenant.clone(),
-                    symbol: symbol.clone(),
+                    table: table.clone(),
+                    key0: key0.clone(),
+                    key1: symbol.clone(),
                     rows: symbol_store.rows.len() as u64,
-                    first_timestamp: first,
-                    last_timestamp: last,
+                    first_micros: first,
+                    last_micros: last,
                 });
             }
         }
@@ -443,8 +452,9 @@ impl HotColumnStore for InMemoryHotColumnStore {
 
     async fn rolling_window(
         &self,
-        tenant: &TenantId,
-        symbols: &[String],
+        table: &str,
+        key0: &Bytes,
+        key1_list: &[Bytes],
         window_end: SystemTime,
         window: Duration,
         lower_bound: Option<SystemTime>,
@@ -455,16 +465,16 @@ impl HotColumnStore for InMemoryHotColumnStore {
         let lower_bound_micros = lower_bound.map(system_time_to_micros);
 
         let guard = self.inner.read().await;
-        let Some(tenant_store) = guard.get(tenant) else {
+        let Some(tenant_store) = guard.get(&(table.to_string(), key0.clone())) else {
             return Ok(Vec::new());
         };
 
         let mut results = Vec::new();
-        let emit_zero = !symbols.is_empty();
-        let symbol_keys: Vec<String> = if symbols.is_empty() {
+        let emit_zero = !key1_list.is_empty();
+        let symbol_keys: Vec<Bytes> = if key1_list.is_empty() {
             tenant_store.symbols.keys().cloned().collect()
         } else {
-            symbols.iter().cloned().collect()
+            key1_list.iter().cloned().collect()
         };
 
         for symbol in symbol_keys {
@@ -478,16 +488,16 @@ impl HotColumnStore for InMemoryHotColumnStore {
                 };
                 if count > 0 || emit_zero {
                     let row = RollingWindowRow {
-                        symbol,
-                        window_end,
+                        key1: symbol,
+                        window_end_micros: end_micros,
                         count,
                     };
                     results.push(row);
                 }
             } else if emit_zero {
                 results.push(RollingWindowRow {
-                    symbol,
-                    window_end,
+                    key1: symbol,
+                    window_end_micros: end_micros,
                     count: 0,
                 });
             }
@@ -512,6 +522,7 @@ fn find_last_le(rows: &[Row], micros: i64) -> Option<&Row> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     fn ts(offset_ms: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_millis(offset_ms)
@@ -520,54 +531,105 @@ mod tests {
     #[tokio::test]
     async fn last_by_returns_latest_row_before_timestamp() -> anyhow::Result<()> {
         let store = InMemoryHotColumnStore::new(MemConfig::default());
+        let table = "ticks";
+        let key0 = Bytes::copy_from_slice(b"tenant");
+        let key1 = Bytes::copy_from_slice(b"AAPL");
         store
-            .append_row(&"tenant".into(), "AAPL", ts(1_000), b"r1")
+            .append_row(
+                table,
+                key0.clone(),
+                key1.clone(),
+                system_time_to_micros(ts(1_000)),
+                vec![Bytes::from_static(b"r1")],
+            )
             .await?;
         store
-            .append_row(&"tenant".into(), "AAPL", ts(2_000), b"r2")
+            .append_row(
+                table,
+                key0.clone(),
+                key1.clone(),
+                system_time_to_micros(ts(2_000)),
+                vec![Bytes::from_static(b"r2")],
+            )
             .await?;
 
         let rows = store
-            .last_by(&"tenant".into(), &["AAPL".into()], ts(1_500))
+            .last_by(table, &key0, &[key1.clone()], ts(1_500))
             .await?;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].payload, b"r1".to_vec());
+        assert_eq!(rows[0].values[0], Bytes::from_static(b"r1"));
 
         let rows = store
-            .last_by(&"tenant".into(), &["AAPL".into()], ts(2_500))
+            .last_by(table, &key0, &[key1.clone()], ts(2_500))
             .await?;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].payload, b"r2".to_vec());
+        assert_eq!(rows[0].values[0], Bytes::from_static(b"r2"));
         Ok(())
     }
 
     #[tokio::test]
     async fn asof_aliases_last_by() -> anyhow::Result<()> {
         let store = InMemoryHotColumnStore::new(MemConfig::default());
+        let table = "ticks";
+        let key0 = Bytes::copy_from_slice(b"tenant");
+        let key1 = Bytes::copy_from_slice(b"AAPL");
         store
-            .append_row(&"tenant".into(), "AAPL", ts(1_000), b"r1")
+            .append_row(
+                table,
+                key0.clone(),
+                key1.clone(),
+                system_time_to_micros(ts(1_000)),
+                vec![Bytes::from_static(b"r1")],
+            )
             .await?;
         let rows = store
-            .asof(&"tenant".into(), &["AAPL".into()], ts(1_500))
+            .asof(table, &key0, &[key1.clone()], ts(1_500))
             .await?;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].payload, b"r1".to_vec());
+        assert_eq!(rows[0].values[0], Bytes::from_static(b"r1"));
         Ok(())
     }
 
     #[tokio::test]
     async fn rolling_window_counts_rows_within_duration() -> anyhow::Result<()> {
         let store = InMemoryHotColumnStore::new(MemConfig::default());
-        let tenant: TenantId = "tenant".into();
-        store.append_row(&tenant, "AAPL", ts(1_000), b"r1").await?;
-        store.append_row(&tenant, "AAPL", ts(2_000), b"r2").await?;
-        store.append_row(&tenant, "AAPL", ts(4_000), b"r3").await?;
+        let table = "ticks";
+        let key0 = Bytes::copy_from_slice(b"tenant");
+        let key1 = Bytes::copy_from_slice(b"AAPL");
+        store
+            .append_row(
+                table,
+                key0.clone(),
+                key1.clone(),
+                system_time_to_micros(ts(1_000)),
+                vec![Bytes::from_static(b"r1")],
+            )
+            .await?;
+        store
+            .append_row(
+                table,
+                key0.clone(),
+                key1.clone(),
+                system_time_to_micros(ts(2_000)),
+                vec![Bytes::from_static(b"r2")],
+            )
+            .await?;
+        store
+            .append_row(
+                table,
+                key0.clone(),
+                key1.clone(),
+                system_time_to_micros(ts(4_000)),
+                vec![Bytes::from_static(b"r3")],
+            )
+            .await?;
 
         let window_end = ts(3_500);
         let rows = store
             .rolling_window(
-                &tenant,
-                &["AAPL".into()],
+                table,
+                &key0,
+                &[key1.clone()],
                 window_end,
                 Duration::from_millis(2_500),
                 None,
@@ -575,8 +637,8 @@ mod tests {
             .await?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].count, 2);
-        assert_eq!(rows[0].symbol, "AAPL");
-        assert_eq!(rows[0].window_end, window_end);
+        assert_eq!(rows[0].key1, key1);
+        assert_eq!(rows[0].window_end_micros, system_time_to_micros(window_end));
         Ok(())
     }
 }

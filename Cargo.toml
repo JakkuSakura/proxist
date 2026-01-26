@@ -16,7 +16,7 @@ rust-version = "1.75"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "macros", "json", "tokio"] }
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }

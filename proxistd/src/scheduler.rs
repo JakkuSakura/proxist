@@ -2,6 +2,7 @@ use crate::clickhouse::{ClickhouseHttpClient, ClickhouseNativeClient};
 use crate::metadata_sqlite::SqliteMetadataStore;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use bytes::Bytes;
 mod plan;
 use plan::{
     build_table_plan, parse_table_schema_from_ddl, rewrite_with_bounds, OrderItem, Predicate,
@@ -93,8 +94,6 @@ pub struct RowSet {
     pub rows: Vec<Vec<ScalarValue>>,
 }
 
-const DEFAULT_PAYLOAD_COLUMN: &str = "payload";
-
 #[derive(Debug, Clone)]
 pub struct TableConfig {
     pub order_col: String,
@@ -104,13 +103,35 @@ pub struct TableConfig {
     pub column_types: Vec<ColumnType>,
 }
 
+pub struct TableRegistry {
+    tables: Mutex<HashMap<String, TableConfig>>,
+}
+
+impl TableRegistry {
+    pub fn new() -> Self {
+        Self {
+            tables: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn register_table(&self, table: impl Into<String>, cfg: TableConfig) {
+        let key = table.into().to_ascii_lowercase();
+        self.tables.lock().unwrap().insert(key, cfg);
+    }
+
+    pub fn table_config(&self, table: &str) -> Option<TableConfig> {
+        let key = table.to_ascii_lowercase();
+        self.tables.lock().unwrap().get(&key).cloned()
+    }
+}
+
 pub struct ProxistScheduler {
     sqlite: Option<SqliteExecutor>,
     clickhouse: Option<ClickhouseHttpClient>,
     clickhouse_native: Option<ClickhouseNativeClient>,
     postgres: Option<PostgresExecutor>,
     hot_store: Option<Arc<dyn HotColumnStore>>,
-    tables: Arc<Mutex<HashMap<String, TableConfig>>>,
+    registry: Arc<TableRegistry>,
     persisted_cutoff_micros: AtomicI64,
     hot_stats: Arc<RwLock<HashMap<(String, String), HotStats>>>,
 }
@@ -121,6 +142,7 @@ impl ProxistScheduler {
         clickhouse: Option<ClickhouseHttpClient>,
         clickhouse_native: Option<ClickhouseNativeClient>,
         hot_store: Option<Arc<dyn HotColumnStore>>,
+        registry: Arc<TableRegistry>,
     ) -> anyhow::Result<Self> {
         let sqlite = match cfg.sqlite_path {
             Some(path) => Some(
@@ -138,15 +160,14 @@ impl ProxistScheduler {
             clickhouse_native,
             postgres,
             hot_store,
-            tables: Arc::new(Mutex::new(HashMap::new())),
+            registry,
             persisted_cutoff_micros: AtomicI64::new(-1),
             hot_stats: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
     pub fn register_table(&self, table: impl Into<String>, cfg: TableConfig) {
-        let key = table.into().to_ascii_lowercase();
-        self.tables.lock().unwrap().insert(key, cfg);
+        self.registry.register_table(table, cfg);
     }
 
     pub fn register_ddl(&self, ddl_sql: &str) -> anyhow::Result<()> {
@@ -164,7 +185,7 @@ impl ProxistScheduler {
             column_names.push(name);
             column_types.push(ty);
         }
-        self.register_table(
+        self.registry.register_table(
             table,
             TableConfig {
                 order_col: annotation.order_col,
@@ -178,8 +199,7 @@ impl ProxistScheduler {
     }
 
     pub fn table_config(&self, table: &str) -> Option<TableConfig> {
-        let key = table.to_ascii_lowercase();
-        self.tables.lock().unwrap().get(&key).cloned()
+        self.registry.table_config(table)
     }
 
     pub fn set_persisted_cutoff(&self, cutoff: Option<SystemTime>) {
@@ -194,11 +214,13 @@ impl ProxistScheduler {
         let mut map = self.hot_stats.write().await;
         map.clear();
         for entry in stats {
+            let key0 = unsafe { std::str::from_utf8_unchecked(&entry.key0) }.to_string();
+            let key1 = unsafe { std::str::from_utf8_unchecked(&entry.key1) }.to_string();
             map.insert(
-                (entry.tenant.clone(), entry.symbol.clone()),
+                (key0, key1),
                 HotStats {
-                    first_micros: entry.first_timestamp.map(system_time_to_micros),
-                    last_micros: entry.last_timestamp.map(system_time_to_micros),
+                    first_micros: entry.first_micros,
+                    last_micros: entry.last_micros,
                 },
             );
         }
@@ -238,8 +260,7 @@ impl SqlExecutor for ProxistScheduler {
         if normalized.starts_with("select") || normalized.starts_with("with") {
             if let Some(hot) = &self.hot_store {
                 let plan = {
-                    let guard = self.tables.lock().unwrap();
-                    analyze_select(sql, &*guard)
+                    analyze_select(sql, &self.registry)
                 };
 
                 if let Some(plan) = plan {
@@ -365,13 +386,13 @@ impl SqlExecutor for ProxistScheduler {
                                 };
                                 let mut select = plan.select.clone();
                                 select.start = micros_to_system_time(hot_lo);
-                                let rows = load_hot_rows(hot, &select).await?;
+                                let rows = load_hot_rows(hot, &select, &plan.table).await?;
                                 if !rows.is_empty() {
                                     hot_rows = Some(project_hot_rows(rows, &plan));
                                 }
                             }
                         } else {
-                            let rows = load_hot_rows(hot, &plan.select).await?;
+                            let rows = load_hot_rows(hot, &plan.select, &plan.table).await?;
                             if !rows.is_empty() {
                                 hot_rows = Some(project_hot_rows(rows, &plan));
                             }
@@ -499,11 +520,10 @@ impl PostgresExecutor {
 
 #[derive(Clone)]
 struct HotRowFlat {
-    k0: String,
-    k1: String,
+    key0: Bytes,
+    key1: Bytes,
     ord_micros: i64,
-    payload: Vec<u8>,
-    seq: i64,
+    values: Vec<Bytes>,
 }
 
 #[derive(Clone)]
@@ -516,6 +536,7 @@ struct SimpleSelect {
 
 #[derive(Clone)]
 struct PlanAnalysis {
+    table: String,
     cfg: TableConfig,
     select: SimpleSelect,
     order_by: Vec<OrderItem>,
@@ -531,13 +552,13 @@ struct HotStats {
     last_micros: Option<i64>,
 }
 
-fn analyze_select(sql: &str, tables: &HashMap<String, TableConfig>) -> Option<PlanAnalysis> {
+fn analyze_select(sql: &str, registry: &TableRegistry) -> Option<PlanAnalysis> {
     let plan = build_table_plan(sql)?;
     if !plan.supports_hot {
         return None;
     }
 
-    let cfg = tables.get(&plan.table)?.clone();
+    let cfg = registry.table_config(&plan.table)?;
 
     let filter0 = cfg.filter_cols.get(0)?.to_ascii_lowercase();
     let filter1 = cfg.filter_cols.get(1)?.to_ascii_lowercase();
@@ -628,6 +649,7 @@ fn analyze_select(sql: &str, tables: &HashMap<String, TableConfig>) -> Option<Pl
     }
 
     Some(PlanAnalysis {
+        table: plan.table,
         cfg,
         select: SimpleSelect {
             key0,
@@ -646,17 +668,25 @@ fn analyze_select(sql: &str, tables: &HashMap<String, TableConfig>) -> Option<Pl
 async fn load_hot_rows(
     hot: &Arc<dyn HotColumnStore>,
     sel: &SimpleSelect,
+    table: &str,
 ) -> anyhow::Result<Vec<HotRowFlat>> {
     let range = QueryRange::new(sel.start, sel.end);
-    let rows = hot.scan_range(&sel.key0, &range, &sel.key1_list).await?;
+    let key0_bytes = Bytes::copy_from_slice(sel.key0.as_bytes());
+    let key1_list: Vec<Bytes> = sel
+        .key1_list
+        .iter()
+        .map(|k| Bytes::copy_from_slice(k.as_bytes()))
+        .collect();
+    let rows = hot
+        .scan_range(table, &key0_bytes, &range, &key1_list)
+        .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         out.push(HotRowFlat {
-            k0: sel.key0.clone(),
-            k1: row.symbol,
-            ord_micros: system_time_to_micros(row.timestamp),
-            payload: row.payload,
-            seq: 0,
+            key0: key0_bytes.clone(),
+            key1: row.key1,
+            ord_micros: row.order_micros,
+            values: row.values,
         });
     }
     Ok(out)
@@ -767,6 +797,33 @@ fn parse_json_rows(
     })
 }
 
+fn bytes_to_scalar(value: &Bytes, ty: ColumnType) -> ScalarValue {
+    if value.is_empty() {
+        return ScalarValue::Null;
+    }
+    let text = unsafe { std::str::from_utf8_unchecked(value) };
+    match ty {
+        ColumnType::Int64 => text
+            .parse::<i64>()
+            .map(ScalarValue::Int64)
+            .unwrap_or_else(|_| ScalarValue::String(text.to_string())),
+        ColumnType::Float64 => text
+            .parse::<f64>()
+            .map(ScalarValue::Float64)
+            .unwrap_or_else(|_| ScalarValue::String(text.to_string())),
+        ColumnType::Bool => {
+            if text.eq_ignore_ascii_case("true") {
+                ScalarValue::Bool(true)
+            } else if text.eq_ignore_ascii_case("false") {
+                ScalarValue::Bool(false)
+            } else {
+                ScalarValue::String(text.to_string())
+            }
+        }
+        ColumnType::Text => ScalarValue::String(text.to_string()),
+    }
+}
+
 fn parse_scalar_value(value: &str, ty: ColumnType) -> ScalarValue {
     if value.is_empty() {
         return ScalarValue::Null;
@@ -840,39 +897,28 @@ fn json_to_scalar(value: JsonValue, ty: ColumnType) -> ScalarValue {
 fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> RowSet {
     let columns = expected_columns(plan);
     let column_types = expected_column_types(plan);
-    let filter0 = plan
-        .cfg
-        .filter_cols
-        .get(0)
-        .map(|c| c.to_ascii_lowercase())
-        .unwrap_or_default();
-    let filter1 = plan
-        .cfg
-        .filter_cols
-        .get(1)
-        .map(|c| c.to_ascii_lowercase())
-        .unwrap_or_default();
-    let order_col = plan.cfg.order_col.to_ascii_lowercase();
-    let payload_col = DEFAULT_PAYLOAD_COLUMN.to_ascii_lowercase();
-    let seq_col = plan.cfg.seq_col.as_ref().map(|c| c.to_ascii_lowercase());
+    let mut indices = Vec::with_capacity(columns.len());
+    for col in &columns {
+        let idx = plan
+            .cfg
+            .columns
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(col));
+        indices.push(idx);
+    }
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut row_values = Vec::with_capacity(columns.len());
-        for col in &columns {
-            let value = if *col == filter0 {
-                ScalarValue::String(row.k0.clone())
-            } else if *col == filter1 {
-                ScalarValue::String(row.k1.clone())
-            } else if *col == order_col {
-                ScalarValue::Int64(row.ord_micros)
-            } else if *col == payload_col {
-                ScalarValue::String(String::from_utf8_lossy(&row.payload).to_string())
-            } else if seq_col.as_ref().map(|s| s == col).unwrap_or(false) {
-                ScalarValue::Int64(row.seq)
-            } else {
-                ScalarValue::Null
-            };
+        for (pos, col) in indices.iter().enumerate() {
+            let ty = column_types
+                .get(pos)
+                .copied()
+                .unwrap_or(ColumnType::Text);
+            let value = col
+                .and_then(|idx| row.values.get(idx))
+                .map(|v| bytes_to_scalar(v, ty))
+                .unwrap_or(ScalarValue::Null);
             row_values.push(value);
         }
         out.push(row_values);
@@ -1221,25 +1267,27 @@ mod scheduler_tests {
             clickhouse_native: None,
             postgres: None,
             hot_store: None,
-            tables: Arc::new(Mutex::new(HashMap::new())),
+            registry: Arc::new(TableRegistry::new()),
             persisted_cutoff_micros: AtomicI64::new(-1),
             hot_stats: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let stats = vec![
             HotSymbolSummary {
-                tenant: "alpha".to_string(),
-                symbol: "SYM1".to_string(),
+                table: "ticks".to_string(),
+                key0: Bytes::copy_from_slice(b"alpha"),
+                key1: Bytes::copy_from_slice(b"SYM1"),
                 rows: 10,
-                first_timestamp: Some(micros_to_system_time(100)),
-                last_timestamp: Some(micros_to_system_time(200)),
+                first_micros: Some(100),
+                last_micros: Some(200),
             },
             HotSymbolSummary {
-                tenant: "alpha".to_string(),
-                symbol: "SYM2".to_string(),
+                table: "ticks".to_string(),
+                key0: Bytes::copy_from_slice(b"alpha"),
+                key1: Bytes::copy_from_slice(b"SYM2"),
                 rows: 10,
-                first_timestamp: Some(micros_to_system_time(100)),
-                last_timestamp: Some(micros_to_system_time(200)),
+                first_micros: Some(100),
+                last_micros: Some(200),
             },
         ];
 
@@ -1264,7 +1312,7 @@ mod scheduler_tests {
 
     #[test]
     fn project_hot_rows_projects_columns() {
-    let cfg = TableConfig {
+        let cfg = TableConfig {
             order_col: "ts_micros".to_string(),
             filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
             seq_col: Some("seq".to_string()),
@@ -1284,6 +1332,7 @@ mod scheduler_tests {
             ],
         };
         let plan = PlanAnalysis {
+            table: "ticks".to_string(),
             cfg,
             select: SimpleSelect {
                 key0: "alpha".to_string(),
@@ -1303,18 +1352,28 @@ mod scheduler_tests {
 
         let rows = vec![
             HotRowFlat {
-                k0: "alpha".to_string(),
-                k1: "SYM1".to_string(),
+                key0: Bytes::copy_from_slice(b"alpha"),
+                key1: Bytes::copy_from_slice(b"SYM1"),
                 ord_micros: 2,
-                payload: vec![0x62],
-                seq: 1,
+                values: vec![
+                    Bytes::copy_from_slice(b"alpha"),
+                    Bytes::copy_from_slice(b"SYM1"),
+                    Bytes::copy_from_slice(b"2"),
+                    Bytes::copy_from_slice(b"b"),
+                    Bytes::copy_from_slice(b"1"),
+                ],
             },
             HotRowFlat {
-                k0: "alpha".to_string(),
-                k1: "SYM1".to_string(),
+                key0: Bytes::copy_from_slice(b"alpha"),
+                key1: Bytes::copy_from_slice(b"SYM1"),
                 ord_micros: 1,
-                payload: vec![0x61],
-                seq: 0,
+                values: vec![
+                    Bytes::copy_from_slice(b"alpha"),
+                    Bytes::copy_from_slice(b"SYM1"),
+                    Bytes::copy_from_slice(b"1"),
+                    Bytes::copy_from_slice(b"a"),
+                    Bytes::copy_from_slice(b"0"),
+                ],
             },
         ];
 
@@ -1345,6 +1404,7 @@ mod scheduler_tests {
     #[test]
     fn merge_rows_keeps_cold_order_and_sorts_hot() {
         let plan = PlanAnalysis {
+            table: "ticks".to_string(),
             cfg: TableConfig {
                 order_col: "ts_micros".to_string(),
                 filter_cols: vec!["tenant".to_string(), "symbol".to_string()],

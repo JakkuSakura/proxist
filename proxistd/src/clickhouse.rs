@@ -1,12 +1,12 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use proxist_core::ingest::IngestSegment;
+use crate::scheduler::{ColumnType, TableRegistry};
 use reqwest::Client;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tracing::debug;
 
 #[cfg(feature = "clickhouse-native")]
@@ -61,6 +61,7 @@ pub trait ClickhouseSink: Send + Sync {
 pub struct ClickhouseHttpSink {
     client: Client,
     config: ClickhouseConfig,
+    registry: std::sync::Arc<TableRegistry>,
 }
 
 impl std::fmt::Debug for ClickhouseHttpSink {
@@ -74,13 +75,13 @@ impl std::fmt::Debug for ClickhouseHttpSink {
 }
 
 impl ClickhouseHttpSink {
-    pub fn new(config: ClickhouseConfig) -> anyhow::Result<Self> {
+    pub fn new(config: ClickhouseConfig, registry: std::sync::Arc<TableRegistry>) -> anyhow::Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .build()
             .context("build ClickHouse HTTP client")?;
 
-        Ok(Self { client, config })
+        Ok(Self { client, config, registry })
     }
 
     fn url(&self) -> String {
@@ -99,11 +100,11 @@ impl ClickhouseHttpSink {
 #[async_trait]
 impl ClickhouseSink for ClickhouseHttpSink {
     async fn flush_segment(&self, segment: &IngestSegment) -> anyhow::Result<()> {
-        if segment.records.is_empty() {
+        if segment.rows.is_empty() {
             return Ok(());
         }
 
-        for chunk in segment.records.chunks(self.chunk_size()) {
+        for chunk in segment.rows.chunks(self.chunk_size()) {
             let mut body = String::new();
             body.push_str(&format!(
                 "INSERT INTO {} FORMAT JSONEachRow\n",
@@ -111,17 +112,35 @@ impl ClickhouseSink for ClickhouseHttpSink {
             ));
 
             for record in chunk {
-                let payload = std::str::from_utf8(&record.payload)
-                    .context("payload must be valid UTF-8 for ClickHouse HTTP ingest")?;
-                let micros = system_time_to_micros(record.timestamp);
-                let row = json!({
-                    "tenant": record.tenant,
-                    "shard_id": record.shard_id,
-                    "symbol": record.symbol,
-                    "ts_micros": micros,
-                    "payload": payload,
-                    "seq": record.seq,
-                });
+                if record.table != self.config.table {
+                    anyhow::bail!(
+                        "ingest row table {} does not match ClickHouse sink table {}",
+                        record.table,
+                        self.config.table
+                    );
+                }
+                let cfg = self
+                    .registry
+                    .table_config(&record.table)
+                    .ok_or_else(|| anyhow!("table schema not registered for {}", record.table))?;
+                if record.values.len() != cfg.columns.len() {
+                    anyhow::bail!(
+                        "ingest row value count mismatch: expected {}, got {}",
+                        cfg.columns.len(),
+                        record.values.len()
+                    );
+                }
+                let mut map = serde_json::Map::with_capacity(cfg.columns.len());
+                for (idx, col) in cfg.columns.iter().enumerate() {
+                    let ty = cfg
+                        .column_types
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(ColumnType::Text);
+                    let value = bytes_to_json(&record.values[idx], ty)?;
+                    map.insert(col.clone(), value);
+                }
+                let row = serde_json::Value::Object(map);
                 let line = serde_json::to_string(&row).context("serialize ClickHouse row")?;
                 body.push_str(&line);
                 body.push('\n');
@@ -180,7 +199,7 @@ impl ClickhouseSink for ClickhouseHttpSink {
         }
 
         debug!(
-            rows = segment.records.len(),
+            rows = segment.rows.len(),
             endpoint = %self.config.endpoint,
             table = %self.config.table,
             "flushed segment to ClickHouse"
@@ -190,13 +209,37 @@ impl ClickhouseSink for ClickhouseHttpSink {
     }
 }
 
-fn system_time_to_micros(ts: SystemTime) -> i64 {
-    ts.duration_since(UNIX_EPOCH)
-        .map(|dur| dur.as_micros() as i64)
-        .unwrap_or_else(|err| {
-            let dur = err.duration();
-            -(dur.as_micros() as i64)
-        })
+fn bytes_to_json(value: &bytes::Bytes, ty: ColumnType) -> anyhow::Result<serde_json::Value> {
+    if value.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    let text = unsafe { std::str::from_utf8_unchecked(value) };
+    let json = match ty {
+        ColumnType::Text => serde_json::Value::String(text.to_string()),
+        ColumnType::Int64 => {
+            let parsed = text
+                .parse::<i64>()
+                .map_err(|err| anyhow!("invalid int literal: {err}"))?;
+            serde_json::Value::Number(parsed.into())
+        }
+        ColumnType::Float64 => {
+            let parsed = text
+                .parse::<f64>()
+                .map_err(|err| anyhow!("invalid float literal: {err}"))?;
+            serde_json::Number::from_f64(parsed)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        ColumnType::Bool => {
+            let parsed = match text {
+                "true" | "TRUE" | "True" => true,
+                "false" | "FALSE" | "False" => false,
+                _ => return Err(anyhow!("invalid bool literal")),
+            };
+            serde_json::Value::Bool(parsed)
+        }
+    };
+    Ok(json)
 }
 
 #[derive(Clone)]
@@ -535,7 +578,11 @@ impl ClickhouseHttpClient {
 
     pub async fn fetch_last_by(
         &self,
-        tenant: &str,
+        key0_col: &str,
+        key1_col: &str,
+        order_col: &str,
+        payload_col: Option<&str>,
+        key0: &str,
         symbols: &[String],
         ts_micros: i64,
     ) -> anyhow::Result<Vec<ClickhouseQueryRow>> {
@@ -547,17 +594,22 @@ impl ClickhouseHttpClient {
             .map(|sym| format!("'{}'", Self::escape(sym)))
             .collect::<Vec<_>>()
             .join(", ");
+        let payload_expr = payload_col.unwrap_or("''");
         let sql = format!(
-            "SELECT symbol, ts_micros, payload \
+            "SELECT {key1} AS symbol, {order} AS ts_micros, {payload} AS payload \
              FROM {table} \
-             WHERE tenant = '{tenant}' \
-               AND symbol IN ({symbols}) \
-               AND ts_micros <= {ts} \
-             ORDER BY symbol, ts_micros DESC \
-             LIMIT 1 BY symbol \
+             WHERE {key0} = '{tenant}' \
+               AND {key1} IN ({symbols}) \
+               AND {order} <= {ts} \
+             ORDER BY {key1}, {order} DESC \
+             LIMIT 1 BY {key1} \
              FORMAT JSONEachRow",
             table = self.config.table,
-            tenant = Self::escape(tenant),
+            key0 = key0_col,
+            key1 = key1_col,
+            order = order_col,
+            payload = payload_expr,
+            tenant = Self::escape(key0),
             symbols = symbol_list,
             ts = ts_micros
         );
@@ -566,7 +618,11 @@ impl ClickhouseHttpClient {
 
     pub async fn fetch_range(
         &self,
-        tenant: &str,
+        key0_col: &str,
+        key1_col: &str,
+        order_col: &str,
+        payload_col: Option<&str>,
+        key0: &str,
         symbols: &[String],
         start_micros: i64,
         end_micros: i64,
@@ -579,16 +635,21 @@ impl ClickhouseHttpClient {
             .map(|sym| format!("'{}'", Self::escape(sym)))
             .collect::<Vec<_>>()
             .join(", ");
+        let payload_expr = payload_col.unwrap_or("''");
         let sql = format!(
-            "SELECT symbol, ts_micros, payload \
+            "SELECT {key1} AS symbol, {order} AS ts_micros, {payload} AS payload \
              FROM {table} \
-             WHERE tenant = '{tenant}' \
-               AND symbol IN ({symbols}) \
-               AND ts_micros BETWEEN {start} AND {end} \
-             ORDER BY ts_micros ASC \
+             WHERE {key0} = '{tenant}' \
+               AND {key1} IN ({symbols}) \
+               AND {order} BETWEEN {start} AND {end} \
+             ORDER BY {order} ASC \
              FORMAT JSONEachRow",
             table = self.config.table,
-            tenant = Self::escape(tenant),
+            key0 = key0_col,
+            key1 = key1_col,
+            order = order_col,
+            payload = payload_expr,
+            tenant = Self::escape(key0),
             symbols = symbol_list,
             start = start_micros,
             end = end_micros

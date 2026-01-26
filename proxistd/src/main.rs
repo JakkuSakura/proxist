@@ -37,7 +37,7 @@ use proxist_core::api::{
     StatusResponse, SymbolDictionarySpec,
 };
 use proxist_core::{
-    ingest::IngestRecord,
+    ingest::IngestRow,
     metadata::ClusterMetadata,
     query::{QueryOperation, RollingAggregation},
     MetadataStore, ShardAssignment, ShardHealth,
@@ -287,6 +287,7 @@ struct AppState {
     persisted_cutoff_override: Option<SystemTime>,
     http_dialect: DialectMode,
     pg_binary: bool,
+    default_table: Option<String>,
 }
 
 #[derive(Debug)]
@@ -357,11 +358,16 @@ fn option_time_to_micros(ts: Option<SystemTime>) -> Option<i64> {
     ts.map(system_time_to_micros)
 }
 
-fn hot_row_to_query_row(row: proxist_mem::HotRow) -> QueryRow {
+fn hot_row_to_query_row(row: proxist_mem::HotRow, payload_idx: Option<usize>) -> QueryRow {
+    let symbol = bytes_to_str_unchecked(&row.key1).to_string();
+    let payload = payload_idx
+        .and_then(|idx| row.values.get(idx))
+        .map(|value| value.to_vec())
+        .unwrap_or_default();
     QueryRow {
-        symbol: row.symbol,
-        timestamp: row.timestamp,
-        payload: ByteBuf::from(row.payload),
+        symbol,
+        timestamp: micros_to_system_time(row.order_micros),
+        payload: ByteBuf::from(payload),
     }
 }
 
@@ -698,14 +704,15 @@ async fn execute_sql_batch(
                     match *query.body {
                         SetExpr::Values(values) => {
                             if let Some(cfg) = table_cfg {
-                                let records = build_ingest_records(
+                                let rows = build_ingest_rows(
+                                    &table_name_lower,
                                     &cfg,
                                     &columns,
                                     values,
                                     &mut seq_counter,
                                 )?;
-                                if !records.is_empty() {
-                                    state.ingest.ingest_records(records).await?;
+                                if !rows.is_empty() {
+                                    state.ingest.ingest_records(rows).await?;
                                 }
                                 outputs.push(SqlBatchResult::Text("Ok.\n".to_string()));
                             } else {
@@ -733,45 +740,60 @@ async fn execute_sql_batch(
     Ok(outputs)
 }
 
-fn build_ingest_records(
+fn build_ingest_rows(
+    table: &str,
     cfg: &crate::scheduler::TableConfig,
     columns: &[Ident],
     values: Values,
     seq_counter: &mut u64,
-) -> anyhow::Result<Vec<IngestRecord>> {
+) -> anyhow::Result<Vec<IngestRow>> {
     let column_names: Vec<String> = if columns.is_empty() {
         cfg.columns.clone()
     } else {
         columns.iter().map(|c| c.value.to_lowercase()).collect()
     };
 
-    let mut records = Vec::new();
-    let tenant_key = cfg
+    let key0_name = cfg
         .filter_cols
         .get(0)
         .map(|s| s.to_ascii_lowercase())
-        .ok_or_else(|| anyhow!("proxist filter_cols missing tenant column"))?;
-    let symbol_key = cfg
+        .ok_or_else(|| anyhow!("proxist filter_cols missing key0 column"))?;
+    let key1_name = cfg
         .filter_cols
         .get(1)
         .map(|s| s.to_ascii_lowercase())
-        .ok_or_else(|| anyhow!("proxist filter_cols missing symbol column"))?;
-    let order_key = cfg.order_col.to_ascii_lowercase();
-    let seq_key = cfg.seq_col.as_ref().map(|s| s.to_ascii_lowercase());
+        .ok_or_else(|| anyhow!("proxist filter_cols missing key1 column"))?;
+    let order_name = cfg.order_col.to_ascii_lowercase();
+    let seq_name = cfg.seq_col.as_ref().map(|s| s.to_ascii_lowercase());
 
-    let tenant_idx = column_names.iter().position(|c| c == &tenant_key);
-    let symbol_idx = column_names.iter().position(|c| c == &symbol_key);
-    let order_idx = column_names.iter().position(|c| c == &order_key);
-    let seq_idx = seq_key
+    let key0_idx = cfg
+        .columns
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(&key0_name))
+        .ok_or_else(|| anyhow!("key0 column missing from table schema"))?;
+    let key1_idx = cfg
+        .columns
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(&key1_name))
+        .ok_or_else(|| anyhow!("key1 column missing from table schema"))?;
+    let order_idx = cfg
+        .columns
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(&order_name))
+        .ok_or_else(|| anyhow!("order column missing from table schema"))?;
+    let seq_idx = seq_name
         .as_ref()
-        .and_then(|seq_key| column_names.iter().position(|c| c == seq_key));
-    let payload_idx = (0..column_names.len()).find(|idx| {
-        Some(*idx) != tenant_idx
-            && Some(*idx) != symbol_idx
-            && Some(*idx) != order_idx
-            && Some(*idx) != seq_idx
-    });
+        .and_then(|name| cfg.columns.iter().position(|c| c.eq_ignore_ascii_case(name)));
 
+    let mut positions = Vec::with_capacity(cfg.columns.len());
+    for col in &cfg.columns {
+        let idx = column_names
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(col));
+        positions.push(idx);
+    }
+
+    let mut rows = Vec::with_capacity(values.rows.len());
     for row in values.rows {
         if row.len() != column_names.len() {
             anyhow::bail!(
@@ -781,46 +803,55 @@ fn build_ingest_records(
             );
         }
 
-        let mut tenant: Option<String> = None;
-        let mut symbol: Option<String> = None;
-        let mut timestamp: Option<SystemTime> = None;
-        let mut seq: Option<u64> = None;
-        let mut payload_bytes: Option<Vec<u8>> = None;
-
-        for (idx, expr) in row.iter().enumerate() {
-            if Some(idx) == tenant_idx {
-                tenant = Some(expr_to_string(expr)?);
-            } else if Some(idx) == symbol_idx {
-                symbol = Some(expr_to_string(expr)?);
-            } else if Some(idx) == order_idx {
-                timestamp = Some(expr_to_timestamp(expr)?);
-            } else if Some(idx) == payload_idx {
-                payload_bytes = Some(expr_to_string(expr)?.into_bytes());
-            } else if Some(idx) == seq_idx {
-                seq = Some(expr_to_u64(expr)?);
-            }
+        let mut ordered_values = Vec::with_capacity(cfg.columns.len());
+        for (col_idx, pos) in positions.iter().enumerate() {
+            let ty = cfg
+                .column_types
+                .get(col_idx)
+                .copied()
+                .unwrap_or(crate::scheduler::ColumnType::Text);
+            let value = match pos {
+                Some(idx) => expr_to_bytes(&row[*idx], ty)?,
+                None => bytes::Bytes::new(),
+            };
+            ordered_values.push(value);
         }
 
-        let tenant = tenant.ok_or_else(|| anyhow!("tenant column required"))?;
-        let symbol = symbol.ok_or_else(|| anyhow!("symbol column required"))?;
-        let timestamp = timestamp.ok_or_else(|| anyhow!("timestamp column required"))?;
-        let seq = seq.unwrap_or_else(|| {
-            let current = *seq_counter;
-            *seq_counter += 1;
-            current
-        });
+        let key0 = ordered_values
+            .get(key0_idx)
+            .cloned()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow!("key0 column required"))?;
+        let key1 = ordered_values
+            .get(key1_idx)
+            .cloned()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow!("key1 column required"))?;
+        let order_expr = positions[order_idx]
+            .and_then(|pos| row.get(pos))
+            .ok_or_else(|| anyhow!("order column required"))?;
+        let order_micros = system_time_to_micros(expr_to_timestamp(order_expr)?);
+        let seq = match seq_idx.and_then(|idx| positions[idx].and_then(|pos| row.get(pos))) {
+            Some(expr) => expr_to_u64(expr)?,
+            None => {
+                let current = *seq_counter;
+                *seq_counter += 1;
+                current
+            }
+        };
 
-        records.push(IngestRecord {
-            tenant,
-            shard_id: String::new(),
-            symbol,
-            timestamp,
-            payload: payload_bytes.unwrap_or_default(),
+        rows.push(IngestRow {
+            table: table.to_string(),
+            key0,
+            key1,
+            order_micros,
             seq,
+            shard_id: String::new(),
+            values: ordered_values,
         });
     }
 
-    Ok(records)
+    Ok(rows)
 }
 
 fn expr_to_string(expr: &Expr) -> anyhow::Result<String> {
@@ -828,6 +859,63 @@ fn expr_to_string(expr: &Expr) -> anyhow::Result<String> {
         Expr::Value(Value::SingleQuotedString(s)) => Ok(s.clone()),
         Expr::Identifier(ident) => Ok(ident.value.clone()),
         _ => Err(anyhow!("expected string literal")),
+    }
+}
+
+fn expr_to_bytes(expr: &Expr, ty: crate::scheduler::ColumnType) -> anyhow::Result<bytes::Bytes> {
+    match ty {
+        crate::scheduler::ColumnType::Text => match expr {
+            Expr::Value(Value::SingleQuotedString(s)) => Ok(bytes::Bytes::copy_from_slice(s.as_bytes())),
+            Expr::Value(Value::Number(num, _)) => Ok(bytes::Bytes::copy_from_slice(num.as_bytes())),
+            Expr::Value(Value::Boolean(v)) => Ok(bytes::Bytes::copy_from_slice(if *v { b"true" } else { b"false" })),
+            Expr::Identifier(ident) => Ok(bytes::Bytes::copy_from_slice(ident.value.as_bytes())),
+            _ => Err(anyhow!("expected text literal")),
+        },
+        crate::scheduler::ColumnType::Int64 => {
+            let value = match expr {
+                Expr::Value(Value::Number(num, _)) => num
+                    .parse::<i64>()
+                    .map(|v| v.to_string())
+                    .map_err(|err| anyhow!("invalid int literal: {err}"))?,
+                Expr::Value(Value::SingleQuotedString(s)) => s
+                    .parse::<i64>()
+                    .map(|v| v.to_string())
+                    .map_err(|err| anyhow!("invalid int literal: {err}"))?,
+                Expr::Identifier(ident) => ident.value.clone(),
+                _ => return Err(anyhow!("expected int literal")),
+            };
+            Ok(bytes::Bytes::copy_from_slice(value.as_bytes()))
+        }
+        crate::scheduler::ColumnType::Float64 => {
+            let value = match expr {
+                Expr::Value(Value::Number(num, _)) => num
+                    .parse::<f64>()
+                    .map(|v| v.to_string())
+                    .map_err(|err| anyhow!("invalid float literal: {err}"))?,
+                Expr::Value(Value::SingleQuotedString(s)) => s
+                    .parse::<f64>()
+                    .map(|v| v.to_string())
+                    .map_err(|err| anyhow!("invalid float literal: {err}"))?,
+                Expr::Identifier(ident) => ident.value.clone(),
+                _ => return Err(anyhow!("expected float literal")),
+            };
+            Ok(bytes::Bytes::copy_from_slice(value.as_bytes()))
+        }
+        crate::scheduler::ColumnType::Bool => {
+            let value = match expr {
+                Expr::Value(Value::Boolean(v)) => v.to_string(),
+                Expr::Value(Value::SingleQuotedString(s)) => {
+                    if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") {
+                        s.to_ascii_lowercase()
+                    } else {
+                        return Err(anyhow!("invalid bool literal"));
+                    }
+                }
+                Expr::Identifier(ident) => ident.value.clone(),
+                _ => return Err(anyhow!("expected bool literal")),
+            };
+            Ok(bytes::Bytes::copy_from_slice(value.as_bytes()))
+        }
     }
 }
 
@@ -932,6 +1020,25 @@ fn micros_to_system_time(micros: i64) -> SystemTime {
     }
 }
 
+fn bytes_to_str_unchecked(value: &bytes::Bytes) -> &str {
+    unsafe { std::str::from_utf8_unchecked(value) }
+}
+
+fn payload_index(cfg: &crate::scheduler::TableConfig) -> Option<usize> {
+    cfg.columns.iter().position(|col| {
+        !cfg
+            .filter_cols
+            .iter()
+            .any(|filter| filter.eq_ignore_ascii_case(col))
+            && !cfg.order_col.eq_ignore_ascii_case(col)
+            && !cfg
+                .seq_col
+                .as_ref()
+                .map(|seq| seq.eq_ignore_ascii_case(col))
+                .unwrap_or(false)
+    })
+}
+
 fn apply_persisted_override(
     persisted: Option<SystemTime>,
     override_ts: Option<SystemTime>,
@@ -953,6 +1060,7 @@ impl ProxistDaemon {
         let cache = Arc::new(tokio::sync::Mutex::new(ClusterMetadata::default()));
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let registry = Arc::new(crate::scheduler::TableRegistry::new());
 
         let wal = config.wal_dir.as_ref().map(|dir| {
             let cfg = WalConfig {
@@ -973,7 +1081,7 @@ impl ProxistDaemon {
         };
 
         let clickhouse_bundle = config.clickhouse.clone().and_then(|cfg| {
-            let sink = ClickhouseHttpSink::new(cfg.clone())
+            let sink = ClickhouseHttpSink::new(cfg.clone(), Arc::clone(&registry))
                 .map(|sink| Arc::new(sink) as Arc<dyn ClickhouseSink>);
             let client = ClickhouseHttpClient::new(cfg.clone()).map(|client| Arc::new(client));
             match (sink, client) {
@@ -997,6 +1105,7 @@ impl ProxistDaemon {
             hot_store.clone(),
             ingest_clickhouse,
             wal.clone(),
+            Arc::clone(&registry),
         ));
 
         // Build in-memory scheduler with SQLite + optional ClickHouse
@@ -1019,6 +1128,7 @@ impl ProxistDaemon {
             ch_client.map(|c| (*c).clone()),
             ch_native,
             Some(Arc::clone(&hot_store)),
+            Arc::clone(&registry),
         )
         .await?;
         let scheduler = Arc::new(scheduler);
@@ -1081,11 +1191,17 @@ impl ProxistDaemon {
                 let stats: Vec<_> = summary
                     .into_iter()
                     .map(|row| proxist_mem::HotSymbolSummary {
-                        tenant: row.tenant,
-                        symbol: row.symbol,
+                        table: self
+                            .config
+                            .clickhouse
+                            .as_ref()
+                            .map(|cfg| cfg.table.clone())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        key0: bytes::Bytes::copy_from_slice(row.tenant.as_bytes()),
+                        key1: bytes::Bytes::copy_from_slice(row.symbol.as_bytes()),
                         rows: row.hot_rows,
-                        first_timestamp: row.hot_first,
-                        last_timestamp: row.hot_last,
+                        first_micros: row.hot_first.map(system_time_to_micros),
+                        last_micros: row.hot_last.map(system_time_to_micros),
                     })
                     .collect();
                 self.scheduler.update_hot_stats(&stats).await;
@@ -1134,6 +1250,7 @@ impl ProxistDaemon {
             persisted_cutoff_override: self.config.persisted_cutoff_override,
             http_dialect: self.config.http_dialect.clone(),
             pg_binary: self.config.pg_binary,
+            default_table: self.config.clickhouse.as_ref().map(|cfg| cfg.table.clone()),
         };
 
         async fn status_handler(
@@ -1362,6 +1479,7 @@ impl ProxistDaemon {
             persisted_cutoff_override: self.config.persisted_cutoff_override,
             http_dialect: self.config.http_dialect.clone(),
             pg_binary: self.config.pg_binary,
+            default_table: self.config.clickhouse.as_ref().map(|cfg| cfg.table.clone()),
         };
         pgwire_server::serve(pg_addr, Arc::new(state), self.config.pg_dialect.clone()).await
     }
@@ -1405,10 +1523,10 @@ async fn replay_wal(
             }
         }
 
-        let filtered: Vec<IngestRecord> = records
+        let filtered: Vec<IngestRow> = records
             .into_iter()
             .filter(|record| match persisted_map.get(&record.shard_id) {
-                Some(cutoff) => record.timestamp > *cutoff,
+                Some(cutoff) => record.order_micros > system_time_to_micros(*cutoff),
                 None => true,
             })
             .collect();
@@ -1429,19 +1547,47 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
         state.persisted_cutoff_override,
     );
     let include_cold = request.include_cold;
+    let table = state
+        .default_table
+        .as_deref()
+        .ok_or_else(|| AppError(anyhow!("query API requires a default table")))?;
+    let cfg = state
+        .scheduler
+        .table_config(table)
+        .ok_or_else(|| AppError(anyhow!("table schema not registered for {}", table)))?;
+    let key0_col = cfg
+        .filter_cols
+        .get(0)
+        .ok_or_else(|| AppError(anyhow!("filter_cols missing key0 column")))?;
+    let key1_col = cfg
+        .filter_cols
+        .get(1)
+        .ok_or_else(|| AppError(anyhow!("filter_cols missing key1 column")))?;
+    let order_col = cfg.order_col.as_str();
+    let payload_idx = payload_index(&cfg);
+    let payload_col = payload_idx.and_then(|idx| cfg.columns.get(idx).map(|s| s.as_str()));
+    let key0 = bytes::Bytes::copy_from_slice(request.tenant.as_bytes());
+    let key1_list: Vec<bytes::Bytes> = request
+        .symbols
+        .iter()
+        .map(|symbol| bytes::Bytes::copy_from_slice(symbol.as_bytes()))
+        .collect();
 
     let rows = match &op_kind {
         QueryOperation::Range => {
             let mut hot_rows = state
                 .hot_store
-                .scan_range(&request.tenant, &request.range, &request.symbols)
+                .scan_range(table, &key0, &request.range, &key1_list)
                 .await?;
             if include_cold {
                 if let Some(persisted) = persisted_at {
-                    hot_rows.retain(|row| row.timestamp > persisted);
+                    hot_rows.retain(|row| row.order_micros > system_time_to_micros(persisted));
                 }
             }
-            let mut rows: Vec<QueryRow> = hot_rows.into_iter().map(hot_row_to_query_row).collect();
+            let mut rows: Vec<QueryRow> = hot_rows
+                .into_iter()
+                .map(|row| hot_row_to_query_row(row, payload_idx))
+                .collect();
 
             if include_cold {
                 if let Some(client) = state.ingest.clickhouse_client() {
@@ -1452,6 +1598,10 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                     if !request.symbols.is_empty() && cold_end >= request.range.start {
                         let cold_rows = client
                             .fetch_range(
+                                key0_col,
+                                key1_col,
+                                order_col,
+                                payload_col,
                                 &request.tenant,
                                 &request.symbols,
                                 system_time_to_micros(request.range.start),
@@ -1481,13 +1631,13 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                 QueryOperation::LastBy => {
                     state
                         .hot_store
-                        .last_by(&request.tenant, &request.symbols, request.range.end)
+                        .last_by(table, &key0, &key1_list, request.range.end)
                         .await?
                 }
                 QueryOperation::AsOf => {
                     state
                         .hot_store
-                        .asof(&request.tenant, &request.symbols, request.range.end)
+                        .asof(table, &key0, &key1_list, request.range.end)
                         .await?
                 }
                 _ => unreachable!(),
@@ -1495,7 +1645,7 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
 
             if include_cold {
                 if let Some(persisted) = persisted_at {
-                    hot_rows.retain(|row| row.timestamp > persisted);
+                    hot_rows.retain(|row| row.order_micros > system_time_to_micros(persisted));
                 }
             }
 
@@ -1515,7 +1665,7 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
             };
 
             for row in hot_rows {
-                upsert(hot_row_to_query_row(row));
+                upsert(hot_row_to_query_row(row, payload_idx));
             }
 
             if include_cold {
@@ -1527,6 +1677,10 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                     if !request.symbols.is_empty() {
                         let cold_rows = client
                             .fetch_last_by(
+                                key0_col,
+                                key1_col,
+                                order_col,
+                                payload_col,
                                 &request.tenant,
                                 &request.symbols,
                                 system_time_to_micros(cutoff),
@@ -1545,19 +1699,27 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                 if let Some(seam_ts) = persisted_at {
                     let seam_rows = state
                         .hot_store
-                        .seam_rows_at(&request.tenant, seam_ts)
+                        .seam_rows_at(table, &key0, seam_ts)
                         .await?;
                     for seam in seam_rows {
-                        if !request.symbols.is_empty() && !request.symbols.contains(&seam.symbol) {
+                        let seam_symbol = bytes_to_str_unchecked(&seam.key1);
+                        if !request.symbols.is_empty()
+                            && !request.symbols.iter().any(|s| s == seam_symbol)
+                        {
                             continue;
                         }
-                        if seam.timestamp > request.range.end {
+                        let seam_ts = micros_to_system_time(seam.order_micros);
+                        if seam_ts > request.range.end {
                             continue;
                         }
+                        let payload = payload_idx
+                            .and_then(|idx| seam.values.get(idx))
+                            .map(|value| value.to_vec())
+                            .unwrap_or_default();
                         upsert(QueryRow {
-                            symbol: seam.symbol,
-                            timestamp: seam.timestamp,
-                            payload: ByteBuf::from(seam.payload),
+                            symbol: seam_symbol.to_string(),
+                            timestamp: seam_ts,
+                            payload: ByteBuf::from(payload),
                         });
                     }
                 }
@@ -1603,16 +1765,11 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
 
             let hot_counts = state
                 .hot_store
-                .rolling_window(
-                    &request.tenant,
-                    &request.symbols,
-                    request.range.end,
-                    window,
-                    hot_lower_bound,
-                )
+                .rolling_window(table, &key0, &key1_list, request.range.end, window, hot_lower_bound)
                 .await?;
             for entry in hot_counts {
-                *counts.entry(entry.symbol).or_insert(0) += entry.count;
+                let symbol = bytes_to_str_unchecked(&entry.key1).to_string();
+                *counts.entry(symbol).or_insert(0) += entry.count;
             }
 
             if include_cold {
@@ -1628,6 +1785,10 @@ async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryR
                     if cold_end >= window_start {
                         let cold_rows = client
                             .fetch_range(
+                                key0_col,
+                                key1_col,
+                                order_col,
+                                payload_col,
                                 &request.tenant,
                                 &request.symbols,
                                 system_time_to_micros(window_start),
@@ -1715,6 +1876,7 @@ mod system_summary_tests {
 #[cfg(test)]
 mod ingest_tests {
     use super::*;
+    use bytes::Bytes;
     use proxist_core::query::{QueryOperation, QueryRange};
     use std::time::Duration;
     use tempfile::NamedTempFile;
@@ -1755,14 +1917,15 @@ mod ingest_tests {
         };
 
         let mut seq = 0;
-        let records = build_ingest_records(&cfg, &columns, values, &mut seq)?;
+        let records = build_ingest_rows("ticks", &cfg, &columns, values, &mut seq)?;
         assert_eq!(records.len(), 1);
         let record = &records[0];
-        assert_eq!(record.tenant, "alpha");
-        assert_eq!(record.symbol, "AAPL");
-        assert_eq!(record.payload, b"abc");
+        assert_eq!(record.table, "ticks");
+        assert_eq!(bytes_to_str_unchecked(&record.key0), "alpha");
+        assert_eq!(bytes_to_str_unchecked(&record.key1), "AAPL");
+        assert_eq!(record.order_micros, 42);
         assert_eq!(record.seq, 7);
-        assert_eq!(system_time_to_micros(record.timestamp), 42);
+        assert_eq!(record.values.len(), 5);
 
         Ok(())
     }
@@ -1783,11 +1946,13 @@ mod ingest_tests {
 
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let registry = Arc::new(crate::scheduler::TableRegistry::new());
         let service = Arc::new(IngestService::new(
             metadata.clone(),
             hot_store.clone(),
             None,
             None,
+            Arc::clone(&registry),
         ));
 
         let snapshot = metadata.get_cluster_metadata().await?;
@@ -1801,18 +1966,48 @@ mod ingest_tests {
                 None,
                 None,
                 Some(hot_store.clone()),
+                Arc::clone(&registry),
             )
             .await?,
         );
+        scheduler.register_table(
+            "ticks",
+            crate::scheduler::TableConfig {
+                order_col: "ts_micros".to_string(),
+                filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
+                seq_col: Some("seq".to_string()),
+                columns: vec![
+                    "tenant".to_string(),
+                    "symbol".to_string(),
+                    "ts_micros".to_string(),
+                    "payload".to_string(),
+                    "seq".to_string(),
+                ],
+                column_types: vec![
+                    crate::scheduler::ColumnType::Text,
+                    crate::scheduler::ColumnType::Text,
+                    crate::scheduler::ColumnType::Int64,
+                    crate::scheduler::ColumnType::Text,
+                    crate::scheduler::ColumnType::Int64,
+                ],
+            },
+        );
 
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
-        let records = vec![IngestRecord {
-            tenant: "alpha".into(),
-            shard_id: String::new(),
-            symbol: "AAPL".into(),
-            timestamp: ts,
-            payload: vec![1],
+        let records = vec![IngestRow {
+            table: "ticks".to_string(),
+            key0: Bytes::copy_from_slice(b"alpha"),
+            key1: Bytes::copy_from_slice(b"AAPL"),
+            order_micros: system_time_to_micros(ts),
             seq: 1,
+            shard_id: String::new(),
+            values: vec![
+                Bytes::copy_from_slice(b"alpha"),
+                Bytes::copy_from_slice(b"AAPL"),
+                Bytes::copy_from_slice(system_time_to_micros(ts).to_string().as_bytes()),
+                Bytes::copy_from_slice(b"\x01"),
+                Bytes::copy_from_slice(b"1"),
+            ],
         }];
         service.ingest_records(records).await?;
 
@@ -1827,6 +2022,7 @@ mod ingest_tests {
             persisted_cutoff_override: None,
             http_dialect: DialectMode::Sql(SqlDialect::ClickHouse),
             pg_binary: false,
+            default_table: Some("ticks".to_string()),
         };
 
         let range = QueryRange::new(ts - Duration::from_millis(1), ts + Duration::from_secs(1));
@@ -1844,7 +2040,6 @@ mod ingest_tests {
         let row = &response.rows[0];
         assert_eq!(row.symbol, "AAPL");
         assert_eq!(row.timestamp, ts);
-        assert_eq!(row.payload.as_ref(), &[1]);
 
         Ok(())
     }
@@ -1865,11 +2060,13 @@ mod ingest_tests {
 
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let registry = Arc::new(crate::scheduler::TableRegistry::new());
         let service = Arc::new(IngestService::new(
             metadata.clone(),
             hot_store.clone(),
             None,
             None,
+            Arc::clone(&registry),
         ));
         let snapshot = metadata.get_cluster_metadata().await?;
         service.apply_metadata(&snapshot).await?;
@@ -1882,19 +2079,49 @@ mod ingest_tests {
                 None,
                 None,
                 Some(hot_store.clone()),
+                Arc::clone(&registry),
             )
             .await?,
+        );
+        scheduler.register_table(
+            "ticks",
+            crate::scheduler::TableConfig {
+                order_col: "ts_micros".to_string(),
+                filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
+                seq_col: Some("seq".to_string()),
+                columns: vec![
+                    "tenant".to_string(),
+                    "symbol".to_string(),
+                    "ts_micros".to_string(),
+                    "payload".to_string(),
+                    "seq".to_string(),
+                ],
+                column_types: vec![
+                    crate::scheduler::ColumnType::Text,
+                    crate::scheduler::ColumnType::Text,
+                    crate::scheduler::ColumnType::Int64,
+                    crate::scheduler::ColumnType::Text,
+                    crate::scheduler::ColumnType::Int64,
+                ],
+            },
         );
 
         let ts = SystemTime::UNIX_EPOCH + Duration::from_millis(500);
         service
-            .ingest_records(vec![IngestRecord {
-                tenant: "alpha".into(),
-                shard_id: String::new(),
-                symbol: "AAPL".into(),
-                timestamp: ts,
-                payload: vec![7],
+            .ingest_records(vec![IngestRow {
+                table: "ticks".to_string(),
+                key0: Bytes::copy_from_slice(b"alpha"),
+                key1: Bytes::copy_from_slice(b"AAPL"),
+                order_micros: system_time_to_micros(ts),
                 seq: 1,
+                shard_id: String::new(),
+                values: vec![
+                    Bytes::copy_from_slice(b"alpha"),
+                    Bytes::copy_from_slice(b"AAPL"),
+                    Bytes::copy_from_slice(system_time_to_micros(ts).to_string().as_bytes()),
+                    Bytes::copy_from_slice(b"7"),
+                    Bytes::copy_from_slice(b"1"),
+                ],
             }])
             .await?;
 
@@ -1909,6 +2136,7 @@ mod ingest_tests {
             persisted_cutoff_override: None,
             http_dialect: DialectMode::Sql(SqlDialect::ClickHouse),
             pg_binary: false,
+            default_table: Some("ticks".to_string()),
         };
 
         let bundle = compose_diagnostics(&state).await.map_err(|err| err.0)?;
@@ -1955,22 +2183,53 @@ mod wal_replay_tests {
 
         let hot_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let registry = Arc::new(crate::scheduler::TableRegistry::new());
+        registry.register_table(
+            "ticks",
+            crate::scheduler::TableConfig {
+                order_col: "ts_micros".to_string(),
+                filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
+                seq_col: Some("seq".to_string()),
+                columns: vec![
+                    "tenant".to_string(),
+                    "symbol".to_string(),
+                    "ts_micros".to_string(),
+                    "payload".to_string(),
+                    "seq".to_string(),
+                ],
+                column_types: vec![
+                    crate::scheduler::ColumnType::Text,
+                    crate::scheduler::ColumnType::Text,
+                    crate::scheduler::ColumnType::Int64,
+                    crate::scheduler::ColumnType::Text,
+                    crate::scheduler::ColumnType::Int64,
+                ],
+            },
+        );
         let service = Arc::new(IngestService::new(
             metadata.clone(),
             hot_store.clone(),
             None,
             Some(wal.clone()),
+            Arc::clone(&registry),
         ));
 
         let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
         service
-            .ingest_records(vec![IngestRecord {
-                tenant: "alpha".into(),
-                shard_id: String::new(),
-                symbol: "AAPL".into(),
-                timestamp: ts,
-                payload: vec![9],
+            .ingest_records(vec![IngestRow {
+                table: "ticks".to_string(),
+                key0: bytes::Bytes::copy_from_slice(b"alpha"),
+                key1: bytes::Bytes::copy_from_slice(b"AAPL"),
+                order_micros: system_time_to_micros(ts),
                 seq: 1,
+                shard_id: String::new(),
+                values: vec![
+                    bytes::Bytes::copy_from_slice(b"alpha"),
+                    bytes::Bytes::copy_from_slice(b"AAPL"),
+                    bytes::Bytes::copy_from_slice(system_time_to_micros(ts).to_string().as_bytes()),
+                    bytes::Bytes::copy_from_slice(b"9"),
+                    bytes::Bytes::copy_from_slice(b"1"),
+                ],
             }])
             .await?;
 

@@ -2,13 +2,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use crc32fast::Hasher as Crc32;
 use serde::{Deserialize, Serialize};
 
-use proxist_core::ingest::IngestRecord;
+use proxist_core::ingest::IngestRow;
 
 const MANIFEST_FILE: &str = "manifest.json";
 
@@ -61,7 +60,7 @@ impl WalManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WalEntry {
     seq: u64,
-    record: IngestRecord,
+    row: IngestRow,
 }
 
 #[derive(Debug, Clone)]
@@ -142,8 +141,8 @@ impl WalManager {
         guard.rows_since_snapshot >= self.config.snapshot_every_rows && guard.manifest.next_seq > 1
     }
 
-    pub fn append_records(&self, records: &[IngestRecord]) -> anyhow::Result<WalAppendResult> {
-        if records.is_empty() {
+    pub fn append_records(&self, rows: &[IngestRow]) -> anyhow::Result<WalAppendResult> {
+        if rows.is_empty() {
             return Ok(WalAppendResult {
                 first_seq: 0,
                 last_seq: 0,
@@ -163,12 +162,9 @@ impl WalManager {
             .take()
             .ok_or_else(|| anyhow!("wal writer not initialized"))?;
 
-        for record in records {
+        for row in rows {
             let seq = guard.manifest.next_seq;
-            let entry = WalEntry {
-                seq,
-                record: record.clone(),
-            };
+            let entry = WalEntry { seq, row: row.clone() };
             let payload = bincode::serialize(&entry).context("serialize wal entry")?;
             let mut crc = Crc32::new();
             crc.update(&payload);
@@ -201,7 +197,7 @@ impl WalManager {
             meta.end_seq = seq;
             meta.bytes += header_len + entry_len;
 
-            last_micros = Some(system_time_to_micros(record.timestamp));
+            last_micros = Some(row.order_micros);
         }
 
         writer.writer.flush()?;
@@ -213,7 +209,7 @@ impl WalManager {
                 .context("fsync wal segment")?;
         }
 
-        guard.rows_since_snapshot += records.len() as u64;
+        guard.rows_since_snapshot += rows.len() as u64;
         write_manifest(&self.config.dir, &guard.manifest)?;
         guard.writer = Some(writer);
 
@@ -222,7 +218,7 @@ impl WalManager {
             last_seq,
             last_micros,
             bytes_written,
-            rows_written: records.len() as u64,
+            rows_written: rows.len() as u64,
         })
     }
 
@@ -287,7 +283,7 @@ impl WalManager {
         }))
     }
 
-    pub fn replay_from(&self, after_seq: u64) -> anyhow::Result<Vec<IngestRecord>> {
+    pub fn replay_from(&self, after_seq: u64) -> anyhow::Result<Vec<IngestRow>> {
         let guard = self.state.lock().expect("wal state lock poisoned");
         let mut segments = guard.manifest.segments.clone();
         drop(guard);
@@ -331,7 +327,7 @@ impl WalManager {
                 let entry: WalEntry = bincode::deserialize(&payload)
                     .context("deserialize wal entry")?;
                 if entry.seq > after_seq {
-                    records.push(entry.record);
+                    records.push(entry.row);
                 }
             }
         }
@@ -530,28 +526,21 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn system_time_to_micros(ts: SystemTime) -> i64 {
-    ts.duration_since(UNIX_EPOCH)
-        .map(|dur| dur.as_micros() as i64)
-        .unwrap_or_else(|err| {
-            let dur = err.duration();
-            -(dur.as_micros() as i64)
-        })
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn record(tenant: &str, shard: &str, symbol: &str, seq: u64, ts: i64) -> IngestRecord {
-        IngestRecord {
-            tenant: tenant.into(),
-            shard_id: shard.into(),
-            symbol: symbol.into(),
-            timestamp: UNIX_EPOCH + std::time::Duration::from_micros(ts as u64),
-            payload: vec![1, 2, 3],
+    fn record(table: &str, shard: &str, key0: &str, key1: &str, seq: u64, ts: i64) -> IngestRow {
+        IngestRow {
+            table: table.into(),
+            key0: bytes::Bytes::copy_from_slice(key0.as_bytes()),
+            key1: bytes::Bytes::copy_from_slice(key1.as_bytes()),
+            order_micros: ts,
             seq,
+            shard_id: shard.into(),
+            values: vec![bytes::Bytes::from_static(b"1")],
         }
     }
 
@@ -565,13 +554,13 @@ mod tests {
             fsync: false,
         };
         let wal = WalManager::open(config)?;
-        let records = vec![record("alpha", "s1", "AAPL", 1, 1000)];
+        let records = vec![record("ticks", "s1", "alpha", "AAPL", 1, 1000)];
         let res = wal.append_records(&records)?;
         assert_eq!(res.rows_written, 1);
 
         let replayed = wal.replay_from(0)?;
         assert_eq!(replayed.len(), 1);
-        assert_eq!(replayed[0].tenant, "alpha");
+        assert_eq!(replayed[0].table, "ticks");
         Ok(())
     }
 
@@ -585,7 +574,7 @@ mod tests {
             fsync: false,
         };
         let wal = WalManager::open(config)?;
-        let records = vec![record("alpha", "s1", "AAPL", 1, 1000)];
+        let records = vec![record("ticks", "s1", "alpha", "AAPL", 1, 1000)];
         let res = wal.append_records(&records)?;
         let snapshot = b"[]".to_vec();
         let did = wal.maybe_snapshot(snapshot, res.last_seq, res.last_micros)?;

@@ -27,6 +27,7 @@ fp-prql = { path = "../FerroPhase/crates/fp-prql" }
 sqlx.workspace = true
 tokio-postgres = { version = "0.7", optional = true }
 reqwest.workspace = true
+bytes.workspace = true
 pgwire = { version = "0.30.2", default-features = false, features = ["server-api"] }
 futures = "0.3"
 csv = "1.3"

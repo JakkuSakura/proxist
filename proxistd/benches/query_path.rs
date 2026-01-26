@@ -4,8 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::cell::RefCell;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use bytes::Bytes;
 use proxist_mem::{HotColumnStore, HotSymbolSummary, InMemoryHotColumnStore, MemConfig};
-use proxistd::scheduler::{ExecutorConfig, ProxistScheduler, SqlExecutor, TableConfig};
+use proxistd::scheduler::{ExecutorConfig, ProxistScheduler, SqlExecutor, TableConfig, TableRegistry};
 
 fn micros_to_system_time(micros: i64) -> SystemTime {
     if micros >= 0 {
@@ -27,6 +28,7 @@ fn build_fixture(cutoff_micros: i64) -> Fixture {
         .build()
         .expect("runtime");
     let hot_store = Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+    let registry = Arc::new(TableRegistry::new());
     let symbols = vec!["SYM1".to_string(), "SYM2".to_string(), "SYM3".to_string()];
     let tenant = "alpha".to_string();
     let rows_per_symbol = 20_000i64;
@@ -36,10 +38,22 @@ fn build_fixture(cutoff_micros: i64) -> Fixture {
     rt.block_on(async {
         for symbol in &symbols {
             for offset in 0..rows_per_symbol {
-                let ts = micros_to_system_time(start_micros + offset);
-                let payload = b"payload";
+                let ts_micros = start_micros + offset;
+                let values = vec![
+                    Bytes::copy_from_slice(tenant.as_bytes()),
+                    Bytes::copy_from_slice(symbol.as_bytes()),
+                    Bytes::copy_from_slice(ts_micros.to_string().as_bytes()),
+                    Bytes::from_static(b"payload"),
+                    Bytes::copy_from_slice(offset.to_string().as_bytes()),
+                ];
                 hot_store
-                    .append_row(&tenant, symbol, ts, payload)
+                    .append_row(
+                        "ticks",
+                        Bytes::copy_from_slice(tenant.as_bytes()),
+                        Bytes::copy_from_slice(symbol.as_bytes()),
+                        ts_micros,
+                        values,
+                    )
                     .await
                     .expect("append row");
             }
@@ -55,6 +69,7 @@ fn build_fixture(cutoff_micros: i64) -> Fixture {
             None,
             None,
             Some(hot_store),
+            Arc::clone(&registry),
         ))
         .expect("scheduler");
 
@@ -85,11 +100,12 @@ fn build_fixture(cutoff_micros: i64) -> Fixture {
     let stats: Vec<_> = symbols
         .iter()
         .map(|symbol| HotSymbolSummary {
-            tenant: tenant.clone(),
-            symbol: symbol.clone(),
+            table: "ticks".to_string(),
+            key0: Bytes::copy_from_slice(tenant.as_bytes()),
+            key1: Bytes::copy_from_slice(symbol.as_bytes()),
             rows: rows_per_symbol as u64,
-            first_timestamp: Some(micros_to_system_time(start_micros)),
-            last_timestamp: Some(micros_to_system_time(end_micros)),
+            first_micros: Some(start_micros),
+            last_micros: Some(end_micros),
         })
         .collect();
     rt.block_on(scheduler.update_hot_stats(&stats));
