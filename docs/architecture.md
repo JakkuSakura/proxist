@@ -4,7 +4,7 @@ Proxist is a Rust-native time-series proxy that keeps the hot working set in mem
 
 ## Implementation Status
 
-- **Working today**: HTTP control surface (`/query`, `/status`, `/assignments`, `/health`) plus ClickHouse-compatible SQL ingest, disk or in-memory WAL with replay snapshots, hot column store, ClickHouse persistence with retry/backoff, SQLite-backed metadata + persistence trackers, metadata-driven ingest wiring via DDL annotations, `pxctl` CLI (status/apply/query/rolling windows), and Docker-based integration test harness.
+- **Working today**: HTTP control surface (`/status`, `/assignments`, `/health`, `/diagnostics`) plus ClickHouse-compatible SQL ingest, disk or in-memory WAL with replay snapshots, hot column store, ClickHouse persistence with retry/backoff, SQLite-backed metadata + persistence trackers, metadata-driven ingest wiring via DDL annotations, `pxctl` CLI (status/apply/hot-summary), and Docker-based integration test harness.
 - **MVP outstanding**: none — core durability, seam-aware queries, metadata workflows, observability, and regression coverage are in place.
 
 ## High-Level Components

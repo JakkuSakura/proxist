@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::clickhouse::{
     ClickhouseConfig, ClickhouseHttpClient, ClickhouseHttpSink, ClickhouseNativeClient,
-    ClickhouseQueryRow, ClickhouseSink,
+    ClickhouseSink,
 };
 use crate::metadata_sqlite::SqliteMetadataStore;
 use crate::scheduler::{
@@ -33,13 +33,11 @@ use chrono::NaiveDateTime;
 use ingest::{HotColdSummaryRow, IngestService};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use proxist_core::api::{
-    DiagnosticsBundle, DiagnosticsHotSummaryRow, QueryRequest, QueryResponse, QueryRow,
-    StatusResponse, SymbolDictionarySpec,
+    DiagnosticsBundle, DiagnosticsHotSummaryRow, StatusResponse, SymbolDictionarySpec,
 };
 use proxist_core::{
     ingest::IngestRow,
     metadata::ClusterMetadata,
-    query::{QueryOperation, RollingAggregation},
     MetadataStore, ShardAssignment, ShardHealth,
 };
 use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
@@ -52,7 +50,6 @@ use fp_sql::{
     strip_leading_sql_comments, SqlDialect,
 };
 use fp_prql::PrqlFrontend;
-use serde_bytes::ByteBuf;
 use serde_json::json;
 use tokio::signal;
 use tracing::{error, info, instrument};
@@ -268,7 +265,6 @@ struct ProxistDaemon {
     config: DaemonConfig,
     metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
     metadata_store: SqliteMetadataStore,
-    hot_store: Arc<dyn HotColumnStore>,
     ingest_service: Arc<IngestService>,
     scheduler: Arc<ProxistScheduler>,
     metrics_handle: Option<PrometheusHandle>,
@@ -279,15 +275,12 @@ struct ProxistDaemon {
 struct AppState {
     metadata: SqliteMetadataStore,
     metadata_cache: Arc<tokio::sync::Mutex<ClusterMetadata>>,
-    hot_store: Arc<dyn HotColumnStore>,
     ingest: Arc<IngestService>,
     scheduler: Arc<ProxistScheduler>,
     metrics: Option<PrometheusHandle>,
     api_token: Option<String>,
-    persisted_cutoff_override: Option<SystemTime>,
     http_dialect: DialectMode,
     pg_binary: bool,
-    default_table: Option<String>,
 }
 
 #[derive(Debug)]
@@ -356,19 +349,6 @@ fn convert_summary_row(row: HotColdSummaryRow) -> DiagnosticsHotSummaryRow {
 
 fn option_time_to_micros(ts: Option<SystemTime>) -> Option<i64> {
     ts.map(system_time_to_micros)
-}
-
-fn hot_row_to_query_row(row: proxist_mem::HotRow, payload_idx: Option<usize>) -> QueryRow {
-    let symbol = bytes_to_str_unchecked(&row.key1).to_string();
-    let payload = payload_idx
-        .and_then(|idx| row.values.get(idx))
-        .map(|value| value.to_vec())
-        .unwrap_or_default();
-    QueryRow {
-        symbol,
-        timestamp: micros_to_system_time(row.order_micros),
-        payload: ByteBuf::from(payload),
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -986,23 +966,6 @@ fn parse_datetime_string(text: &str) -> anyhow::Result<SystemTime> {
         + Duration::from_nanos(nanos as u64))
 }
 
-fn query_operation_label(op: &QueryOperation) -> &'static str {
-    match op {
-        QueryOperation::Range => "range",
-        QueryOperation::LastBy => "last_by",
-        QueryOperation::AsOf => "asof",
-        QueryOperation::RollingWindow => "rolling_window",
-    }
-}
-
-fn clickhouse_row_to_query_row(row: ClickhouseQueryRow) -> anyhow::Result<QueryRow> {
-    Ok(QueryRow {
-        symbol: row.symbol,
-        timestamp: micros_to_system_time(row.ts_micros),
-        payload: ByteBuf::from(row.payload.into_bytes()),
-    })
-}
-
 fn system_time_to_micros(ts: SystemTime) -> i64 {
     ts.duration_since(UNIX_EPOCH)
         .map(|dur| dur.as_micros() as i64)
@@ -1018,25 +981,6 @@ fn micros_to_system_time(micros: i64) -> SystemTime {
     } else {
         UNIX_EPOCH - Duration::from_micros((-micros) as u64)
     }
-}
-
-fn bytes_to_str_unchecked(value: &bytes::Bytes) -> &str {
-    unsafe { std::str::from_utf8_unchecked(value) }
-}
-
-fn payload_index(cfg: &crate::scheduler::TableConfig) -> Option<usize> {
-    cfg.columns.iter().position(|col| {
-        !cfg
-            .filter_cols
-            .iter()
-            .any(|filter| filter.eq_ignore_ascii_case(col))
-            && !cfg.order_col.eq_ignore_ascii_case(col)
-            && !cfg
-                .seq_col
-                .as_ref()
-                .map(|seq| seq.eq_ignore_ascii_case(col))
-                .unwrap_or(false)
-    })
 }
 
 fn apply_persisted_override(
@@ -1148,7 +1092,6 @@ impl ProxistDaemon {
             config,
             metadata_cache: cache,
             metadata_store,
-            hot_store,
             ingest_service,
             scheduler,
             metrics_handle,
@@ -1242,19 +1185,12 @@ impl ProxistDaemon {
         let state = AppState {
             metadata: self.metadata_store.clone(),
             metadata_cache: Arc::clone(&self.metadata_cache),
-            hot_store: Arc::clone(&self.hot_store),
             ingest: Arc::clone(&self.ingest_service),
             scheduler: Arc::clone(&self.scheduler),
             metrics: self.metrics_handle.clone(),
             api_token: self.config.api_token.clone(),
-            persisted_cutoff_override: self.config.persisted_cutoff_override,
             http_dialect: self.config.http_dialect.clone(),
             pg_binary: self.config.pg_binary,
-            default_table: self
-                .config
-                .clickhouse
-                .as_ref()
-                .map(|cfg| format!("{}.{}", cfg.database, cfg.table)),
         };
 
         async fn status_handler(
@@ -1398,40 +1334,6 @@ impl ProxistDaemon {
             Ok(next.run(req).await)
         }
 
-        async fn query_handler(
-            State(state): State<AppState>,
-            Json(request): Json<QueryRequest>,
-        ) -> Result<Json<QueryResponse>, AppError> {
-            let include_cold = request.include_cold;
-            let op_kind = request.op.clone();
-            let span = tracing::info_span!(
-                "query",
-                op = ?op_kind,
-                include_cold,
-                symbols = request.symbols.len()
-            );
-            let _guard = span.enter();
-            let start = Instant::now();
-
-            let response = execute_query(&state, request).await?;
-
-            let op_label = query_operation_label(&op_kind);
-            let include_cold_label = if include_cold { "true" } else { "false" };
-            metrics::counter!(
-                "proxist_query_requests_total",
-                1,
-                "op" => op_label,
-                "include_cold" => include_cold_label
-            );
-            metrics::histogram!(
-                "proxist_query_latency_usec",
-                start.elapsed().as_secs_f64() * 1_000_000.0,
-                "op" => op_label
-            );
-
-            Ok(Json(response))
-        }
-
         async fn health_handler(
             State(state): State<AppState>,
             Json(health): Json<ShardHealth>,
@@ -1445,7 +1347,6 @@ impl ProxistDaemon {
         let app = Router::new()
             .route("/", post(clickhouse_sql_handler))
             .route("/status", get(status_handler))
-            .route("/query", post(query_handler))
             .route("/assignments", post(upsert_assignments_handler))
             .route("/metrics", get(metrics_handler))
             .route("/diagnostics", get(diagnostics_handler))
@@ -1475,19 +1376,12 @@ impl ProxistDaemon {
         let state = AppState {
             metadata: self.metadata_store.clone(),
             metadata_cache: Arc::clone(&self.metadata_cache),
-            hot_store: Arc::clone(&self.hot_store),
             ingest: Arc::clone(&self.ingest_service),
             scheduler: Arc::clone(&self.scheduler),
             metrics: self.metrics_handle.clone(),
             api_token: self.config.api_token.clone(),
-            persisted_cutoff_override: self.config.persisted_cutoff_override,
             http_dialect: self.config.http_dialect.clone(),
             pg_binary: self.config.pg_binary,
-            default_table: self
-                .config
-                .clickhouse
-                .as_ref()
-                .map(|cfg| format!("{}.{}", cfg.database, cfg.table)),
         };
         pgwire_server::serve(pg_addr, Arc::new(state), self.config.pg_dialect.clone()).await
     }
@@ -1548,292 +1442,6 @@ async fn replay_wal(
     Ok(())
 }
 
-async fn execute_query(state: &AppState, request: QueryRequest) -> Result<QueryResponse, AppError> {
-    let op_kind = request.op.clone();
-    let persisted_at = apply_persisted_override(
-        state.ingest.last_persisted_timestamp(),
-        state.persisted_cutoff_override,
-    );
-    let include_cold = request.include_cold;
-    let table = state
-        .default_table
-        .as_deref()
-        .ok_or_else(|| AppError(anyhow!("query API requires a default table")))?;
-    let cfg = state
-        .scheduler
-        .table_config(table)
-        .ok_or_else(|| AppError(anyhow!("table schema not registered for {}", table)))?;
-    let key0_col = cfg
-        .filter_cols
-        .get(0)
-        .ok_or_else(|| AppError(anyhow!("filter_cols missing key0 column")))?;
-    let key1_col = cfg
-        .filter_cols
-        .get(1)
-        .ok_or_else(|| AppError(anyhow!("filter_cols missing key1 column")))?;
-    let order_col = cfg.order_col.as_str();
-    let payload_idx = payload_index(&cfg);
-    let payload_col = payload_idx.and_then(|idx| cfg.columns.get(idx).map(|s| s.as_str()));
-    let key0 = bytes::Bytes::copy_from_slice(request.tenant.as_bytes());
-    let key1_list: Vec<bytes::Bytes> = request
-        .symbols
-        .iter()
-        .map(|symbol| bytes::Bytes::copy_from_slice(symbol.as_bytes()))
-        .collect();
-
-    let rows = match &op_kind {
-        QueryOperation::Range => {
-            let mut hot_rows = state
-                .hot_store
-                .scan_range(table, &key0, &request.range, &key1_list)
-                .await?;
-            if include_cold {
-                if let Some(persisted) = persisted_at {
-                    hot_rows.retain(|row| row.order_micros > system_time_to_micros(persisted));
-                }
-            }
-            let mut rows: Vec<QueryRow> = hot_rows
-                .into_iter()
-                .map(|row| hot_row_to_query_row(row, payload_idx))
-                .collect();
-
-            if include_cold {
-                if let Some(client) = state.ingest.clickhouse_client() {
-                    let cold_end = persisted_at
-                        .map(|persisted| std::cmp::min(persisted, request.range.end))
-                        .unwrap_or(request.range.end);
-
-                    if !request.symbols.is_empty() && cold_end >= request.range.start {
-                        let cold_rows = client
-                            .fetch_range(
-                                key0_col,
-                                key1_col,
-                                order_col,
-                                payload_col,
-                                &request.tenant,
-                                &request.symbols,
-                                system_time_to_micros(request.range.start),
-                                system_time_to_micros(cold_end),
-                            )
-                            .await?
-                            .into_iter()
-                            .map(clickhouse_row_to_query_row)
-                            .collect::<anyhow::Result<Vec<_>>>()?;
-
-                        rows.extend(cold_rows);
-                    }
-                }
-            }
-
-            rows.sort_by_key(|row| (system_time_to_micros(row.timestamp), row.symbol.clone()));
-            rows.dedup_by(|a, b| {
-                a.symbol == b.symbol
-                    && a.timestamp == b.timestamp
-                    && a.payload.as_ref() == b.payload.as_ref()
-            });
-
-            Ok::<_, AppError>(rows)
-        }
-        QueryOperation::LastBy | QueryOperation::AsOf => {
-            let mut hot_rows = match op_kind {
-                QueryOperation::LastBy => {
-                    state
-                        .hot_store
-                        .last_by(table, &key0, &key1_list, request.range.end)
-                        .await?
-                }
-                QueryOperation::AsOf => {
-                    state
-                        .hot_store
-                        .asof(table, &key0, &key1_list, request.range.end)
-                        .await?
-                }
-                _ => unreachable!(),
-            };
-
-            if include_cold {
-                if let Some(persisted) = persisted_at {
-                    hot_rows.retain(|row| row.order_micros > system_time_to_micros(persisted));
-                }
-            }
-
-            let mut map: HashMap<String, QueryRow> = HashMap::new();
-
-            let mut upsert = |row: QueryRow| match map.entry(row.symbol.clone()) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(row);
-                }
-                std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    if system_time_to_micros(row.timestamp)
-                        > system_time_to_micros(slot.get().timestamp)
-                    {
-                        slot.insert(row);
-                    }
-                }
-            };
-
-            for row in hot_rows {
-                upsert(hot_row_to_query_row(row, payload_idx));
-            }
-
-            if include_cold {
-                if let Some(client) = state.ingest.clickhouse_client() {
-                    let cutoff = persisted_at
-                        .map(|persisted| std::cmp::min(persisted, request.range.end))
-                        .unwrap_or(request.range.end);
-
-                    if !request.symbols.is_empty() {
-                        let cold_rows = client
-                            .fetch_last_by(
-                                key0_col,
-                                key1_col,
-                                order_col,
-                                payload_col,
-                                &request.tenant,
-                                &request.symbols,
-                                system_time_to_micros(cutoff),
-                            )
-                            .await?
-                            .into_iter()
-                            .map(clickhouse_row_to_query_row)
-                            .collect::<anyhow::Result<Vec<_>>>()?;
-
-                        for row in cold_rows {
-                            upsert(row);
-                        }
-                    }
-                }
-
-                if let Some(seam_ts) = persisted_at {
-                    let seam_rows = state
-                        .hot_store
-                        .seam_rows_at(table, &key0, seam_ts)
-                        .await?;
-                    for seam in seam_rows {
-                        let seam_symbol = bytes_to_str_unchecked(&seam.key1);
-                        if !request.symbols.is_empty()
-                            && !request.symbols.iter().any(|s| s == seam_symbol)
-                        {
-                            continue;
-                        }
-                        let seam_ts = micros_to_system_time(seam.order_micros);
-                        if seam_ts > request.range.end {
-                            continue;
-                        }
-                        let payload = payload_idx
-                            .and_then(|idx| seam.values.get(idx))
-                            .map(|value| value.to_vec())
-                            .unwrap_or_default();
-                        upsert(QueryRow {
-                            symbol: seam_symbol.to_string(),
-                            timestamp: seam_ts,
-                            payload: ByteBuf::from(payload),
-                        });
-                    }
-                }
-            }
-
-            let mut rows: Vec<QueryRow> = if request.symbols.is_empty() {
-                map.into_values().collect()
-            } else {
-                request
-                    .symbols
-                    .iter()
-                    .filter_map(|symbol| map.get(symbol).cloned())
-                    .collect()
-            };
-            rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-
-            Ok::<_, AppError>(rows)
-        }
-        QueryOperation::RollingWindow => {
-            if request.symbols.is_empty() {
-                return Err(AppError(anyhow!(
-                    "rolling_window queries require at least one symbol"
-                )));
-            }
-            let config = request.rolling.clone().ok_or_else(|| {
-                AppError(anyhow!(
-                    "rolling configuration is required for rolling_window queries"
-                ))
-            })?;
-            if !matches!(config.aggregation, RollingAggregation::Count) {
-                return Err(AppError(anyhow!(
-                    "unsupported rolling aggregation: {:?}",
-                    config.aggregation
-                )));
-            }
-
-            let window = config.window();
-            let hot_lower_bound = if include_cold { persisted_at } else { None };
-            let mut counts: HashMap<String, u64> = HashMap::new();
-            for symbol in &request.symbols {
-                counts.entry(symbol.clone()).or_insert(0);
-            }
-
-            let hot_counts = state
-                .hot_store
-                .rolling_window(table, &key0, &key1_list, request.range.end, window, hot_lower_bound)
-                .await?;
-            for entry in hot_counts {
-                let symbol = bytes_to_str_unchecked(&entry.key1).to_string();
-                *counts.entry(symbol).or_insert(0) += entry.count;
-            }
-
-            if include_cold {
-                if let (Some(client), Some(persisted)) =
-                    (state.ingest.clickhouse_client(), persisted_at)
-                {
-                    let cold_end = std::cmp::min(persisted, request.range.end);
-                    let window_start = request
-                        .range
-                        .end
-                        .checked_sub(window)
-                        .unwrap_or(SystemTime::UNIX_EPOCH);
-                    if cold_end >= window_start {
-                        let cold_rows = client
-                            .fetch_range(
-                                key0_col,
-                                key1_col,
-                                order_col,
-                                payload_col,
-                                &request.tenant,
-                                &request.symbols,
-                                system_time_to_micros(window_start),
-                                system_time_to_micros(cold_end),
-                            )
-                            .await?;
-                        for row in cold_rows {
-                            *counts.entry(row.symbol.clone()).or_insert(0) += 1;
-                        }
-                    }
-                }
-            }
-
-            let mut rows = Vec::with_capacity(counts.len().max(request.symbols.len()).max(1));
-            for symbol in request.symbols.clone() {
-                let count = *counts.get(&symbol).unwrap_or(&0);
-                let payload = serde_json::to_vec(&json!({
-                    "aggregation": "count",
-                    "window_micros": config.length_micros,
-                    "count": count,
-                }))
-                .map_err(|err| AppError(anyhow!(err)))?;
-                rows.push(QueryRow {
-                    symbol,
-                    timestamp: request.range.end,
-                    payload: ByteBuf::from(payload),
-                });
-            }
-            rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-
-            Ok::<_, AppError>(rows)
-        }
-    }?;
-
-    Ok(QueryResponse { rows })
-}
-
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -1885,9 +1493,12 @@ mod system_summary_tests {
 mod ingest_tests {
     use super::*;
     use bytes::Bytes;
-    use proxist_core::query::{QueryOperation, QueryRange};
     use std::time::Duration;
     use tempfile::NamedTempFile;
+
+    fn bytes_to_str_unchecked(value: &bytes::Bytes) -> &str {
+        unsafe { std::str::from_utf8_unchecked(value) }
+    }
 
     #[test]
     fn build_ingest_records_maps_annotation_columns() -> anyhow::Result<()> {
@@ -1934,120 +1545,6 @@ mod ingest_tests {
         assert_eq!(record.order_micros, 42);
         assert_eq!(record.seq, 7);
         assert_eq!(record.values.len(), 5);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn last_by_include_cold_uses_seam_rows() -> anyhow::Result<()> {
-        let metadata_file = NamedTempFile::new()?;
-        let metadata_path = metadata_file.path().to_str().unwrap().to_string();
-        let metadata = SqliteMetadataStore::connect(&metadata_path).await?;
-        metadata
-            .put_shard_assignment(ShardAssignment {
-                shard_id: "alpha-shard".into(),
-                tenant_id: "alpha".into(),
-                node_id: "node-a".into(),
-                symbol_range: ("A".into(), "Z".into()),
-            })
-            .await?;
-
-        let hot_store: Arc<dyn HotColumnStore> =
-            Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
-        let registry = Arc::new(crate::scheduler::TableRegistry::new());
-        let service = Arc::new(IngestService::new(
-            metadata.clone(),
-            hot_store.clone(),
-            None,
-            None,
-            Arc::clone(&registry),
-        ));
-
-        let snapshot = metadata.get_cluster_metadata().await?;
-        service.apply_metadata(&snapshot).await?;
-        let scheduler = Arc::new(
-            ProxistScheduler::new(
-                ExecutorConfig {
-                    sqlite_path: None,
-                    pg_url: None,
-                },
-                None,
-                None,
-                Some(hot_store.clone()),
-                Arc::clone(&registry),
-            )
-            .await?,
-        );
-        scheduler.register_table(
-            "ticks",
-            crate::scheduler::TableConfig {
-                order_col: "ts_micros".to_string(),
-                filter_cols: vec!["tenant".to_string(), "symbol".to_string()],
-                seq_col: Some("seq".to_string()),
-                columns: vec![
-                    "tenant".to_string(),
-                    "symbol".to_string(),
-                    "ts_micros".to_string(),
-                    "payload".to_string(),
-                    "seq".to_string(),
-                ],
-                column_types: vec![
-                    crate::scheduler::ColumnType::Text,
-                    crate::scheduler::ColumnType::Text,
-                    crate::scheduler::ColumnType::Int64,
-                    crate::scheduler::ColumnType::Text,
-                    crate::scheduler::ColumnType::Int64,
-                ],
-            },
-        );
-
-        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
-        let records = vec![IngestRow {
-            table: "ticks".to_string(),
-            key0: Bytes::copy_from_slice(b"alpha"),
-            key1: Bytes::copy_from_slice(b"AAPL"),
-            order_micros: system_time_to_micros(ts),
-            seq: 1,
-            shard_id: String::new(),
-            values: vec![
-                Bytes::copy_from_slice(b"alpha"),
-                Bytes::copy_from_slice(b"AAPL"),
-                Bytes::copy_from_slice(system_time_to_micros(ts).to_string().as_bytes()),
-                Bytes::copy_from_slice(b"\x01"),
-                Bytes::copy_from_slice(b"1"),
-            ],
-        }];
-        service.ingest_records(records).await?;
-
-        let state = AppState {
-            metadata: metadata.clone(),
-            metadata_cache: Arc::new(tokio::sync::Mutex::new(snapshot)),
-            hot_store: hot_store.clone(),
-            ingest: service.clone(),
-            scheduler,
-            metrics: None,
-            api_token: None,
-            persisted_cutoff_override: None,
-            http_dialect: DialectMode::Sql(SqlDialect::ClickHouse),
-            pg_binary: false,
-            default_table: Some("ticks".to_string()),
-        };
-
-        let range = QueryRange::new(ts - Duration::from_millis(1), ts + Duration::from_secs(1));
-        let request = QueryRequest {
-            tenant: "alpha".into(),
-            symbols: vec!["AAPL".into()],
-            range,
-            include_cold: true,
-            op: QueryOperation::LastBy,
-            rolling: None,
-        };
-
-        let response = execute_query(&state, request).await.map_err(|err| err.0)?;
-        assert_eq!(response.rows.len(), 1);
-        let row = &response.rows[0];
-        assert_eq!(row.symbol, "AAPL");
-        assert_eq!(row.timestamp, ts);
 
         Ok(())
     }
@@ -2136,15 +1633,12 @@ mod ingest_tests {
         let state = AppState {
             metadata: metadata.clone(),
             metadata_cache: Arc::new(tokio::sync::Mutex::new(snapshot)),
-            hot_store: hot_store.clone(),
             ingest: service.clone(),
             scheduler,
             metrics: None,
             api_token: None,
-            persisted_cutoff_override: None,
             http_dialect: DialectMode::Sql(SqlDialect::ClickHouse),
             pg_binary: false,
-            default_table: Some("ticks".to_string()),
         };
 
         let bundle = compose_diagnostics(&state).await.map_err(|err| err.0)?;

@@ -1,42 +1,8 @@
 use std::time::SystemTime;
 
 pub use crate::metadata::{ShardAssignment, ShardHealth};
-use crate::{
-    metadata::TenantId,
-    query::{QueryOperation, QueryRange, RollingWindowConfig},
-    ShardPersistenceTracker,
-};
+use crate::{metadata::TenantId, ShardPersistenceTracker};
 use serde::{Deserialize, Serialize};
-use serde_bytes::ByteBuf;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryRequest {
-    pub tenant: TenantId,
-    pub symbols: Vec<String>,
-    pub range: QueryRange,
-    pub include_cold: bool,
-    #[serde(default = "default_query_op")]
-    pub op: QueryOperation,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rolling: Option<RollingWindowConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryResponse {
-    pub rows: Vec<QueryRow>,
-}
-
-fn default_query_op() -> QueryOperation {
-    QueryOperation::Range
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryRow {
-    pub symbol: String,
-    #[serde(with = "crate::time::serde_micros")]
-    pub timestamp: SystemTime,
-    pub payload: ByteBuf,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolDictionarySpec {

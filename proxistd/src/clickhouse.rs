@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use proxist_core::ingest::IngestSegment;
 use crate::scheduler::{ColumnType, TableRegistry};
 use reqwest::Client;
-use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -289,14 +288,6 @@ impl ClickhouseNativeClient {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ClickhouseQueryRow {
-    pub symbol: String,
-    #[serde(deserialize_with = "deserialize_i64_any")]
-    pub ts_micros: i64,
-    pub payload: String,
-}
-
 #[cfg(feature = "clickhouse-native")]
 fn block_to_rowset(block: &Block<Complex>) -> anyhow::Result<crate::scheduler::RowSet> {
     let columns = block
@@ -459,50 +450,6 @@ fn map_sql_type_to_column_type(sql_type: SqlType) -> crate::scheduler::ColumnTyp
     }
 }
 
-fn deserialize_i64_any<'de, D>(deserializer: D) -> Result<i64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct I64Visitor;
-
-    impl<'de> Visitor<'de> for I64Visitor {
-        type Value = i64;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("an i64 or a string containing an i64")
-        }
-
-        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-            Ok(value)
-        }
-
-        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            i64::try_from(value).map_err(|_| E::custom("u64 out of range for i64"))
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            value
-                .parse::<i64>()
-                .map_err(|_| E::custom("invalid i64 string"))
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            self.visit_str(&value)
-        }
-    }
-
-    deserializer.deserialize_any(I64Visitor)
-}
-
 impl ClickhouseHttpClient {
     pub fn new(config: ClickhouseConfig) -> anyhow::Result<Self> {
         let timeout = config.query_timeout_secs.unwrap_or(config.timeout_secs);
@@ -519,43 +466,6 @@ impl ClickhouseHttpClient {
             self.config.endpoint.trim_end_matches('/'),
             self.config.database
         )
-    }
-
-    fn escape(value: &str) -> String {
-        value.replace('\'', "\\'")
-    }
-
-    async fn execute(&self, sql: String) -> anyhow::Result<Vec<ClickhouseQueryRow>> {
-        let mut request = self.client.post(self.url()).body(sql);
-        if let Some(username) = &self.config.username {
-            request = request.basic_auth(username, self.config.password.as_ref());
-        }
-        let response = request.send().await.context("send ClickHouse query")?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unavailable>".into());
-            return Err(anyhow!(
-                "clickhouse query failed: status={} body={}",
-                status,
-                body
-            ));
-        }
-        let body = response
-            .text()
-            .await
-            .context("read ClickHouse query body")?;
-        let mut rows = Vec::new();
-        for line in body.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            rows.push(serde_json::from_str(trimmed).context("parse ClickHouse query row")?);
-        }
-        Ok(rows)
     }
 
     pub async fn execute_raw(&self, sql: &str) -> anyhow::Result<String> {
@@ -576,87 +486,6 @@ impl ClickhouseHttpClient {
             .text()
             .await
             .context("read raw ClickHouse query response")
-    }
-
-    pub async fn fetch_last_by(
-        &self,
-        key0_col: &str,
-        key1_col: &str,
-        order_col: &str,
-        payload_col: Option<&str>,
-        key0: &str,
-        symbols: &[String],
-        ts_micros: i64,
-    ) -> anyhow::Result<Vec<ClickhouseQueryRow>> {
-        if symbols.is_empty() {
-            return Ok(Vec::new());
-        }
-        let symbol_list = symbols
-            .iter()
-            .map(|sym| format!("'{}'", Self::escape(sym)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let payload_expr = payload_col.unwrap_or("''");
-        let sql = format!(
-            "SELECT {key1} AS symbol, {order} AS ts_micros, {payload} AS payload \
-             FROM {table} \
-             WHERE {key0} = '{tenant}' \
-               AND {key1} IN ({symbols}) \
-               AND {order} <= {ts} \
-             ORDER BY {key1}, {order} DESC \
-             LIMIT 1 BY {key1} \
-             FORMAT JSONEachRow",
-            table = self.config.table,
-            key0 = key0_col,
-            key1 = key1_col,
-            order = order_col,
-            payload = payload_expr,
-            tenant = Self::escape(key0),
-            symbols = symbol_list,
-            ts = ts_micros
-        );
-        self.execute(sql).await
-    }
-
-    pub async fn fetch_range(
-        &self,
-        key0_col: &str,
-        key1_col: &str,
-        order_col: &str,
-        payload_col: Option<&str>,
-        key0: &str,
-        symbols: &[String],
-        start_micros: i64,
-        end_micros: i64,
-    ) -> anyhow::Result<Vec<ClickhouseQueryRow>> {
-        if symbols.is_empty() {
-            return Ok(Vec::new());
-        }
-        let symbol_list = symbols
-            .iter()
-            .map(|sym| format!("'{}'", Self::escape(sym)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let payload_expr = payload_col.unwrap_or("''");
-        let sql = format!(
-            "SELECT {key1} AS symbol, {order} AS ts_micros, {payload} AS payload \
-             FROM {table} \
-             WHERE {key0} = '{tenant}' \
-               AND {key1} IN ({symbols}) \
-               AND {order} BETWEEN {start} AND {end} \
-             ORDER BY {order} ASC \
-             FORMAT JSONEachRow",
-            table = self.config.table,
-            key0 = key0_col,
-            key1 = key1_col,
-            order = order_col,
-            payload = payload_expr,
-            tenant = Self::escape(key0),
-            symbols = symbol_list,
-            start = start_micros,
-            end = end_micros
-        );
-        self.execute(sql).await
     }
 
     pub fn target(&self) -> ClickhouseTarget {

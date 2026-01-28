@@ -44,12 +44,11 @@ For the full design matrix, see `docs/design-goals.md`.
 
 ## Current Capabilities
 
-- HTTP daemon (`proxistd`) exposes `/query`, `/status`, `/assignments`, and `/health` (ingest via SQL INSERT).
+- HTTP daemon (`proxistd`) exposes `/status`, `/assignments`, `/health`, `/diagnostics`, and a ClickHouse-compatible SQL endpoint at `/` (ingest via SQL INSERT).
 - Ingest pipeline appends to an in-memory WAL, writes into the hot column store, and optionally flushes batches to ClickHouse via JSONEachRow.
 - Metadata lives in SQLite with shard assignments, symbol dictionaries, and shard health snapshots surfaced through `/status`.
-- `pxctl` CLI drives status, query, seam inspection, and assignment workflows over REST (e.g., `pxctl query --tenant alpha --symbols AAPL --op last_by --end-micros …`).
+- `pxctl` CLI drives status, seam inspection, and assignment workflows over REST.
 - `pxctl hot-summary` surfaces proxist’s seam state, returning per-symbol in-memory row counts and persistence watermarks (add `--json` for machine consumption).
-- `pxctl` queries support `range`, `last_by`, and `asof`, with optional `--include-cold` to merge ClickHouse history across the persistence watermark.
 
 Simple seam check:
 
@@ -68,7 +67,6 @@ beta    GOOG        beta::GOOG     4            1704103203000000     17041032050
   - `PROXIST_WAL_FSYNC` (`true`/`false`, default true) toggles fsync on WAL append.
   - `PROXIST_WAL_REPLAY_PERSIST` (`true`/`false`, default true) replays WAL rows into ClickHouse on boot.
 - Disk WAL emits snapshots + manifests so nodes can replay from the latest snapshot before scanning recent segments.
-- Hot query path supports `range`, `last_by`, and `asof` operations across the in-memory store; planners will stitch in ClickHouse results once persistence watermarking is complete.
 - Daemon bearer auth can be sourced from `PROXIST_API_TOKEN_FILE`, keeping tokens out of process environments.
 - Diagnostics bundle (`/diagnostics`) returns seam summaries and persistence trackers alongside metrics for quick health snapshots.
 
