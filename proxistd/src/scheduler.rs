@@ -1,4 +1,5 @@
 use crate::clickhouse::{ClickhouseHttpClient, ClickhouseNativeClient};
+use crate::hot_sql::HotSqlEngine;
 use crate::metadata_sqlite::SqliteMetadataStore;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -132,6 +133,7 @@ pub struct ProxistScheduler {
     postgres: Option<PostgresExecutor>,
     hot_store: Option<Arc<dyn HotColumnStore>>,
     registry: Arc<TableRegistry>,
+    hot_sql: Arc<Mutex<HotSqlEngine>>,
     persisted_cutoff_micros: AtomicI64,
     hot_stats: Arc<RwLock<HashMap<(String, String), HotStats>>>,
 }
@@ -161,6 +163,7 @@ impl ProxistScheduler {
             postgres,
             hot_store,
             registry,
+            hot_sql: Arc::new(Mutex::new(HotSqlEngine::new())),
             persisted_cutoff_micros: AtomicI64::new(-1),
             hot_stats: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -428,6 +431,11 @@ impl SqlExecutor for ProxistScheduler {
             if let Some(pg) = &self.postgres {
                 return pg.execute(sql).await;
             }
+        }
+
+        if self.clickhouse.is_none() && self.clickhouse_native.is_none() {
+            let mut engine = self.hot_sql.lock().unwrap();
+            return engine.execute(sql);
         }
 
         if let Some(sqlite) = &self.sqlite {
@@ -1266,6 +1274,7 @@ mod scheduler_tests {
             clickhouse: None,
             clickhouse_native: None,
             postgres: None,
+            hot_sql: Arc::new(Mutex::new(HotSqlEngine::new())),
             hot_store: None,
             registry: Arc::new(TableRegistry::new()),
             persisted_cutoff_micros: AtomicI64::new(-1),

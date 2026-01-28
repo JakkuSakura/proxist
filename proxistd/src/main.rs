@@ -1,4 +1,5 @@
 mod clickhouse;
+mod hot_sql;
 mod ingest;
 mod metadata_sqlite;
 mod pgwire_server;
@@ -614,7 +615,14 @@ async fn execute_sql_batch(
         }
 
         if normalized.to_ascii_lowercase().starts_with("create") {
-            let mut parsed = parse_sql_with_dialect(&dialect, normalized)?;
+            let mut parsed = match parse_sql_with_dialect(&dialect, normalized) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    let raw = forward_sql_to_scheduler(state, normalized).await?;
+                    outputs.push(SqlBatchResult::Text(raw));
+                    continue;
+                }
+            };
             if parsed.is_empty() {
                 continue;
             }
@@ -660,7 +668,14 @@ async fn execute_sql_batch(
             continue;
         }
 
-        let parsed = parse_sql_with_dialect(&dialect, normalized)?;
+        let parsed = match parse_sql_with_dialect(&dialect, normalized) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                let raw = forward_sql_to_scheduler(state, normalized).await?;
+                outputs.push(SqlBatchResult::Text(raw));
+                continue;
+            }
+        };
         if parsed.is_empty() {
             continue;
         }
@@ -727,6 +742,12 @@ fn build_ingest_rows(
     values: Values,
     seq_counter: &mut u64,
 ) -> anyhow::Result<Vec<IngestRow>> {
+    enum ColumnPosition {
+        Direct(usize),
+        MicrosFrom(usize),
+        Missing,
+    }
+
     let column_names: Vec<String> = if columns.is_empty() {
         cfg.columns.clone()
     } else {
@@ -767,10 +788,23 @@ fn build_ingest_rows(
 
     let mut positions = Vec::with_capacity(cfg.columns.len());
     for col in &cfg.columns {
-        let idx = column_names
+        if let Some(idx) = column_names
             .iter()
-            .position(|c| c.eq_ignore_ascii_case(col));
-        positions.push(idx);
+            .position(|c| c.eq_ignore_ascii_case(col))
+        {
+            positions.push(ColumnPosition::Direct(idx));
+            continue;
+        }
+        if let Some(base) = col.strip_suffix("_micros") {
+            if let Some(idx) = column_names
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(base))
+            {
+                positions.push(ColumnPosition::MicrosFrom(idx));
+                continue;
+            }
+        }
+        positions.push(ColumnPosition::Missing);
     }
 
     let mut rows = Vec::with_capacity(values.rows.len());
@@ -791,8 +825,12 @@ fn build_ingest_rows(
                 .copied()
                 .unwrap_or(crate::scheduler::ColumnType::Text);
             let value = match pos {
-                Some(idx) => expr_to_bytes(&row[*idx], ty)?,
-                None => bytes::Bytes::new(),
+                ColumnPosition::Direct(idx) => expr_to_bytes(&row[*idx], ty)?,
+                ColumnPosition::MicrosFrom(idx) => {
+                    let micros = system_time_to_micros(expr_to_timestamp(&row[*idx])?);
+                    bytes::Bytes::copy_from_slice(micros.to_string().as_bytes())
+                }
+                ColumnPosition::Missing => bytes::Bytes::new(),
             };
             ordered_values.push(value);
         }
@@ -807,11 +845,16 @@ fn build_ingest_rows(
             .cloned()
             .filter(|v| !v.is_empty())
             .ok_or_else(|| anyhow!("key1 column required"))?;
-        let order_expr = positions[order_idx]
-            .and_then(|pos| row.get(pos))
-            .ok_or_else(|| anyhow!("order column required"))?;
+        let order_expr = match &positions[order_idx] {
+            ColumnPosition::Direct(pos) | ColumnPosition::MicrosFrom(pos) => row.get(*pos),
+            ColumnPosition::Missing => None,
+        }
+        .ok_or_else(|| anyhow!("order column required"))?;
         let order_micros = system_time_to_micros(expr_to_timestamp(order_expr)?);
-        let seq = match seq_idx.and_then(|idx| positions[idx].and_then(|pos| row.get(pos))) {
+        let seq = match seq_idx.and_then(|idx| match &positions[idx] {
+            ColumnPosition::Direct(pos) | ColumnPosition::MicrosFrom(pos) => row.get(*pos),
+            ColumnPosition::Missing => None,
+        }) {
             Some(expr) => expr_to_u64(expr)?,
             None => {
                 let current = *seq_counter;
