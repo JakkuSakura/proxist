@@ -293,7 +293,7 @@ PY
 setup_dataset() {
   local name="$1"
   local hot_ratio="$2"
-  local hot_rows=$((WINDOW_ROWS * hot_ratio / 100))
+  local hot_rows=$((TOTAL_ROWS * hot_ratio / 100))
   local cold_rows=$((TOTAL_ROWS - hot_rows))
   local cutoff=$((WINDOW_END - hot_rows))
 
@@ -386,7 +386,7 @@ SQL
 run_mode() {
   local name="$1"
   local hot_ratio="$2"
-  local hot_rows=$((WINDOW_ROWS * hot_ratio / 100))
+  local hot_rows=$((TOTAL_ROWS * hot_ratio / 100))
   local cutoff=$((WINDOW_END - hot_rows))
   if [[ "${hot_rows}" -eq 0 ]]; then
     cutoff="${WINDOW_END}"
