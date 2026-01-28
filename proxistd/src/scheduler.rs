@@ -8,6 +8,8 @@ mod plan;
 use plan::{
     build_table_plan, parse_table_schema_from_ddl, rewrite_with_bounds, OrderItem, Predicate,
 };
+use fp_core::query::SqlDialect;
+use fp_sql::sql_ast::parse_sql_ast;
 use proxist_core::query::QueryRange;
 use proxist_mem::{HotColumnStore, HotSymbolSummary};
 use serde_json::{Map, Value as JsonValue};
@@ -177,7 +179,13 @@ impl ProxistScheduler {
         let Some(annotation) = parse_proxist_table_config(ddl_sql)? else {
             return Ok(());
         };
-        let (table, columns) = parse_table_schema_from_ddl(ddl_sql)
+        let mut stmts =
+            parse_sql_ast(ddl_sql, SqlDialect::ClickHouse).map_err(|err| anyhow!(err))?;
+        let stmt = stmts
+            .drain(..)
+            .next()
+            .ok_or_else(|| anyhow!("unable to determine table schema from DDL"))?;
+        let (table, columns) = parse_table_schema_from_ddl(&stmt)
             .ok_or_else(|| anyhow!("unable to determine table schema from DDL"))?;
         if columns.is_empty() {
             anyhow::bail!("proxist annotation requires explicit column definitions");
@@ -262,9 +270,12 @@ impl SqlExecutor for ProxistScheduler {
 
         if normalized.starts_with("select") || normalized.starts_with("with") {
             if let Some(hot) = &self.hot_store {
-                let plan = {
-                    analyze_select(sql, &self.registry)
-                };
+                let plan_stmt = parse_sql_ast(sql, SqlDialect::ClickHouse)
+                    .ok()
+                    .and_then(|mut stmts| stmts.drain(..).next());
+                let plan = plan_stmt
+                    .as_ref()
+                    .and_then(|stmt| analyze_select(stmt, &self.registry));
 
                 if let Some(plan) = plan {
                     let requested_format = detect_wire_format(sql);
@@ -309,68 +320,74 @@ impl SqlExecutor for ProxistScheduler {
 
                             if need_cold && start_u <= cutoff {
                                 let cold_end = cutoff.min(end_u);
-                                if let Some(cold_sql) = rewrite_with_bounds(
-                                    sql,
-                                    &plan.cfg.order_col,
-                                    Some(start_u),
-                                    Some(cold_end),
-                                    limit_hint,
-                                ) {
-                                    let columns = expected_columns(&plan);
-                                    let column_types = expected_column_types(&plan);
-                                    match requested_format {
-                                        ClickhouseWireFormat::JsonEachRow => {
-                                            if let Some(ch) = &self.clickhouse {
-                                                let cold_sql = ensure_jsoneachrow(&cold_sql);
-                                                let text = ch.execute_raw(&cold_sql).await?;
-                                                cold_rows = Some(parse_json_rows(
-                                                    &text,
-                                                    &columns,
-                                                    &column_types,
-                                                )?);
-                                            } else {
+                                if let Some(stmt) = plan_stmt.as_ref() {
+                                    if let Some(cold_sql) = rewrite_with_bounds(
+                                        stmt,
+                                        &plan.cfg.order_col,
+                                        Some(start_u),
+                                        Some(cold_end),
+                                        limit_hint,
+                                    ) {
+                                        let columns = expected_columns(&plan);
+                                        let column_types = expected_column_types(&plan);
+                                        match requested_format {
+                                            ClickhouseWireFormat::JsonEachRow => {
+                                                if let Some(ch) = &self.clickhouse {
+                                                    let cold_sql = ensure_jsoneachrow(&cold_sql);
+                                                    let text = ch.execute_raw(&cold_sql).await?;
+                                                    cold_rows = Some(parse_json_rows(
+                                                        &text,
+                                                        &columns,
+                                                        &column_types,
+                                                    )?);
+                                                } else {
+                                                    plan_failed = true;
+                                                }
+                                            }
+                                            ClickhouseWireFormat::Other => {
                                                 plan_failed = true;
                                             }
-                                        }
-                                        ClickhouseWireFormat::Other => {
-                                            plan_failed = true;
-                                        }
-                                        ClickhouseWireFormat::Unknown => {
-                                            if let Some(native) = &self.clickhouse_native {
-                                                match native.query_rowset(&cold_sql).await {
-                                                    Ok(rowset) => {
-                                                        cold_rows = Some(align_rowset_columns(
-                                                            rowset, &columns,
-                                                        )?);
-                                                    }
-                                                    Err(_) => {
-                                                        if let Some(ch) = &self.clickhouse {
-                                                            let cold_sql =
-                                                                ensure_csv_with_names(&cold_sql);
-                                                            let text =
-                                                                ch.execute_raw(&cold_sql).await?;
-                                                            cold_rows = Some(parse_csv_rows(
-                                                                &text,
-                                                                &columns,
-                                                                &column_types,
-                                                            )?);
-                                                        } else {
-                                                            plan_failed = true;
+                                            ClickhouseWireFormat::Unknown => {
+                                                if let Some(native) = &self.clickhouse_native {
+                                                    match native.query_rowset(&cold_sql).await {
+                                                        Ok(rowset) => {
+                                                            cold_rows = Some(
+                                                                align_rowset_columns(
+                                                                    rowset, &columns,
+                                                                )?,
+                                                            );
+                                                        }
+                                                        Err(_) => {
+                                                            if let Some(ch) = &self.clickhouse {
+                                                                let cold_sql =
+                                                                    ensure_csv_with_names(&cold_sql);
+                                                                let text =
+                                                                    ch.execute_raw(&cold_sql).await?;
+                                                                cold_rows = Some(parse_csv_rows(
+                                                                    &text,
+                                                                    &columns,
+                                                                    &column_types,
+                                                                )?);
+                                                            } else {
+                                                                plan_failed = true;
+                                                            }
                                                         }
                                                     }
+                                                } else if let Some(ch) = &self.clickhouse {
+                                                    let cold_sql = ensure_csv_with_names(&cold_sql);
+                                                    let text = ch.execute_raw(&cold_sql).await?;
+                                                    cold_rows = Some(parse_csv_rows(
+                                                        &text,
+                                                        &columns,
+                                                        &column_types,
+                                                    )?);
+                                                } else {
+                                                    plan_failed = true;
                                                 }
-                                            } else if let Some(ch) = &self.clickhouse {
-                                                let cold_sql = ensure_csv_with_names(&cold_sql);
-                                                let text = ch.execute_raw(&cold_sql).await?;
-                                                cold_rows = Some(parse_csv_rows(
-                                                    &text,
-                                                    &columns,
-                                                    &column_types,
-                                                )?);
-                                            } else {
-                                                plan_failed = true;
                                             }
                                         }
+                                    } else {
+                                        plan_failed = true;
                                     }
                                 } else {
                                     plan_failed = true;
@@ -435,7 +452,16 @@ impl SqlExecutor for ProxistScheduler {
 
         if self.clickhouse.is_none() && self.clickhouse_native.is_none() {
             let mut engine = self.hot_sql.lock().unwrap();
-            return engine.execute(sql);
+            let mut stmts =
+                parse_sql_ast(sql, SqlDialect::ClickHouse).map_err(|err| anyhow!(err))?;
+            if stmts.is_empty() {
+                return Ok(SqlResult::Text(String::new()));
+            }
+            if stmts.len() != 1 {
+                anyhow::bail!("multiple statements detected; split before executing");
+            }
+            let stmt = stmts.remove(0);
+            return engine.execute_statement(&stmt);
         }
 
         if let Some(sqlite) = &self.sqlite {
@@ -560,8 +586,8 @@ struct HotStats {
     last_micros: Option<i64>,
 }
 
-fn analyze_select(sql: &str, registry: &TableRegistry) -> Option<PlanAnalysis> {
-    let plan = build_table_plan(sql)?;
+fn analyze_select(stmt: &fp_core::sql_ast::Statement, registry: &TableRegistry) -> Option<PlanAnalysis> {
+    let plan = build_table_plan(stmt)?;
     if !plan.supports_hot {
         return None;
     }

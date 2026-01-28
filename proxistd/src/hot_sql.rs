@@ -4,16 +4,14 @@ use std::net::Ipv4Addr;
 
 use anyhow::anyhow;
 use chrono::{Datelike, NaiveDateTime, TimeZone, Utc};
-use fp_sql::ast::{
-    BinaryOperator, DataType as AstDataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, OrderByExpr, Query, Select,
-    SelectItem, SetExpr, Statement, Value as AstValue, WindowFrameBound, WindowFrameUnits,
+use fp_core::sql_ast::{
+    AlterTableOperation, Assignment, BinaryOperator, ColumnOption, DataType as AstDataType,
+    DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr, GroupByExpr, Ident, Interval,
+    JoinConstraint, JoinOperator, ObjectName, ObjectType, OrderByExpr, Query, Select, SelectItem,
+    SampleRatio, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, TableWithJoins,
+    UnaryOperator, Value as AstValue, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec,
     WindowType,
 };
-use fp_sql::dialect::ClickHouseDialect;
-use fp_sql::parser::Parser;
-use sqlparser::keywords::Keyword;
-use sqlparser::tokenizer::{Token, Tokenizer, Word, Whitespace};
 use serde_json::{Map, Value as JsonValue};
 use uuid::Uuid;
 
@@ -382,35 +380,7 @@ impl HotSqlEngine {
         }
     }
 
-    pub fn execute(&mut self, sql: &str) -> anyhow::Result<SqlResult> {
-        let sql = rewrite_insert_columns_with_dots(sql);
-        let (sql, format) = split_format_clause(&sql);
-        let normalized = sql.trim();
-        if normalized.is_empty() {
-            return Ok(SqlResult::Text(String::new()));
-        }
-        let normalized_lower = normalized.to_ascii_lowercase();
-
-        if let Some(mutation) = parse_alter_mutation(normalized)? {
-            return self.execute_mutation(mutation);
-        }
-
-        if normalized_lower.starts_with("create") && normalized_lower.contains("table") {
-            let info = parse_create_table(normalized)?;
-            return self.execute_create_table(info);
-        }
-
-        let (normalized, sample_ratio) = split_sample_clause(normalized);
-        let stmt = match parse_statement(&normalized) {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                if normalized_lower.contains("create table") {
-                    let info = parse_create_table(normalized.as_str())?;
-                    return self.execute_create_table(info);
-                }
-                return Err(err);
-            }
-        };
+    pub fn execute_statement(&mut self, stmt: &Statement) -> anyhow::Result<SqlResult> {
         match stmt {
             Statement::CreateView { name, query, .. } => {
                 let key = name.to_string().to_ascii_lowercase();
@@ -418,19 +388,19 @@ impl HotSqlEngine {
                     key.clone(),
                     View {
                         name: key,
-                        query: *query,
+                        query: *query.clone(),
                     },
                 );
                 Ok(SqlResult::Text("Ok.\n".to_string()))
             }
             Statement::Drop { object_type, names, .. } => {
-                if matches!(object_type, fp_sql::ast::ObjectType::Table) {
-                    for name in &names {
+                if matches!(object_type, ObjectType::Table) {
+                    for name in names {
                         self.tables.remove(&name.to_string().to_ascii_lowercase());
                     }
                 }
-                if matches!(object_type, fp_sql::ast::ObjectType::View) {
-                    for name in &names {
+                if matches!(object_type, ObjectType::View) {
+                    for name in names {
                         self.views.remove(&name.to_string().to_ascii_lowercase());
                     }
                 }
@@ -444,12 +414,12 @@ impl HotSqlEngine {
                 };
                 let column_refs = column_refs_from_defs(&table.columns);
                 for op in operations {
-                    if let fp_sql::ast::AlterTableOperation::AddColumn { column_def, .. } = op {
+                    if let AlterTableOperation::AddColumn { column_def, .. } = op {
                         let name = column_def.name.value.to_ascii_lowercase();
                         let mut default = None;
-                        for opt in column_def.options {
-                            if let fp_sql::ast::ColumnOption::Default(expr) = opt.option {
-                                default = Some(expr);
+                        for opt in &column_def.options {
+                            if let ColumnOption::Default(expr) = &opt.option {
+                                default = Some(expr.clone());
                             }
                         }
                         let data_type = map_data_type(&column_def.data_type);
@@ -476,62 +446,146 @@ impl HotSqlEngine {
                 columns,
                 source,
                 ..
-            } => self.execute_insert(table_name, columns, source, Some(normalized.as_str())),
+            } => self.execute_insert(table_name, columns, source),
             Statement::Query(query) => {
-                let (dataset, format_hint) =
-                    self.execute_query(&query, format.as_deref(), sample_ratio)?;
+                let (dataset, format_hint) = self.execute_query(
+                    query,
+                    query.format.as_deref(),
+                    query.sample_ratio.as_ref().map(|s| s.as_f64()),
+                )?;
                 let output = render_dataset(dataset, format_hint)?;
                 Ok(output)
             }
-            _ => Ok(SqlResult::Text("".to_string())),
+            Statement::CreateTable {
+                name,
+                columns,
+                engine,
+                order_by,
+                as_table,
+                ttl,
+                sample_by,
+                query,
+            } => {
+                let info = CreateTableInfo {
+                    name: name.to_string().to_ascii_lowercase(),
+                    columns: columns
+                        .iter()
+                        .map(|col| {
+                            let name = col.name.value.to_ascii_lowercase();
+                            let data_type = map_data_type(&col.data_type);
+                            let mut default = None;
+                            let mut materialized = None;
+                            for opt in &col.options {
+                                match &opt.option {
+                                    ColumnOption::Default(expr) => {
+                                        default = Some(expr.clone());
+                                    }
+                                    ColumnOption::Materialized(expr) => {
+                                        materialized = Some(expr.clone());
+                                    }
+                                }
+                            }
+                            ColumnDefn {
+                                name,
+                                data_type,
+                                default,
+                                materialized,
+                            }
+                        })
+                        .collect(),
+                    engine: engine.clone(),
+                    as_table: as_table
+                        .as_ref()
+                        .map(|t: &ObjectName| t.to_string().to_ascii_lowercase()),
+                    query: query.as_ref().map(|q: &Box<Query>| q.as_ref().clone()),
+                    order_by: order_by
+                        .as_ref()
+                        .map(|cols: &Vec<Ident>| cols.iter().map(|c| c.value.clone()).collect()),
+                    ttl: ttl.clone(),
+                    sample_by: sample_by.clone(),
+                };
+                self.execute_create_table(info)
+            }
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+            } => self.execute_update(table, assignments, selection.as_ref()),
+            Statement::Delete { from, selection } => {
+                self.execute_delete(from, selection.as_ref())
+            }
         }
     }
 
-    fn execute_mutation(&mut self, mutation: Mutation) -> anyhow::Result<SqlResult> {
-        let table_name = mutation.table.to_ascii_lowercase();
+    fn execute_update(
+        &mut self,
+        table: &ObjectName,
+        assignments: &[Assignment],
+        selection: Option<&Expr>,
+    ) -> anyhow::Result<SqlResult> {
+        let table_name = table.to_string().to_ascii_lowercase();
         let mut table = match self.tables.remove(&table_name) {
             Some(table) => table,
             None => return Ok(SqlResult::Text("Ok.\n".to_string())),
         };
         let column_refs = column_refs_from_defs(&table.columns);
-        match mutation.kind {
-            MutationKind::Update { assignments, selection } => {
-                for row in &mut table.rows {
-                    if let Some(expr) = selection.as_ref() {
-                        let keep = self
-                            .eval_expr(expr, &column_refs, row)
-                            .as_bool()
-                            .unwrap_or(false);
-                        if !keep {
-                            continue;
-                        }
-                    }
-                    for (name, expr) in &assignments {
-                        if let Some(idx) = table
-                            .columns
-                            .iter()
-                            .position(|col| col.name == *name)
-                        {
-                            let value = self.eval_expr(expr, &column_refs, row);
-                            row[idx] = value;
-                        }
-                    }
+        for row in &mut table.rows {
+            if let Some(expr) = selection {
+                let keep = self
+                    .eval_expr(expr, &column_refs, row)
+                    .as_bool()
+                    .unwrap_or(false);
+                if !keep {
+                    continue;
                 }
             }
-            MutationKind::Delete { selection } => {
-                table.rows.retain(|row| {
-                    if let Some(expr) = selection.as_ref() {
-                        let keep = self
-                            .eval_expr(expr, &column_refs, row)
-                            .as_bool()
-                            .unwrap_or(false);
-                        !keep
-                    } else {
-                        false
-                    }
-                });
+            for assignment in assignments {
+                let name = assignment
+                    .id
+                    .last()
+                    .map(|ident| ident.value.to_ascii_lowercase());
+                let Some(name) = name else {
+                    continue;
+                };
+                if let Some(idx) = table.columns.iter().position(|col| col.name == name) {
+                    let value = self.eval_expr(&assignment.value, &column_refs, row);
+                    row[idx] = value;
+                }
             }
         }
+        self.tables.insert(table_name, table);
+        Ok(SqlResult::Text("Ok.\n".to_string()))
+    }
+
+    fn execute_delete(
+        &mut self,
+        from: &[TableWithJoins],
+        selection: Option<&Expr>,
+    ) -> anyhow::Result<SqlResult> {
+        if from.len() != 1 {
+            return Ok(SqlResult::Text("Ok.\n".to_string()));
+        }
+        let table = match &from[0].relation {
+            TableFactor::Table { name, .. } => name.to_string(),
+            _ => return Ok(SqlResult::Text("Ok.\n".to_string())),
+        };
+        let table_name = table.to_ascii_lowercase();
+        let mut table = match self.tables.remove(&table_name) {
+            Some(table) => table,
+            None => return Ok(SqlResult::Text("Ok.\n".to_string())),
+        };
+        let column_refs = column_refs_from_defs(&table.columns);
+        table.rows.retain(|row| {
+            if let Some(expr) = selection {
+                let keep = self
+                    .eval_expr(expr, &column_refs, row)
+                    .as_bool()
+                    .unwrap_or(false);
+                !keep
+            } else {
+                false
+            }
+        });
         self.tables.insert(table_name, table);
         Ok(SqlResult::Text("Ok.\n".to_string()))
     }
@@ -564,10 +618,9 @@ impl HotSqlEngine {
 
     fn execute_insert(
         &mut self,
-        table_name: ObjectName,
-        columns: Vec<Ident>,
-        source: Option<Box<Query>>,
-        raw_sql: Option<&str>,
+        table_name: &ObjectName,
+        columns: &[Ident],
+        source: &Option<Box<Query>>,
     ) -> anyhow::Result<SqlResult> {
         let table_name = table_name.to_string().to_ascii_lowercase();
         let mut table = match self.tables.remove(&table_name) {
@@ -581,42 +634,24 @@ impl HotSqlEngine {
             columns.iter().map(|c| c.value.to_ascii_lowercase()).collect()
         };
 
-        let mut rows_to_insert: Vec<Vec<Value>> =
-            match source.as_deref().map(|q| q.body.as_ref()) {
-                Some(SetExpr::Values(values)) => values
-                    .rows
-                    .iter()
-                    .map(|row_exprs| {
-                        row_exprs
-                            .iter()
-                            .map(|expr| self.eval_expr(expr, &[], &[]))
-                            .collect()
-                    })
-                    .collect(),
-                Some(SetExpr::Select(select)) => {
-                    let query = Query {
-                        with: None,
-                        body: SetExpr::Select(select.clone()).into(),
-                        order_by: Vec::new(),
-                        limit: None,
-                        limit_by: Vec::new(),
-                        offset: None,
-                        fetch: None,
-                        locks: Vec::new(),
-                        for_clause: None,
-                    };
-                    let (dataset, _) = self.execute_query(&query, None, None)?;
-                    dataset.rows
-                }
-                _ => Vec::new(),
-            };
-        if rows_to_insert.is_empty() {
-            if let Some(raw_sql) = raw_sql {
-                if let Ok(rows) = parse_insert_values_fallback(raw_sql, self) {
-                    rows_to_insert = rows;
-                }
+        let rows_to_insert: Vec<Vec<Value>> = match source.as_deref().map(|q| q.body.as_ref()) {
+            Some(SetExpr::Values(values)) => values
+                .rows
+                .iter()
+                .map(|row_exprs| {
+                    row_exprs
+                        .iter()
+                        .map(|expr| self.eval_expr(expr, &[], &[]))
+                        .collect()
+                })
+                .collect(),
+            Some(SetExpr::Select(_)) => {
+                let query = source.as_ref().unwrap();
+                let (dataset, _) = self.execute_query(query, None, None)?;
+                dataset.rows
             }
-        }
+            _ => Vec::new(),
+        };
 
         let column_refs = column_refs_from_defs(&table.columns);
 
@@ -678,36 +713,30 @@ impl HotSqlEngine {
             } => {
                 let left = self.execute_query(
                     &Query {
-                        with: None,
                         body: left.clone(),
                         order_by: Vec::new(),
                         limit: None,
-                        limit_by: Vec::new(),
                         offset: None,
-                        fetch: None,
-                        locks: Vec::new(),
-                        for_clause: None,
+                        format: None,
+                        sample_ratio: sample_ratio.map(SampleRatio),
                     },
                     None,
                     sample_ratio,
                 )?;
                 let right = self.execute_query(
                     &Query {
-                        with: None,
                         body: right.clone(),
                         order_by: Vec::new(),
                         limit: None,
-                        limit_by: Vec::new(),
                         offset: None,
-                        fetch: None,
-                        locks: Vec::new(),
-                        for_clause: None,
+                        format: None,
+                        sample_ratio: sample_ratio.map(SampleRatio),
                     },
                     None,
                     sample_ratio,
                 )?;
-                if !matches!(op, fp_sql::ast::SetOperator::Union)
-                    || !matches!(set_quantifier, fp_sql::ast::SetQuantifier::All)
+                if !matches!(op, SetOperator::Union)
+                    || !matches!(set_quantifier, SetQuantifier::All)
                 {
                     return Err(anyhow!("only UNION ALL is supported"));
                 }
@@ -725,10 +754,7 @@ impl HotSqlEngine {
         }
 
         if let Some(offset) = &query.offset {
-            let offset_value = self
-                .eval_expr(&offset.value, &[], &[])
-                .as_u64()
-                .unwrap_or(0) as usize;
+            let offset_value = self.eval_expr(offset, &[], &[]).as_u64().unwrap_or(0) as usize;
             if offset_value < dataset.rows.len() {
                 dataset.rows = dataset.rows[offset_value..].to_vec();
             } else {
@@ -763,7 +789,7 @@ impl HotSqlEngine {
         }
 
         if let Some(table_name) = select.from.get(0).and_then(|from| match &from.relation {
-            fp_sql::ast::TableFactor::Table { name, .. } => Some(name.to_string()),
+            TableFactor::Table { name, .. } => Some(name.to_string()),
             _ => None,
         }) {
             if let Some(table) = self.tables.get(&table_name.to_ascii_lowercase()).cloned() {
@@ -864,10 +890,10 @@ impl HotSqlEngine {
 
     fn build_relation_factor(
         &mut self,
-        relation: &fp_sql::ast::TableFactor,
+        relation: &TableFactor,
     ) -> anyhow::Result<DataSet> {
         match relation {
-            fp_sql::ast::TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table { name, alias, .. } => {
                 let table_name = name.to_string().to_ascii_lowercase();
                 if let Some(view) = self.views.get(&table_name).cloned() {
                     let query = view.query;
@@ -899,7 +925,7 @@ impl HotSqlEngine {
                     rows: table.rows.clone(),
                 })
             }
-            fp_sql::ast::TableFactor::Derived { subquery, alias, .. } => {
+            TableFactor::Derived { subquery, alias, .. } => {
                 let (mut dataset, _) = self.execute_query(subquery, None, None)?;
                 if let Some(alias) = alias {
                     for col in &mut dataset.columns {
@@ -959,21 +985,8 @@ impl HotSqlEngine {
                         ));
                     }
                 }
-                SelectItem::Wildcard(_) => {
+                SelectItem::Wildcard => {
                     out.extend(row.iter().cloned());
-                }
-                SelectItem::QualifiedWildcard(object_name, _) => {
-                    let qualifier = object_name.to_string().to_ascii_lowercase();
-                    for (idx, col) in columns.iter().enumerate() {
-                        if col
-                            .qualifier
-                            .as_ref()
-                            .map(|q| q == &qualifier)
-                            .unwrap_or(false)
-                        {
-                            out.push(row.get(idx).cloned().unwrap_or(Value::Null));
-                        }
-                    }
                 }
             }
         }
@@ -997,21 +1010,8 @@ impl HotSqlEngine {
                 SelectItem::ExprWithAlias { expr, .. } => {
                     out.push(self.eval_group_expr(expr, dataset, base_row, group_rows, window_values));
                 }
-                SelectItem::Wildcard(_) => {
+                SelectItem::Wildcard => {
                     out.extend(base_row.iter().cloned());
-                }
-                SelectItem::QualifiedWildcard(object_name, _) => {
-                    let qualifier = object_name.to_string().to_ascii_lowercase();
-                    for (idx, col) in dataset.columns.iter().enumerate() {
-                        if col
-                            .qualifier
-                            .as_ref()
-                            .map(|q| q == &qualifier)
-                            .unwrap_or(false)
-                        {
-                            out.push(base_row.get(idx).cloned().unwrap_or(Value::Null));
-                        }
-                    }
                 }
             }
         }
@@ -1091,9 +1091,8 @@ impl HotSqlEngine {
                     .collect();
                 Value::Tuple(values)
             }
-            Expr::Array(array) => {
-                let values = array
-                    .elem
+            Expr::Array(exprs) => {
+                let values = exprs
                     .iter()
                     .map(|e| self.eval_expr(e, columns, row))
                     .collect();
@@ -1194,258 +1193,6 @@ fn apply_rows_to_table(table: &mut Table, rows: Vec<Vec<Value>>, engine: &mut Ho
     }
 }
 
-fn parse_statement(sql: &str) -> anyhow::Result<Statement> {
-    let mut statements = Parser::parse_sql(&ClickHouseDialect {}, sql)
-        .map_err(|err| anyhow!("failed to parse SQL: {err}"))?;
-    if statements.is_empty() {
-        return Err(anyhow!("empty SQL"));
-    }
-    Ok(statements.remove(0))
-}
-
-fn split_format_clause(sql: &str) -> (String, Option<String>) {
-    let mut tokenizer = Tokenizer::new(&ClickHouseDialect {}, sql);
-    let tokens: Vec<Token> = match tokenizer.tokenize() {
-        Ok(tokens) => tokens,
-        Err(_) => return (sql.trim().to_string(), None),
-    };
-    let mut depth = 0i32;
-    let mut format_idx = None;
-    let mut format_token = None;
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        match &tokens[idx] {
-            Token::LParen => depth += 1,
-            Token::RParen => depth -= 1,
-            Token::Word(word) if depth == 0 => {
-                if word.value.eq_ignore_ascii_case("format") {
-                    let next = next_non_ws(&tokens, idx + 1);
-                    if let Some(next_idx) = next {
-                        if let Token::Word(format_word) = &tokens[next_idx] {
-                            format_idx = Some(idx);
-                            format_token = Some(format_word.value.clone());
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-
-    if let Some(start) = format_idx {
-        let mut end = start + 1;
-        while end < tokens.len() {
-            if let Token::SemiColon = tokens[end] {
-                break;
-            }
-            end += 1;
-        }
-        let mut trimmed = Vec::new();
-        for (idx, token) in tokens.iter().enumerate() {
-            if idx >= start && idx < end {
-                continue;
-            }
-            trimmed.push(token.to_string());
-        }
-        return (trimmed.join(" "), format_token);
-    }
-
-    (sql.trim().to_string(), None)
-}
-
-fn rewrite_insert_columns_with_dots(sql: &str) -> String {
-    let mut tokenizer = Tokenizer::new(&ClickHouseDialect {}, sql);
-    let tokens: Vec<Token> = match tokenizer.tokenize() {
-        Ok(tokens) => tokens,
-        Err(_) => return rewrite_insert_columns_with_dots_fallback(sql),
-    };
-
-    let mut output = Vec::new();
-    let mut idx = 0usize;
-    let mut in_insert_columns = false;
-    let mut paren_depth = 0i32;
-
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-        if is_insert_start(&tokens, idx) {
-            in_insert_columns = true;
-        }
-
-        if in_insert_columns {
-            match token {
-                Token::LParen => {
-                    paren_depth += 1;
-                    output.push(token.clone());
-                    idx += 1;
-                    continue;
-                }
-                Token::RParen => {
-                    paren_depth -= 1;
-                    output.push(token.clone());
-                    if paren_depth == 0 {
-                        in_insert_columns = false;
-                    }
-                    idx += 1;
-                    continue;
-                }
-                Token::Word(word) if paren_depth == 1 => {
-                    let next_idx = next_non_ws(&tokens, idx + 1);
-                    let last_idx = next_idx.and_then(|i| next_non_ws(&tokens, i + 1));
-                    if let (Some(dot_idx), Some(name_idx)) = (next_idx, last_idx) {
-                        if matches!(tokens[dot_idx], Token::Period) {
-                            if let Token::Word(next_word) = &tokens[name_idx] {
-                                let combined = format!("{}.{}", word.value, next_word.value);
-                                output.push(Token::Word(Word {
-                                    value: combined,
-                                    quote_style: Some('"'),
-                                    keyword: Keyword::NoKeyword,
-                                }));
-                                idx = name_idx + 1;
-                                continue;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        output.push(token.clone());
-        idx += 1;
-    }
-
-    output
-        .iter()
-        .map(|t| t.to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn rewrite_insert_columns_with_dots_fallback(sql: &str) -> String {
-    let lower = sql.to_ascii_lowercase();
-    let insert_idx = match lower.find("insert") {
-        Some(idx) => idx,
-        None => return sql.to_string(),
-    };
-    let into_idx = match lower[insert_idx..].find("into") {
-        Some(idx) => insert_idx + idx,
-        None => return sql.to_string(),
-    };
-    let open_idx = match lower[into_idx..].find('(') {
-        Some(idx) => into_idx + idx,
-        None => return sql.to_string(),
-    };
-
-    let mut depth = 0i32;
-    let mut close_idx = None;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    for (offset, ch) in sql[open_idx..].char_indices() {
-        match ch {
-            '\'' if !in_double && !in_backtick => in_single = !in_single,
-            '"' if !in_single && !in_backtick => in_double = !in_double,
-            '`' if !in_single && !in_double => in_backtick = !in_backtick,
-            '(' if !(in_single || in_double || in_backtick) => {
-                depth += 1;
-            }
-            ')' if !(in_single || in_double || in_backtick) => {
-                depth -= 1;
-                if depth == 0 {
-                    close_idx = Some(open_idx + offset);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let Some(close_idx) = close_idx else {
-        return sql.to_string();
-    };
-
-    let cols = &sql[open_idx + 1..close_idx];
-    let mut rewritten_cols = Vec::new();
-    for part in cols.split(',') {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let rewritten = if trimmed.starts_with('"')
-            || trimmed.starts_with('`')
-            || trimmed.starts_with('\'')
-            || !trimmed.contains('.')
-        {
-            trimmed.to_string()
-        } else {
-            format!("\"{}\"", trimmed)
-        };
-        rewritten_cols.push(rewritten);
-    }
-
-    let mut out = String::new();
-    out.push_str(&sql[..open_idx + 1]);
-    out.push_str(&rewritten_cols.join(", "));
-    out.push_str(&sql[close_idx..]);
-    out
-}
-
-fn split_sample_clause(sql: &str) -> (String, Option<f64>) {
-    let mut tokenizer = Tokenizer::new(&ClickHouseDialect {}, sql);
-    let tokens: Vec<Token> = match tokenizer.tokenize() {
-        Ok(tokens) => tokens,
-        Err(_) => return (sql.trim().to_string(), None),
-    };
-    let mut depth = 0i32;
-    let mut sample_start = None;
-    let mut sample_end = None;
-    let mut ratio = None;
-
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        match &tokens[idx] {
-            Token::LParen => depth += 1,
-            Token::RParen => depth -= 1,
-            Token::Word(word) if depth == 0 => {
-                if word.value.eq_ignore_ascii_case("sample") {
-                    sample_start = Some(idx);
-                    let mut cursor = idx + 1;
-                    while cursor < tokens.len() {
-                        if let Token::Word(next_word) = &tokens[cursor] {
-                            if is_select_clause_start(next_word) {
-                                break;
-                            }
-                        }
-                        if let Token::Number(num, _) = &tokens[cursor] {
-                            ratio = parse_sample_ratio(num);
-                            sample_end = Some(cursor + 1);
-                        }
-                        cursor += 1;
-                    }
-                    sample_end = sample_end.or(Some(cursor));
-                    break;
-                }
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-
-    if let (Some(start), Some(end)) = (sample_start, sample_end) {
-        let mut trimmed = Vec::new();
-        for (idx, token) in tokens.iter().enumerate() {
-            if idx >= start && idx < end {
-                continue;
-            }
-            trimmed.push(token.to_string());
-        }
-        return (trimmed.join(" "), ratio);
-    }
-
-    (sql.trim().to_string(), None)
-}
-
 fn parse_format_hint(format: Option<&str>) -> Option<FormatHint> {
     let format = format?.trim();
     if format.eq_ignore_ascii_case("tsvwithnames") {
@@ -1459,816 +1206,31 @@ fn parse_format_hint(format: Option<&str>) -> Option<FormatHint> {
     }
 }
 
-fn parse_create_table(sql: &str) -> anyhow::Result<CreateTableInfo> {
-    let mut tokenizer = Tokenizer::new(&ClickHouseDialect {}, sql);
-    let tokens: Vec<Token> = tokenizer
-        .tokenize()
-        .map_err(|err: sqlparser::tokenizer::TokenizerError| anyhow!(err.to_string()))?;
-    let clauses = extract_create_table_clauses(&tokens)?;
-
-    let (table_name, column_spans) = parse_create_table_span(&tokens)?;
-    if column_spans.is_empty() && clauses.as_table.is_none() {
-        return Err(anyhow!("column list missing"));
-    }
-    let mut column_defs = Vec::new();
-    for span in column_spans {
-        let (name, data_type, default, materialized) =
-            parse_column_defn_fallback(&tokens[span.0..span.1])?;
-        let materialized = materialized
-            .or_else(|| clauses.materialized_exprs.get(&name).cloned());
-        column_defs.push(ColumnDefn {
-            name,
-            data_type,
-            default: if materialized.is_some() { None } else { default },
-            materialized,
-        });
-    }
-    let name = ObjectName(vec![Ident::new(table_name)]);
-    let engine = None;
-    let query = None;
-
-    let mut expanded = Vec::new();
-    for column in column_defs {
-        match &column.data_type {
-            DataType::Nested(fields) => {
-                for (field_name, field_type) in fields {
-                    expanded.push(ColumnDefn {
-                        name: format!("{}.{}", column.name, field_name),
-                        data_type: DataType::Array(Box::new(field_type.clone())),
-                        default: None,
-                        materialized: None,
-                    });
-                }
-            }
-            _ => expanded.push(column),
-        }
-    }
-
-    Ok(CreateTableInfo {
-        name: name.to_string().to_ascii_lowercase(),
-        columns: expanded,
-        engine,
-        as_table: clauses.as_table,
-        query,
-        order_by: None,
-        ttl: clauses.ttl,
-        sample_by: clauses.sample_by,
-    })
-}
-
-fn parse_create_table_span(tokens: &[Token]) -> anyhow::Result<(String, Vec<(usize, usize)>)> {
-    let mut idx = 0usize;
-    let mut table_name = None;
-    let mut name_end = None;
-    while idx < tokens.len() {
-        if let Token::Word(word) = &tokens[idx] {
-            if word.value.eq_ignore_ascii_case("table") {
-                let mut name_parts = Vec::new();
-                let mut cursor = idx + 1;
-                while cursor < tokens.len() {
-                    match &tokens[cursor] {
-                        Token::Word(word) => name_parts.push(word.value.clone()),
-                        Token::Period => name_parts.push(".".to_string()),
-                        Token::Whitespace(_) => {}
-                        Token::LParen => break,
-                        _ => break,
-                    }
-                    cursor += 1;
-                }
-                if !name_parts.is_empty() {
-                    table_name = Some(name_parts.join(""));
-                    name_end = Some(cursor);
-                }
-            }
-        }
-        if table_name.is_some() {
-            break;
-        }
-        idx += 1;
-    }
-    let table_name = table_name.ok_or_else(|| anyhow!("missing table name"))?;
-    let name_end = name_end.unwrap_or(idx);
-    let open_idx = next_non_ws(tokens, name_end)
-        .and_then(|idx| if matches!(tokens[idx], Token::LParen) { Some(idx) } else { None });
-    let column_spans = if let Some(open_idx) = open_idx {
-        let close_idx = find_matching_paren(tokens, open_idx)?;
-        split_column_definitions_in_span(tokens, open_idx + 1, close_idx)
-    } else {
-        Vec::new()
-    };
-    Ok((table_name.to_ascii_lowercase(), column_spans))
-}
-
-fn split_column_definitions_in_span(
-    tokens: &[Token],
-    start: usize,
-    end: usize,
-) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut depth = 0i32;
-    let mut col_start = start;
-    let mut idx = start;
-    while idx < end {
-        match &tokens[idx] {
-            Token::LParen => depth += 1,
-            Token::RParen => depth -= 1,
-            Token::Comma if depth == 0 => {
-                spans.push((col_start, idx));
-                col_start = idx + 1;
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-    if col_start < end {
-        spans.push((col_start, end));
-    }
-    spans
-}
-
-fn parse_column_defn_fallback(tokens: &[Token]) -> anyhow::Result<(String, DataType, Option<Expr>, Option<Expr>)> {
-    let mut idx = 0usize;
-    let mut name = None;
-    while idx < tokens.len() {
-        if let Token::Word(word) = &tokens[idx] {
-            name = Some(word.value.to_ascii_lowercase());
-            idx += 1;
-            break;
-        }
-        idx += 1;
-    }
-    let name = name.ok_or_else(|| anyhow!("column name missing"))?;
-
-    let mut type_tokens = Vec::new();
-    let mut default_expr = None;
-    let mut materialized_expr = None;
-    let mut depth = 0i32;
-    while idx < tokens.len() {
-        match &tokens[idx] {
-            Token::LParen => {
-                depth += 1;
-                type_tokens.push(tokens[idx].to_string());
-            }
-            Token::RParen => {
-                depth -= 1;
-                type_tokens.push(tokens[idx].to_string());
-            }
-            Token::Word(word) if depth == 0 && word.value.eq_ignore_ascii_case("default") => {
-                let expr_sql = tokens[idx + 1..]
-                    .iter()
-                    .map(|t| t.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !expr_sql.trim().is_empty() {
-                    default_expr = parse_expr_from_sql(expr_sql.trim()).ok();
-                }
-                break;
-            }
-            Token::Word(word) if depth == 0 && word.value.eq_ignore_ascii_case("materialized") => {
-                let expr_sql = tokens[idx + 1..]
-                    .iter()
-                    .map(|t| t.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !expr_sql.trim().is_empty() {
-                    materialized_expr = parse_expr_from_sql(expr_sql.trim()).ok();
-                }
-                break;
-            }
-            Token::Whitespace(_) => {}
-            _ => type_tokens.push(tokens[idx].to_string()),
-        }
-        idx += 1;
-    }
-
-    let ty_sql = type_tokens.join(" ").trim().to_string();
-    let data_type = parse_type_string(&ty_sql);
-    Ok((name, data_type, default_expr, materialized_expr))
-}
-
-#[derive(Debug, Clone)]
-struct CreateTableClauses {
-    strip_spans: Vec<(usize, usize)>,
-    engine_args_span: Option<(usize, usize)>,
-    as_table_span: Option<(usize, usize)>,
-    as_table: Option<String>,
-    ttl: Option<Expr>,
-    sample_by: Option<Expr>,
-    materialized_spans: Vec<usize>,
-    materialized_exprs: HashMap<String, Expr>,
-}
-
-fn extract_create_table_clauses(tokens: &[Token]) -> anyhow::Result<CreateTableClauses> {
-    let mut depth = 0i32;
-    let mut strip_spans = Vec::new();
-    let mut engine_args_span = None;
-    let mut as_table_span = None;
-    let mut as_table = None;
-    let mut ttl = None;
-    let mut sample_by = None;
-    let mut materialized_spans = Vec::new();
-    let mut materialized_exprs = HashMap::new();
-
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        match &tokens[idx] {
-            Token::LParen => depth += 1,
-            Token::RParen => depth -= 1,
-            Token::Word(word) if depth == 0 => {
-                if word.value.eq_ignore_ascii_case("engine") {
-                    if let Some(eq_idx) = next_non_ws(tokens, idx + 1) {
-                        if matches!(tokens[eq_idx], Token::Eq) {
-                            if let Some(name_idx) = next_non_ws(tokens, eq_idx + 1) {
-                                if let Some(arg_start) = next_non_ws(tokens, name_idx + 1) {
-                                    if matches!(tokens[arg_start], Token::LParen) {
-                                        let end = find_matching_paren(tokens, arg_start)?;
-                                        engine_args_span = Some((arg_start, end + 1));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if word.value.eq_ignore_ascii_case("partition") {
-                    if is_keyword_sequence(tokens, idx, &["partition", "by"]) {
-                        if let Some((start, end)) = capture_clause(tokens, idx)? {
-                            strip_spans.push((start, end));
-                        }
-                    }
-                }
-                if word.value.eq_ignore_ascii_case("primary") {
-                    if is_keyword_sequence(tokens, idx, &["primary", "key"]) {
-                        if let Some((start, end)) = capture_clause(tokens, idx)? {
-                            strip_spans.push((start, end));
-                        }
-                    }
-                }
-                if word.value.eq_ignore_ascii_case("sample") {
-                    if is_keyword_sequence(tokens, idx, &["sample", "by"]) {
-                        if let Some((start, end)) = capture_clause(tokens, idx)? {
-                            let expr_sql = tokens[start + 2..end]
-                                .iter()
-                                .map(|t| t.to_string())
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            sample_by = parse_expr_from_sql(&expr_sql).ok();
-                            strip_spans.push((start, end));
-                        }
-                    }
-                }
-                if word.value.eq_ignore_ascii_case("ttl") {
-                    if let Some((start, end)) = capture_clause(tokens, idx)? {
-                        let expr_sql = tokens[start + 1..end]
-                            .iter()
-                            .map(|t| t.to_string())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        ttl = parse_expr_from_sql(&expr_sql).ok();
-                        strip_spans.push((start, end));
-                    }
-                }
-                if word.value.eq_ignore_ascii_case("settings") {
-                    if let Some((start, end)) = capture_clause(tokens, idx)? {
-                        strip_spans.push((start, end));
-                    }
-                }
-                if word.value.eq_ignore_ascii_case("as") {
-                    if let Some(next_idx) = next_non_ws(tokens, idx + 1) {
-                        if let Token::Word(next_word) = &tokens[next_idx] {
-                            if !next_word.value.eq_ignore_ascii_case("select") {
-                                let end = next_non_ws(tokens, next_idx + 1).unwrap_or(tokens.len());
-                                as_table_span = Some((idx, end));
-                                as_table = Some(next_word.value.to_ascii_lowercase());
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-
-    let column_spans = split_column_definitions(tokens)?;
-    for span in column_spans {
-        let col_tokens = &tokens[span.0..span.1];
-        if let Some((name, materialized_idx, expr_span)) = find_materialized_in_column(col_tokens)? {
-            let expr_tokens = &col_tokens[expr_span.0..expr_span.1];
-            let expr_sql = expr_tokens
-                .iter()
-                .map(|t| t.to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if let Ok(expr) = parse_expr_from_sql(&expr_sql) {
-                materialized_exprs.insert(name.clone(), expr);
-            }
-            materialized_spans.push(span.0 + materialized_idx);
-        }
-    }
-
-    Ok(CreateTableClauses {
-        strip_spans,
-        engine_args_span,
-        as_table_span,
-        as_table,
-        ttl,
-        sample_by,
-        materialized_spans,
-        materialized_exprs,
-    })
-}
-
-fn split_column_definitions(tokens: &[Token]) -> anyhow::Result<Vec<(usize, usize)>> {
-    let mut result = Vec::new();
-    let mut depth = 0i32;
-    let mut start = None;
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        match &tokens[idx] {
-            Token::LParen => {
-                depth += 1;
-                if depth == 1 {
-                    start = Some(idx + 1);
-                }
-            }
-            Token::RParen => {
-                if depth == 1 {
-                    if let Some(start_idx) = start.take() {
-                        result.push((start_idx, idx));
-                    }
-                }
-                depth -= 1;
-            }
-            Token::Comma if depth == 1 => {
-                if let Some(start_idx) = start {
-                    result.push((start_idx, idx));
-                    start = Some(idx + 1);
-                }
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-    Ok(result)
-}
-
-fn find_materialized_in_column(
-    tokens: &[Token],
-) -> anyhow::Result<Option<(String, usize, (usize, usize))>> {
-    let mut name = None;
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        if let Token::Word(word) = &tokens[idx] {
-            if name.is_none() {
-                name = Some(word.value.to_ascii_lowercase());
-            }
-            if word.value.eq_ignore_ascii_case("materialized") {
-                let expr_start = next_non_ws(tokens, idx + 1).unwrap_or(tokens.len());
-                let expr_end = tokens.len();
-                if let Some(name) = name {
-                    return Ok(Some((name, idx, (expr_start, expr_end))));
-                }
-            }
-        }
-        idx += 1;
-    }
-    Ok(None)
-}
-
-fn capture_clause(tokens: &[Token], start_idx: usize) -> anyhow::Result<Option<(usize, usize)>> {
-    let mut depth = 0i32;
-    let mut idx = start_idx;
-    while idx < tokens.len() {
-        match &tokens[idx] {
-            Token::LParen => depth += 1,
-            Token::RParen => depth -= 1,
-            Token::Word(word) if depth == 0 => {
-                if idx > start_idx && is_clause_start(word) {
-                    return Ok(Some((start_idx, idx)));
-                }
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-    Ok(Some((start_idx, tokens.len())))
-}
-
-fn is_clause_start(word: &Word) -> bool {
-    matches!(
-        word.value.to_ascii_lowercase().as_str(),
-        "partition" | "primary" | "sample" | "ttl" | "settings" | "order" | "as"
-    )
-}
-
-fn is_keyword_sequence(tokens: &[Token], start: usize, seq: &[&str]) -> bool {
-    let mut idx = start;
-    for keyword in seq {
-        let Some(next_idx) = next_non_ws(tokens, idx) else {
-            return false;
-        };
-        match &tokens[next_idx] {
-            Token::Word(word) if word.value.eq_ignore_ascii_case(keyword) => {
-                idx = next_idx + 1;
-            }
-            _ => return false,
-        }
-    }
-    true
-}
-
-fn next_non_ws(tokens: &[Token], start: usize) -> Option<usize> {
-    let mut idx = start;
-    while idx < tokens.len() {
-        match tokens[idx] {
-            Token::Whitespace(_) => idx += 1,
-            _ => return Some(idx),
-        }
-    }
-    None
-}
-
-fn find_matching_paren(tokens: &[Token], start: usize) -> anyhow::Result<usize> {
-    let mut depth = 0i32;
-    for (idx, token) in tokens.iter().enumerate().skip(start) {
-        match token {
-            Token::LParen => depth += 1,
-            Token::RParen => {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(idx);
-                }
-            }
-            _ => {}
-        }
-    }
-    Err(anyhow!("unbalanced parentheses"))
-}
-
-fn is_select_clause_start(word: &Word) -> bool {
-    matches!(
-        word.value.to_ascii_lowercase().as_str(),
-        "where" | "group" | "order" | "limit" | "format" | "settings" | "union"
-    )
-}
-
-fn parse_sample_ratio(text: &str) -> Option<f64> {
-    let trimmed = text.trim();
-    if let Some(value) = trimmed.strip_suffix('%') {
-        return value.parse::<f64>().ok().map(|v| v / 100.0);
-    }
-    trimmed.parse::<f64>().ok()
-}
-
-fn rewrite_array_types(tokens: &mut [Token]) -> anyhow::Result<()> {
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        if let Token::Word(word) = &tokens[idx] {
-            if word.value.eq_ignore_ascii_case("array") {
-                if let Some(open_idx) = next_non_ws(tokens, idx + 1) {
-                    if matches!(tokens[open_idx], Token::LParen) {
-                        let close_idx = find_matching_paren(tokens, open_idx)?;
-                        tokens[idx] = Token::Word(Word {
-                            value: "ARRAY".to_string(),
-                            quote_style: None,
-                            keyword: Keyword::ARRAY,
-                        });
-                        tokens[open_idx] = Token::Lt;
-                        tokens[close_idx] = Token::Gt;
-                        idx = close_idx + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        idx += 1;
-    }
-    Ok(())
-}
-
-fn rewrite_enum_equals(tokens: &mut [Token]) -> anyhow::Result<()> {
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        if let Token::Word(word) = &tokens[idx] {
-            if word.value.eq_ignore_ascii_case("enum8")
-                || word.value.eq_ignore_ascii_case("enum16")
-            {
-                if let Some(open_idx) = next_non_ws(tokens, idx + 1) {
-                    if matches!(tokens[open_idx], Token::LParen) {
-                        let close_idx = find_matching_paren(tokens, open_idx)?;
-                        for pos in open_idx + 1..close_idx {
-                            if matches!(tokens[pos], Token::Eq) {
-                                tokens[pos] = Token::Whitespace(Whitespace::Space);
-                            }
-                        }
-                        idx = close_idx + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        idx += 1;
-    }
-    Ok(())
-}
-
-fn is_insert_start(tokens: &[Token], idx: usize) -> bool {
-    match tokens.get(idx) {
-        Some(Token::Word(word)) if word.value.eq_ignore_ascii_case("insert") => {
-            if let Some(Token::Word(next)) = next_non_ws(tokens, idx + 1).and_then(|i| tokens.get(i)) {
-                next.value.eq_ignore_ascii_case("into")
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Mutation {
-    table: String,
-    kind: MutationKind,
-}
-
-#[derive(Debug, Clone)]
-enum MutationKind {
-    Update {
-        assignments: Vec<(String, Expr)>,
-        selection: Option<Expr>,
-    },
-    Delete {
-        selection: Option<Expr>,
-    },
-}
-
-fn parse_alter_mutation(sql: &str) -> anyhow::Result<Option<Mutation>> {
-    let lower = sql.trim_start().to_ascii_lowercase();
-    if !lower.starts_with("alter table") {
-        return Ok(None);
-    }
-    let tokens = lower.split_whitespace().collect::<Vec<_>>();
-    if tokens.iter().any(|t| *t == "update") {
-        let rewritten = rewrite_alter_to_update(sql);
-        let stmt = parse_statement(&rewritten)?;
-        if let Statement::Update { table, assignments, selection, .. } = stmt {
-            let table_name = table.to_string().to_ascii_lowercase();
-            let assigns = assignments
-                .into_iter()
-                .map(|a| {
-                    let name = a
-                        .id
-                        .into_iter()
-                        .map(|ident| ident.value.to_ascii_lowercase())
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    (name, a.value)
-                })
-                .collect();
-            return Ok(Some(Mutation {
-                table: table_name,
-                kind: MutationKind::Update { assignments: assigns, selection },
-            }));
-        }
-    }
-    if tokens.iter().any(|t| *t == "delete") {
-        let rewritten = rewrite_alter_to_delete(sql);
-        let stmt = parse_statement(&rewritten)?;
-        if let Statement::Delete { from, selection, .. } = stmt {
-            if let Some(first) = from.get(0) {
-                if let fp_sql::ast::TableFactor::Table { name, .. } = &first.relation {
-                    return Ok(Some(Mutation {
-                        table: name.to_string().to_ascii_lowercase(),
-                        kind: MutationKind::Delete { selection },
-                    }));
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn rewrite_alter_to_update(sql: &str) -> String {
-    let lower = sql.to_ascii_lowercase();
-    if let Some(idx) = lower.find("alter table") {
-        if let Some(update_idx) = lower.find(" update") {
-            let table = sql[idx + "alter table".len()..update_idx].trim();
-            let tail = &sql[update_idx + 1..];
-            let rest = tail.trim_start_matches("update");
-            return format!("UPDATE {table} SET {rest}");
-        }
-    }
-    sql.to_string()
-}
-
-fn rewrite_alter_to_delete(sql: &str) -> String {
-    let lower = sql.to_ascii_lowercase();
-    if let Some(idx) = lower.find("alter table") {
-        if let Some(delete_idx) = lower.find(" delete") {
-            let table = sql[idx + "alter table".len()..delete_idx].trim();
-            let tail = &sql[delete_idx + 1..];
-            let rest = tail.trim_start_matches("delete");
-            return format!("DELETE FROM {table} {rest}");
-        }
-    }
-    sql.to_string()
-}
-
-fn parse_expr_from_sql(expr_sql: &str) -> anyhow::Result<Expr> {
-    let query = format!("SELECT {expr_sql}");
-    let mut stmts = Parser::parse_sql(&ClickHouseDialect {}, &query)
-        .map_err(|err| anyhow!("failed to parse expr: {err}"))?;
-    let stmt = stmts.remove(0);
-    if let Statement::Query(query) = stmt {
-        if let SetExpr::Select(select) = *query.body {
-            if let Some(item) = select.projection.first() {
-                if let SelectItem::UnnamedExpr(expr) = item {
-                    return Ok(expr.clone());
-                }
-            }
-        }
-    }
-    Err(anyhow!("failed to parse expression"))
-}
-
-fn parse_insert_values_fallback(
-    sql: &str,
-    engine: &mut HotSqlEngine,
-) -> anyhow::Result<Vec<Vec<Value>>> {
-    let lower = sql.to_ascii_lowercase();
-    let mut values_idx = None;
-    let mut scan = 0usize;
-    while scan < lower.len() {
-        if lower[scan..].starts_with("values") {
-            let preceded_by_ws = if scan == 0 {
-                true
-            } else {
-                lower[..scan]
-                    .chars()
-                    .last()
-                    .map(|ch| ch.is_whitespace())
-                    .unwrap_or(false)
-            };
-            if preceded_by_ws {
-                values_idx = Some(scan);
-                break;
-            }
-        }
-        scan += 1;
-    }
-    let values_idx = values_idx.ok_or_else(|| anyhow!("missing VALUES"))?;
-    let mut tuples = Vec::new();
-    let tail = &sql[values_idx + "values".len()..];
-    let mut depth = 0i32;
-    let mut bracket_depth = 0i32;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    let mut start = None;
-    for (offset, ch) in tail.char_indices() {
-        match ch {
-            '\'' if !in_double && !in_backtick => in_single = !in_single,
-            '"' if !in_single && !in_backtick => in_double = !in_double,
-            '`' if !in_single && !in_double => in_backtick = !in_backtick,
-            '[' if !(in_single || in_double || in_backtick) => bracket_depth += 1,
-            ']' if !(in_single || in_double || in_backtick) => bracket_depth -= 1,
-            '(' if !(in_single || in_double || in_backtick) => {
-                if depth == 0 {
-                    start = Some(offset + 1);
-                }
-                depth += 1;
-            }
-            ')' if !(in_single || in_double || in_backtick) => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(start_idx) = start.take() {
-                        tuples.push(tail[start_idx..offset].to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
-        if depth == 0 && bracket_depth == 0 && start.is_none() && offset > 0 {
-            if ch == ';' {
-                break;
-            }
-        }
-    }
-
-    let mut rows = Vec::new();
-    for tuple in tuples {
-        let exprs = split_tuple_expressions(&tuple);
-        let mut row = Vec::new();
-        for expr_sql in exprs {
-            row.push(parse_insert_expr(&expr_sql, engine)?);
-        }
-        rows.push(row);
-    }
-    Ok(rows)
-}
-
-fn parse_insert_expr(expr_sql: &str, engine: &mut HotSqlEngine) -> anyhow::Result<Value> {
-    let trimmed = expr_sql.trim();
-    if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        let inner = &trimmed[1..trimmed.len().saturating_sub(1)];
-        let values = split_tuple_expressions(inner)
-            .into_iter()
-            .map(|expr| parse_insert_expr(&expr, engine))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        return Ok(Value::Array(values));
-    }
-    if trimmed.starts_with('(') && trimmed.ends_with(')') {
-        let inner = &trimmed[1..trimmed.len().saturating_sub(1)];
-        let values = split_tuple_expressions(inner)
-            .into_iter()
-            .map(|expr| parse_insert_expr(&expr, engine))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        return Ok(Value::Tuple(values));
-    }
-    let expr = parse_expr_from_sql(trimmed)?;
-    Ok(engine.eval_expr(&expr, &[], &[]))
-}
-
-fn split_tuple_expressions(input: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0i32;
-    let mut bracket_depth = 0i32;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    for ch in input.chars() {
-        match ch {
-            '\'' if !in_double && !in_backtick => in_single = !in_single,
-            '"' if !in_single && !in_backtick => in_double = !in_double,
-            '`' if !in_single && !in_double => in_backtick = !in_backtick,
-            '[' if !(in_single || in_double || in_backtick) => {
-                bracket_depth += 1;
-                current.push(ch);
-            }
-            ']' if !(in_single || in_double || in_backtick) => {
-                bracket_depth -= 1;
-                current.push(ch);
-            }
-            '(' if !(in_single || in_double || in_backtick) => {
-                depth += 1;
-                current.push(ch);
-            }
-            ')' if !(in_single || in_double || in_backtick) => {
-                depth -= 1;
-                current.push(ch);
-            }
-            ',' if !(in_single || in_double || in_backtick) && depth == 0 && bracket_depth == 0 => {
-                if !current.trim().is_empty() {
-                    parts.push(current.trim().to_string());
-                }
-                current.clear();
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.trim().is_empty() {
-        parts.push(current.trim().to_string());
-    }
-    parts
-}
-
 fn map_data_type(data_type: &AstDataType) -> DataType {
     match data_type {
-        AstDataType::Boolean | AstDataType::Bool => DataType::Bool,
-        AstDataType::Int64 | AstDataType::BigInt(_) | AstDataType::Int8(_) => DataType::Int64,
-        AstDataType::UnsignedBigInt(_) | AstDataType::UnsignedInt8(_) => DataType::UInt64,
-        AstDataType::Float64 | AstDataType::Double | AstDataType::DoublePrecision => {
-            DataType::Float64
-        }
-        AstDataType::Float(_) | AstDataType::Real | AstDataType::Float4 | AstDataType::Float8 => {
-            DataType::Float64
-        }
-        AstDataType::Decimal(info) | AstDataType::Numeric(info) | AstDataType::Dec(info) => {
-            let (precision, scale) = match info {
-                fp_sql::ast::ExactNumberInfo::PrecisionAndScale(p, s) => (*p as u8, *s as u8),
-                fp_sql::ast::ExactNumberInfo::Precision(p) => (*p as u8, 0),
-                fp_sql::ast::ExactNumberInfo::None => (18, 4),
-            };
-            DataType::Decimal { precision, scale }
-        }
-        AstDataType::Date | AstDataType::Datetime(_) | AstDataType::Timestamp(_, _) => {
-            DataType::DateTime
-        }
+        AstDataType::Boolean => DataType::Bool,
+        AstDataType::Int64 => DataType::Int64,
+        AstDataType::UnsignedBigInt => DataType::UInt64,
+        AstDataType::Float64 => DataType::Float64,
+        AstDataType::Decimal { precision, scale } => DataType::Decimal {
+            precision: *precision,
+            scale: *scale,
+        },
+        AstDataType::Date => DataType::DateTime,
+        AstDataType::DateTime => DataType::DateTime,
+        AstDataType::DateTime64(precision) => DataType::DateTime64(*precision),
         AstDataType::Uuid => DataType::Uuid,
-        AstDataType::Array(elem) => {
-            let inner = match elem {
-                fp_sql::ast::ArrayElemTypeDef::SquareBracket(data) => map_data_type(data),
-                fp_sql::ast::ArrayElemTypeDef::AngleBracket(data) => map_data_type(data),
-                fp_sql::ast::ArrayElemTypeDef::None => DataType::String,
-            };
-            DataType::Array(Box::new(inner))
+        AstDataType::Ipv4 => DataType::Ipv4,
+        AstDataType::String => DataType::String,
+        AstDataType::Array(inner) => DataType::Array(Box::new(map_data_type(inner))),
+        AstDataType::Tuple(items) => DataType::Tuple(items.iter().map(map_data_type).collect()),
+        AstDataType::Map(key, value) => {
+            DataType::Map(Box::new(map_data_type(key)), Box::new(map_data_type(value)))
         }
         AstDataType::Custom(name, modifiers) => {
-            let name = name.to_string().to_ascii_lowercase();
+            let name = name.to_ascii_lowercase();
             parse_custom_type(&name, modifiers)
         }
-        _ => DataType::String,
     }
 }
 
@@ -2580,18 +1542,17 @@ fn eval_binary(op: &BinaryOperator, left: Value, right: Value) -> Value {
     }
 }
 
-fn eval_unary(op: &fp_sql::ast::UnaryOperator, value: Value) -> Value {
+fn eval_unary(op: &UnaryOperator, value: Value) -> Value {
     match op {
-        fp_sql::ast::UnaryOperator::Not => Value::Bool(!value.as_bool().unwrap_or(false)),
-        fp_sql::ast::UnaryOperator::Minus => value
+        UnaryOperator::Not => Value::Bool(!value.as_bool().unwrap_or(false)),
+        UnaryOperator::Minus => value
             .as_f64()
             .map(|v| Value::Float(-v))
             .unwrap_or(Value::Null),
-        fp_sql::ast::UnaryOperator::Plus => value
+        UnaryOperator::Plus => value
             .as_f64()
             .map(Value::Float)
             .unwrap_or(Value::Null),
-        _ => Value::Null,
     }
 }
 
@@ -2864,6 +1825,14 @@ fn lookup_column(
             return row.get(idx).cloned().unwrap_or(Value::Null);
         }
     }
+    if let Some(qual) = qualifier {
+        let combined = format!("{qual}.{name}");
+        for (idx, col) in columns.iter().enumerate() {
+            if col.name == combined {
+                return row.get(idx).cloned().unwrap_or(Value::Null);
+            }
+        }
+    }
     Value::Null
 }
 
@@ -2960,7 +1929,7 @@ fn datetime_to_micros(value: &Value) -> Option<i64> {
 }
 
 fn parse_interval(
-    interval: &fp_sql::ast::Interval,
+    interval: &Interval,
     columns: &[ColumnRef],
     row: &[Value],
     engine: &mut HotSqlEngine,
@@ -2971,12 +1940,13 @@ fn parse_interval(
         .unwrap_or(0);
     let unit = interval
         .leading_field
-        .unwrap_or(fp_sql::ast::DateTimeField::Day);
+        .clone()
+        .unwrap_or(DateTimeField::Day);
     let seconds = match unit {
-        fp_sql::ast::DateTimeField::Day => quantity * 86_400,
-        fp_sql::ast::DateTimeField::Hour => quantity * 3600,
-        fp_sql::ast::DateTimeField::Minute => quantity * 60,
-        fp_sql::ast::DateTimeField::Second => quantity,
+        DateTimeField::Day => quantity * 86_400,
+        DateTimeField::Hour => quantity * 3600,
+        DateTimeField::Minute => quantity * 60,
+        DateTimeField::Second => quantity,
         _ => quantity,
     };
     Value::Int(seconds)
@@ -3002,7 +1972,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::UnaryOp { expr, .. } => contains_aggregate(expr),
         Expr::Nested(expr) => contains_aggregate(expr),
         Expr::Tuple(exprs) => exprs.iter().any(contains_aggregate),
-        Expr::Array(array) => array.elem.iter().any(contains_aggregate),
+        Expr::Array(exprs) => exprs.iter().any(contains_aggregate),
         _ => false,
     }
 }
@@ -3025,7 +1995,6 @@ fn is_array_join(expr: &Expr) -> bool {
 fn group_by_exprs(group_by: &GroupByExpr) -> Vec<Expr> {
     match group_by {
         GroupByExpr::Expressions(exprs) => exprs.clone(),
-        GroupByExpr::All => Vec::new(),
     }
 }
 
@@ -3041,10 +2010,7 @@ fn projected_columns(select: &Select) -> anyhow::Result<Vec<ColumnRef>> {
                 name: expr.to_string().to_ascii_lowercase(),
                 qualifier: None,
             }),
-            SelectItem::Wildcard(_) => return Err(anyhow!("wildcard in projection not supported")),
-            SelectItem::QualifiedWildcard(_, _) => {
-                return Err(anyhow!("qualified wildcard in projection not supported"))
-            }
+            SelectItem::Wildcard => return Err(anyhow!("wildcard in projection not supported")),
         }
     }
     Ok(columns)
@@ -3107,8 +2073,7 @@ fn match_join_constraint(
             .eval_expr(expr, columns, row)
             .as_bool()
             .unwrap_or(false),
-        JoinConstraint::Using(_) => true,
-        _ => true,
+        JoinConstraint::None => true,
     }
 }
 
@@ -3160,13 +2125,19 @@ fn apply_array_join(
     for row in &dataset.rows {
         let mut expanded = vec![row.clone()];
         for expr in &array_exprs {
+            let expr_name = expr.to_string().to_ascii_lowercase();
+            let expr_idx = dataset.columns.iter().position(|c| c.name == expr_name);
             let mut next_rows = Vec::new();
             for base in expanded {
                 let value = engine.eval_expr(expr, &dataset.columns, &base);
                 if let Value::Array(values) = value {
                     for val in values {
                         let mut new_row = base.clone();
-                        new_row.push(val);
+                        if let Some(idx) = expr_idx {
+                            new_row[idx] = val;
+                        } else {
+                            new_row.push(val);
+                        }
                         next_rows.push(new_row);
                     }
                 } else {
@@ -3177,16 +2148,10 @@ fn apply_array_join(
         }
         rows.extend(expanded);
     }
-
-    let mut columns = dataset.columns.clone();
-    for expr in array_exprs {
-        columns.push(ColumnRef {
-            name: expr.to_string().to_ascii_lowercase(),
-            qualifier: None,
-        });
-    }
-
-    Ok(DataSet { columns, rows })
+    Ok(DataSet {
+        columns: dataset.columns,
+        rows,
+    })
 }
 
 fn apply_sample(
@@ -3210,7 +2175,7 @@ fn apply_sample(
         .from
         .get(0)
         .and_then(|from| match &from.relation {
-            fp_sql::ast::TableFactor::Table { name, .. } => {
+            TableFactor::Table { name, .. } => {
                 engine.tables.get(&name.to_string().to_ascii_lowercase())
             }
             _ => None,
@@ -3267,13 +2232,8 @@ fn eval_window_function(
     engine: &mut HotSqlEngine,
 ) -> anyhow::Result<Vec<Value>> {
     let spec = match func.over.clone() {
-        Some(WindowType::WindowSpec(spec)) => spec,
-        None => fp_sql::ast::WindowSpec {
-            partition_by: Vec::new(),
-            order_by: Vec::new(),
-            window_frame: None,
-        },
-        _ => return Ok(vec![Value::Null; dataset.rows.len()]),
+        Some(WindowType::WindowSpec(spec)) => *spec,
+        None => WindowSpec::default(),
     };
     let partition_exprs = spec.partition_by;
     let order_exprs = spec.order_by;
@@ -3303,7 +2263,7 @@ fn eval_window_function(
         });
 
         for (pos, row_idx) in indices.iter().enumerate() {
-            let window_range = window_frame_range(frame.as_ref(), pos, indices.len());
+            let window_range = window_frame_range(frame.as_ref().map(|v| &**v), pos, indices.len());
             let rows = &indices[window_range.0..window_range.1];
             let mut sum = 0f64;
             for idx in rows {
@@ -3321,11 +2281,15 @@ fn eval_window_function(
 }
 
 fn window_frame_range(
-    frame: Option<&fp_sql::ast::WindowFrame>,
+    frame: Option<&WindowFrame>,
     position: usize,
     total: usize,
 ) -> (usize, usize) {
-    let frame = frame.cloned().unwrap_or_default();
+    let frame = frame.cloned().unwrap_or(WindowFrame {
+        units: WindowFrameUnits::Rows,
+        start_bound: WindowFrameBound::CurrentRow,
+        end_bound: None,
+    });
     if frame.units != WindowFrameUnits::Rows {
         return (0, position + 1);
     }

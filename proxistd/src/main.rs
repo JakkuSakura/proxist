@@ -43,12 +43,15 @@ use proxist_core::{
 };
 use proxist_mem::{HotColumnStore, InMemoryHotColumnStore, MemConfig};
 use proxist_wal::{WalConfig, WalManager};
+use fp_core::sql_ast::{Expr, FunctionArg, FunctionArgExpr, Ident, SetExpr, Statement, Value, Values};
 use fp_sql::{
-    ast::{Expr, FunctionArg, FunctionArgExpr, Ident, SetExpr, Statement, Value, Values},
     ensure_engine_clause,
-    parser::Parser,
-    parse_sql_dialect, replace_engine_case_insensitive, split_statements, sqlparser_dialect,
-    strip_leading_sql_comments, SqlDialect,
+    parse_sql_dialect,
+    replace_engine_case_insensitive,
+    split_statements,
+    sql_ast::parse_sql_ast,
+    strip_leading_sql_comments,
+    SqlDialect,
 };
 use fp_prql::PrqlFrontend;
 use serde_json::json;
@@ -595,8 +598,7 @@ fn parse_sql_with_dialect(
     dialect: &DialectMode,
     sql: &str,
 ) -> Result<Vec<Statement>, AppError> {
-    let dialect_impl = sqlparser_dialect(dialect.sql_dialect());
-    Parser::parse_sql(dialect_impl.as_ref(), sql)
+    parse_sql_ast(sql, dialect.sql_dialect())
         .map_err(|err| AppError(anyhow!("failed to parse SQL: {err}")))
 }
 

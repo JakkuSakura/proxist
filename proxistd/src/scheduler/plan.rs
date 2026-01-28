@@ -1,10 +1,6 @@
-use fp_sql::{
-    ast::{
-        BinaryOperator as BinOp, Expr, GroupByExpr, Ident, SelectItem, SetExpr, Statement,
-        TableFactor, Value, WildcardAdditionalOptions,
-    },
-    dialect::ClickHouseDialect,
-    parser::Parser,
+use fp_core::sql_ast::{
+    BinaryOperator as BinOp, Expr, GroupByExpr, Ident, SelectItem, SetExpr, Statement, TableFactor,
+    Value,
 };
 
 #[derive(Debug, Clone)]
@@ -20,17 +16,13 @@ pub struct TablePlan {
 }
 
 pub fn rewrite_with_bounds(
-    sql: &str,
+    stmt: &Statement,
     order_col: &str,
     lower: Option<i64>,
     upper: Option<i64>,
     limit_hint: Option<usize>,
 ) -> Option<String> {
-    let mut stmts = Parser::parse_sql(&ClickHouseDialect {}, sql).ok()?;
-    if stmts.is_empty() {
-        return None;
-    }
-    let mut stmt = stmts.remove(0);
+    let mut stmt = stmt.clone();
 
     let append_bounds = |selection: &mut Option<Expr>| {
         let ident = |name: &str| {
@@ -100,26 +92,25 @@ pub fn rewrite_with_bounds(
     Some(stmt.to_string())
 }
 
-pub fn parse_table_schema_from_ddl(sql: &str) -> Option<(String, Vec<(String, super::ColumnType)>)> {
-    let mut stmts = Parser::parse_sql(&ClickHouseDialect {}, sql).ok()?;
-    for stmt in stmts.drain(..) {
-        if let Statement::CreateTable { name, columns, .. } = stmt {
-            let table = name.to_string().to_ascii_lowercase();
-            let cols = columns
-                .into_iter()
-                .map(|col| {
-                    let name = col.name.value.to_ascii_lowercase();
-                    let ty = map_data_type(&col.data_type);
-                    (name, ty)
-                })
-                .collect::<Vec<_>>();
-            return Some((table, cols));
-        }
+pub fn parse_table_schema_from_ddl(
+    stmt: &Statement,
+) -> Option<(String, Vec<(String, super::ColumnType)>)> {
+    if let Statement::CreateTable { name, columns, .. } = stmt {
+        let table = name.to_string().to_ascii_lowercase();
+        let cols = columns
+            .iter()
+            .map(|col| {
+                let name = col.name.value.to_ascii_lowercase();
+                let ty = map_data_type(&col.data_type);
+                (name, ty)
+            })
+            .collect::<Vec<_>>();
+        return Some((table, cols));
     }
     None
 }
 
-fn map_data_type(data_type: &fp_sql::ast::DataType) -> super::ColumnType {
+fn map_data_type(data_type: &fp_core::sql_ast::DataType) -> super::ColumnType {
     let lowered = data_type.to_string().to_ascii_lowercase();
     if lowered.contains("int") {
         super::ColumnType::Int64
@@ -165,10 +156,7 @@ pub enum Predicate {
     },
 }
 
-pub fn build_table_plan(sql: &str) -> Option<TablePlan> {
-    let mut stmts = Parser::parse_sql(&ClickHouseDialect {}, sql).ok()?;
-    let stmt = stmts.drain(..).next()?;
-
+pub fn build_table_plan(stmt: &Statement) -> Option<TablePlan> {
     let query = match stmt {
         Statement::Query(query) => query,
         _ => return Some(TablePlan::cold()),
@@ -188,23 +176,10 @@ pub fn build_table_plan(sql: &str) -> Option<TablePlan> {
         _ => return Some(TablePlan::cold()),
     };
 
-    if query.with.is_some()
-        || select.top.is_some()
-        || select.into.is_some()
-        || !select.from[0].joins.is_empty()
+    if !select.from[0].joins.is_empty()
         || select.distinct.is_some()
         || has_group_by(&select.group_by)
         || select.having.is_some()
-        || !select.lateral_views.is_empty()
-        || !select.cluster_by.is_empty()
-        || !select.distribute_by.is_empty()
-        || !select.sort_by.is_empty()
-        || !select.named_window.is_empty()
-        || select.qualify.is_some()
-        || !query.limit_by.is_empty()
-        || query.fetch.is_some()
-        || !query.locks.is_empty()
-        || query.for_clause.is_some()
     {
         return Some(TablePlan::unsupported(table));
     }
@@ -220,10 +195,7 @@ pub fn build_table_plan(sql: &str) -> Option<TablePlan> {
     let mut has_wildcard = false;
     for item in &select.projection {
         match item {
-            SelectItem::Wildcard(opts) | SelectItem::QualifiedWildcard(_, opts) => {
-                if wildcard_has_options(opts) {
-                    return Some(TablePlan::unsupported(table));
-                }
+            SelectItem::Wildcard => {
                 has_wildcard = true;
             }
             SelectItem::UnnamedExpr(expr) => {
@@ -268,7 +240,7 @@ pub fn build_table_plan(sql: &str) -> Option<TablePlan> {
     let offset = query
         .offset
         .as_ref()
-        .and_then(|off| literal_i64(&off.value))
+        .and_then(literal_i64)
         .map(|v| v.max(0) as usize);
 
     let limit = query
@@ -293,7 +265,6 @@ pub fn build_table_plan(sql: &str) -> Option<TablePlan> {
 
 fn has_group_by(group_by: &GroupByExpr) -> bool {
     match group_by {
-        GroupByExpr::All => true,
         GroupByExpr::Expressions(exprs) => !exprs.is_empty(),
     }
 }
@@ -334,13 +305,6 @@ impl TablePlan {
             supports_hot: false,
         }
     }
-}
-
-fn wildcard_has_options(opts: &WildcardAdditionalOptions) -> bool {
-    opts.opt_exclude.is_some()
-        || opts.opt_except.is_some()
-        || opts.opt_rename.is_some()
-        || opts.opt_replace.is_some()
 }
 
 fn predicate_supported(predicate: &Predicate) -> bool {
@@ -401,29 +365,6 @@ fn collect_predicates(expr: &Expr, out: &mut Vec<Predicate>) -> bool {
             }
             _ => false,
         },
-        Expr::Between {
-            expr,
-            low,
-            high,
-            negated,
-            ..
-        } => {
-            if *negated {
-                return false;
-            }
-            if let (Some(col), Some(lo), Some(hi)) =
-                (column_ident(expr), literal_i64(low), literal_i64(high))
-            {
-                out.push(Predicate::Between {
-                    column: col,
-                    low: lo,
-                    high: hi,
-                });
-                true
-            } else {
-                false
-            }
-        }
         Expr::InList {
             expr,
             list,
@@ -469,14 +410,7 @@ fn literal_scalar(expr: &Expr) -> Option<String> {
         Expr::Value(Value::Number(n, _)) => Some(n.clone()),
         Expr::Value(Value::SingleQuotedString(s))
         | Expr::Value(Value::DoubleQuotedString(s))
-        | Expr::Value(Value::EscapedStringLiteral(s))
-        | Expr::Value(Value::SingleQuotedByteStringLiteral(s))
-        | Expr::Value(Value::DoubleQuotedByteStringLiteral(s))
-        | Expr::Value(Value::RawStringLiteral(s))
-        | Expr::Value(Value::NationalStringLiteral(s))
-        | Expr::Value(Value::HexStringLiteral(s))
-        | Expr::Value(Value::UnQuotedString(s)) => Some(s.clone()),
-        Expr::Value(Value::DollarQuotedString(dollar)) => Some(dollar.value.clone()),
+        | Expr::Value(Value::UnquotedString(s)) => Some(s.clone()),
         Expr::Value(Value::Boolean(b)) => Some(b.to_string()),
         Expr::Value(Value::Null) => Some(String::from("null")),
         _ => None,
@@ -488,7 +422,7 @@ fn literal_i64(expr: &Expr) -> Option<i64> {
         Expr::Value(Value::Number(n, _)) => n.parse().ok(),
         Expr::Value(Value::SingleQuotedString(s)) => s.parse().ok(),
         Expr::Value(Value::DoubleQuotedString(s)) => s.parse().ok(),
-        Expr::Value(Value::UnQuotedString(s)) => s.parse().ok(),
+        Expr::Value(Value::UnquotedString(s)) => s.parse().ok(),
         _ => None,
     }
 }
@@ -496,11 +430,15 @@ fn literal_i64(expr: &Expr) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fp_core::query::SqlDialect;
+    use fp_sql::sql_ast::parse_sql_ast;
 
     #[test]
     fn build_plan_captures_limit_offset() {
         let sql = "SELECT * FROM data WHERE key0 = 'A' AND key1 IN ('B', 'C') AND ts >= 0 AND ts <= 100 ORDER BY ts LIMIT 5 OFFSET 2";
-        let plan = build_table_plan(sql).expect("plan");
+        let mut stmts = parse_sql_ast(sql, SqlDialect::ClickHouse).expect("parse sql");
+        let stmt = stmts.remove(0);
+        let plan = build_table_plan(&stmt).expect("plan");
 
         assert_eq!(plan.table, "data");
         assert_eq!(plan.limit, Some(5));
@@ -530,7 +468,9 @@ mod tests {
     #[test]
     fn rewrite_with_bounds_adds_filters_and_limit_hint() {
         let sql = "SELECT * FROM data ORDER BY ts";
-        let rewritten = rewrite_with_bounds(sql, "ts", Some(10), Some(20), Some(15))
+        let mut stmts = parse_sql_ast(sql, SqlDialect::ClickHouse).expect("parse sql");
+        let stmt = stmts.remove(0);
+        let rewritten = rewrite_with_bounds(&stmt, "ts", Some(10), Some(20), Some(15))
             .expect("rewrite with bounds");
         let lower = rewritten.to_ascii_lowercase();
         assert!(lower.contains("ts >= 10"));
