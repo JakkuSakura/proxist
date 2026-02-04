@@ -39,6 +39,7 @@ pub trait SqlExecutor: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickhouseWireFormat {
     JsonEachRow,
+    RowBinaryWithNamesAndTypes,
     Other,
     Unknown,
 }
@@ -46,21 +47,28 @@ pub enum ClickhouseWireFormat {
 #[derive(Debug, Clone)]
 pub struct ClickhouseWire {
     pub format: ClickhouseWireFormat,
-    pub body: String,
+    pub body: bytes::Bytes,
 }
 
 impl ClickhouseWire {
     fn jsoneachrow(body: String) -> Self {
         Self {
             format: ClickhouseWireFormat::JsonEachRow,
-            body,
+            body: bytes::Bytes::from(body),
         }
     }
 
     fn with_unknown(body: String) -> Self {
         Self {
             format: ClickhouseWireFormat::Unknown,
-            body,
+            body: bytes::Bytes::from(body),
+        }
+    }
+
+    fn rowbinary(body: Vec<u8>) -> Self {
+        Self {
+            format: ClickhouseWireFormat::RowBinaryWithNamesAndTypes,
+            body: bytes::Bytes::from(body),
         }
     }
 }
@@ -279,14 +287,11 @@ impl SqlExecutor for ProxistScheduler {
 
                 if let Some(plan) = plan {
                     let requested_format = detect_wire_format(sql);
-                    if !matches!(
-                        requested_format,
-                        ClickhouseWireFormat::JsonEachRow | ClickhouseWireFormat::Unknown
-                    ) {
+                    if matches!(requested_format, ClickhouseWireFormat::Other) {
                         if let Some(ch) = &self.clickhouse {
                             return Ok(SqlResult::Clickhouse(ClickhouseWire {
                                 format: requested_format,
-                                body: ch.execute_raw(sql).await?,
+                                body: bytes::Bytes::from(ch.execute_raw(sql).await?),
                             }));
                         }
                         // fall through to default executors if ClickHouse is unavailable
@@ -330,61 +335,39 @@ impl SqlExecutor for ProxistScheduler {
                                     ) {
                                         let columns = expected_columns(&plan);
                                         let column_types = expected_column_types(&plan);
-                                        match requested_format {
-                                            ClickhouseWireFormat::JsonEachRow => {
-                                                if let Some(ch) = &self.clickhouse {
-                                                    let cold_sql = ensure_jsoneachrow(&cold_sql);
-                                                    let text = ch.execute_raw(&cold_sql).await?;
-                                                    cold_rows = Some(parse_json_rows(
-                                                        &text,
-                                                        &columns,
-                                                        &column_types,
-                                                    )?);
-                                                } else {
-                                                    plan_failed = true;
+                                        if let Some(native) = &self.clickhouse_native {
+                                            match native.query_rowset(&cold_sql).await {
+                                                Ok(rowset) => {
+                                                    cold_rows =
+                                                        Some(align_rowset_columns(rowset, &columns)?);
                                                 }
-                                            }
-                                            ClickhouseWireFormat::Other => {
-                                                plan_failed = true;
-                                            }
-                                            ClickhouseWireFormat::Unknown => {
-                                                if let Some(native) = &self.clickhouse_native {
-                                                    match native.query_rowset(&cold_sql).await {
-                                                        Ok(rowset) => {
-                                                            cold_rows = Some(
-                                                                align_rowset_columns(
-                                                                    rowset, &columns,
-                                                                )?,
-                                                            );
-                                                        }
-                                                        Err(_) => {
-                                                            if let Some(ch) = &self.clickhouse {
-                                                                let cold_sql =
-                                                                    ensure_csv_with_names(&cold_sql);
-                                                                let text =
-                                                                    ch.execute_raw(&cold_sql).await?;
-                                                                cold_rows = Some(parse_csv_rows(
-                                                                    &text,
-                                                                    &columns,
-                                                                    &column_types,
-                                                                )?);
-                                                            } else {
-                                                                plan_failed = true;
-                                                            }
-                                                        }
+                                                Err(_) => {
+                                                    if let Some(ch) = &self.clickhouse {
+                                                        let cold_sql =
+                                                            ensure_rowbinary_with_names(&cold_sql);
+                                                        let bytes =
+                                                            ch.execute_raw_bytes(&cold_sql).await?;
+                                                        cold_rows = Some(parse_rowbinary_rows(
+                                                            &bytes,
+                                                            &columns,
+                                                            &column_types,
+                                                        )?);
+                                                    } else {
+                                                        plan_failed = true;
                                                     }
-                                                } else if let Some(ch) = &self.clickhouse {
-                                                    let cold_sql = ensure_csv_with_names(&cold_sql);
-                                                    let text = ch.execute_raw(&cold_sql).await?;
-                                                    cold_rows = Some(parse_csv_rows(
-                                                        &text,
-                                                        &columns,
-                                                        &column_types,
-                                                    )?);
-                                                } else {
-                                                    plan_failed = true;
                                                 }
                                             }
+                                        } else if let Some(ch) = &self.clickhouse {
+                                            let cold_sql =
+                                                ensure_rowbinary_with_names(&cold_sql);
+                                            let bytes = ch.execute_raw_bytes(&cold_sql).await?;
+                                            cold_rows = Some(parse_rowbinary_rows(
+                                                &bytes,
+                                                &columns,
+                                                &column_types,
+                                            )?);
+                                        } else {
+                                            plan_failed = true;
                                         }
                                     } else {
                                         plan_failed = true;
@@ -418,23 +401,38 @@ impl SqlExecutor for ProxistScheduler {
                             }
                         }
 
-                        if !plan_failed && (cold_rows.is_some() || hot_rows.is_some()) {
-                            let cold_sorted = plan.order_by.first().is_some();
-                            let merged = merge_rows(cold_rows, hot_rows, &plan, cold_sorted)?;
-                            let sliced = apply_offset_limit(merged, plan.offset, plan.limit);
-                            return Ok(SqlResult::TypedRows(sliced));
-                        }
+                            if !plan_failed && (cold_rows.is_some() || hot_rows.is_some()) {
+                                let cold_sorted = plan.order_by.first().is_some();
+                                let merged = merge_rows(cold_rows, hot_rows, &plan, cold_sorted)?;
+                                let sliced = apply_offset_limit(merged, plan.offset, plan.limit);
+                                if matches!(
+                                    requested_format,
+                                    ClickhouseWireFormat::RowBinaryWithNamesAndTypes
+                                ) {
+                                    let body = render_rowbinary_rows(&sliced);
+                                    return Ok(SqlResult::Clickhouse(ClickhouseWire::rowbinary(
+                                        body,
+                                    )));
+                                }
+                                return Ok(SqlResult::TypedRows(sliced));
+                            }
                     }
                 }
             }
 
             if let Some(ch) = &self.clickhouse {
                 let wire_format = detect_wire_format(sql);
-                let body = ch.execute_raw(sql).await?;
-                let wire = if matches!(wire_format, ClickhouseWireFormat::JsonEachRow) {
-                    ClickhouseWire::jsoneachrow(body)
+                let wire = if matches!(wire_format, ClickhouseWireFormat::RowBinaryWithNamesAndTypes)
+                {
+                    let body = ch.execute_raw_bytes(sql).await?;
+                    ClickhouseWire {
+                        format: wire_format,
+                        body,
+                    }
+                } else if matches!(wire_format, ClickhouseWireFormat::JsonEachRow) {
+                    ClickhouseWire::jsoneachrow(ch.execute_raw(sql).await?)
                 } else {
-                    ClickhouseWire::with_unknown(body)
+                    ClickhouseWire::with_unknown(ch.execute_raw(sql).await?)
                 };
                 return Ok(SqlResult::Clickhouse(wire));
             }
@@ -447,6 +445,17 @@ impl SqlExecutor for ProxistScheduler {
         {
             if let Some(pg) = &self.postgres {
                 return pg.execute(sql).await;
+            }
+            if let Some(native) = &self.clickhouse_native {
+                native.execute(sql).await?;
+                return Ok(SqlResult::Text("Ok.\n".to_string()));
+            }
+            if let Some(ch) = &self.clickhouse {
+                let body = ch.execute_raw(sql).await?;
+                if body.trim().is_empty() {
+                    return Ok(SqlResult::Text("Ok.\n".to_string()));
+                }
+                return Ok(SqlResult::Text(body));
             }
         }
 
@@ -831,6 +840,248 @@ fn parse_json_rows(
     })
 }
 
+fn parse_rowbinary_rows(
+    bytes: &[u8],
+    expected_columns: &[String],
+    expected_types: &[ColumnType],
+) -> anyhow::Result<RowSet> {
+    let mut cursor = RowBinaryCursor::new(bytes);
+    let column_count = cursor.read_uvarint()? as usize;
+    let mut columns = Vec::with_capacity(column_count);
+    let mut column_types = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+        columns.push(cursor.read_string()?);
+        let ty = cursor.read_string()?;
+        column_types.push(map_clickhouse_type(&ty));
+    }
+    let row_count = cursor.read_uvarint()? as usize;
+    let mut rows = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        let mut row = Vec::with_capacity(column_count);
+        for ty in &column_types {
+            row.push(cursor.read_scalar(*ty)?);
+        }
+        rows.push(row);
+    }
+    let rowset = RowSet {
+        columns,
+        column_types,
+        rows,
+    };
+    align_rowset_columns(rowset, expected_columns).map(|mut aligned| {
+        if aligned.column_types.is_empty() {
+            aligned.column_types = expected_types.to_vec();
+        }
+        aligned
+    })
+}
+
+fn map_clickhouse_type(raw: &str) -> ColumnType {
+    let lowered = raw.trim().to_ascii_lowercase();
+    if lowered.starts_with("nullable(") && lowered.ends_with(')') {
+        let inner = &lowered["nullable(".len()..lowered.len() - 1];
+        return map_clickhouse_type(inner);
+    }
+    if lowered.starts_with("lowcardinality(") && lowered.ends_with(')') {
+        let inner = &lowered["lowcardinality(".len()..lowered.len() - 1];
+        return map_clickhouse_type(inner);
+    }
+    if lowered.contains("int") {
+        ColumnType::Int64
+    } else if lowered.contains("float")
+        || lowered.contains("double")
+        || lowered.starts_with("decimal")
+    {
+        ColumnType::Float64
+    } else if lowered.contains("bool") {
+        ColumnType::Bool
+    } else {
+        ColumnType::Text
+    }
+}
+
+fn column_type_to_clickhouse_type(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Int64 => "Int64",
+        ColumnType::Float64 => "Float64",
+        ColumnType::Bool => "UInt8",
+        ColumnType::Text => "String",
+    }
+}
+
+struct RowBinaryCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> RowBinaryCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_u8(&mut self) -> anyhow::Result<u8> {
+        let b = *self
+            .bytes
+            .get(self.offset)
+            .ok_or_else(|| anyhow!("rowbinary: unexpected eof"))?;
+        self.offset += 1;
+        Ok(b)
+    }
+
+    fn read_uvarint(&mut self) -> anyhow::Result<u64> {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = self.read_u8()?;
+            result |= u64::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 63 {
+                anyhow::bail!("rowbinary: varint overflow");
+            }
+        }
+        Ok(result)
+    }
+
+    fn read_bytes(&mut self, len: usize) -> anyhow::Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("rowbinary: length overflow"))?;
+        let slice = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| anyhow!("rowbinary: unexpected eof"))?;
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn read_string(&mut self) -> anyhow::Result<String> {
+        let len = self.read_uvarint()? as usize;
+        let bytes = self.read_bytes(len)?;
+        Ok(String::from_utf8_lossy(bytes).to_string())
+    }
+
+    fn read_scalar(&mut self, ty: ColumnType) -> anyhow::Result<ScalarValue> {
+        match ty {
+            ColumnType::Int64 => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(self.read_bytes(8)?);
+                Ok(ScalarValue::Int64(i64::from_le_bytes(buf)))
+            }
+            ColumnType::Float64 => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(self.read_bytes(8)?);
+                Ok(ScalarValue::Float64(f64::from_le_bytes(buf)))
+            }
+            ColumnType::Bool => Ok(ScalarValue::Bool(self.read_u8()? != 0)),
+            ColumnType::Text => {
+                let len = self.read_uvarint()? as usize;
+                let bytes = self.read_bytes(len)?;
+                Ok(ScalarValue::String(String::from_utf8_lossy(bytes).to_string()))
+            }
+        }
+    }
+}
+
+fn render_rowbinary_rows(rows: &RowSet) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_uvarint(&mut out, rows.columns.len() as u64);
+    for (idx, name) in rows.columns.iter().enumerate() {
+        let ty = rows
+            .column_types
+            .get(idx)
+            .copied()
+            .unwrap_or(ColumnType::Text);
+        push_string(&mut out, name);
+        push_string(&mut out, column_type_to_clickhouse_type(ty));
+    }
+    push_uvarint(&mut out, rows.rows.len() as u64);
+    for row in &rows.rows {
+        for (idx, _) in rows.columns.iter().enumerate() {
+            let ty = rows
+                .column_types
+                .get(idx)
+                .copied()
+                .unwrap_or(ColumnType::Text);
+            let value = row
+                .get(idx)
+                .cloned()
+                .unwrap_or(ScalarValue::Null);
+            push_scalar(&mut out, ty, value);
+        }
+    }
+    out
+}
+
+fn push_uvarint(buf: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        buf.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    buf.push(value as u8);
+}
+
+fn push_string(buf: &mut Vec<u8>, text: &str) {
+    push_uvarint(buf, text.len() as u64);
+    buf.extend_from_slice(text.as_bytes());
+}
+
+fn push_scalar(buf: &mut Vec<u8>, ty: ColumnType, value: ScalarValue) {
+    match (ty, value) {
+        (ColumnType::Int64, ScalarValue::Int64(v)) => buf.extend_from_slice(&v.to_le_bytes()),
+        (ColumnType::Float64, ScalarValue::Float64(v)) => buf.extend_from_slice(&v.to_le_bytes()),
+        (ColumnType::Bool, ScalarValue::Bool(v)) => buf.push(if v { 1 } else { 0 }),
+        (ColumnType::Text, ScalarValue::String(s)) => push_string(buf, &s),
+        (ColumnType::Text, ScalarValue::Null) => push_string(buf, ""),
+        (ColumnType::Int64, ScalarValue::Null)
+        | (ColumnType::Float64, ScalarValue::Null) => buf.extend_from_slice(&0i64.to_le_bytes()),
+        (ColumnType::Bool, ScalarValue::Null) => buf.push(0),
+        (ColumnType::Text, other) => {
+            let text = match other {
+                ScalarValue::Null => String::new(),
+                ScalarValue::String(s) => s,
+                ScalarValue::Int64(v) => v.to_string(),
+                ScalarValue::Float64(v) => v.to_string(),
+                ScalarValue::Bool(v) => v.to_string(),
+            };
+            push_string(buf, &text);
+        }
+        (ColumnType::Int64, other) => match other {
+            ScalarValue::Int64(v) => buf.extend_from_slice(&v.to_le_bytes()),
+            ScalarValue::Float64(v) => buf.extend_from_slice(&(v as i64).to_le_bytes()),
+            ScalarValue::String(s) => {
+                let parsed = s.parse::<i64>().unwrap_or(0);
+                buf.extend_from_slice(&parsed.to_le_bytes());
+            }
+            ScalarValue::Bool(v) => buf.extend_from_slice(&(i64::from(v) as i64).to_le_bytes()),
+            ScalarValue::Null => buf.extend_from_slice(&0i64.to_le_bytes()),
+        },
+        (ColumnType::Float64, other) => match other {
+            ScalarValue::Float64(v) => buf.extend_from_slice(&v.to_le_bytes()),
+            ScalarValue::Int64(v) => buf.extend_from_slice(&(v as f64).to_le_bytes()),
+            ScalarValue::String(s) => {
+                let parsed = s.parse::<f64>().unwrap_or(0.0);
+                buf.extend_from_slice(&parsed.to_le_bytes());
+            }
+            ScalarValue::Bool(v) => {
+                let val: f64 = if v { 1.0 } else { 0.0 };
+                buf.extend_from_slice(&val.to_le_bytes());
+            }
+            ScalarValue::Null => buf.extend_from_slice(&0f64.to_le_bytes()),
+        },
+        (ColumnType::Bool, other) => match other {
+            ScalarValue::Bool(v) => buf.push(if v { 1 } else { 0 }),
+            ScalarValue::Int64(v) => buf.push(if v != 0 { 1 } else { 0 }),
+            ScalarValue::String(s) => buf.push(if s == "true" { 1 } else { 0 }),
+            ScalarValue::Float64(v) => buf.push(if v != 0.0 { 1 } else { 0 }),
+            ScalarValue::Null => buf.push(0),
+        },
+    }
+}
+
 fn bytes_to_scalar(value: &Bytes, ty: ColumnType) -> ScalarValue {
     if value.is_empty() {
         return ScalarValue::Null;
@@ -1173,6 +1424,9 @@ fn detect_wire_format(sql: &str) -> ClickhouseWireFormat {
             if token == "jsoneachrow" {
                 return ClickhouseWireFormat::JsonEachRow;
             }
+            if token == "rowbinarywithnamesandtypes" {
+                return ClickhouseWireFormat::RowBinaryWithNamesAndTypes;
+            }
             return ClickhouseWireFormat::Other;
         }
     }
@@ -1182,6 +1436,7 @@ fn detect_wire_format(sql: &str) -> ClickhouseWireFormat {
 fn ensure_jsoneachrow(sql: &str) -> String {
     match detect_wire_format(sql) {
         ClickhouseWireFormat::JsonEachRow => sql.to_string(),
+        ClickhouseWireFormat::RowBinaryWithNamesAndTypes => sql.to_string(),
         ClickhouseWireFormat::Other => sql.to_string(),
         ClickhouseWireFormat::Unknown => {
             if let Some(stripped) = sql.strip_suffix(';') {
@@ -1196,6 +1451,7 @@ fn ensure_jsoneachrow(sql: &str) -> String {
 fn ensure_csv_with_names(sql: &str) -> String {
     match detect_wire_format(sql) {
         ClickhouseWireFormat::JsonEachRow => sql.to_string(),
+        ClickhouseWireFormat::RowBinaryWithNamesAndTypes => sql.to_string(),
         ClickhouseWireFormat::Other => sql.to_string(),
         ClickhouseWireFormat::Unknown => {
             if let Some(stripped) = sql.strip_suffix(';') {
@@ -1204,6 +1460,28 @@ fn ensure_csv_with_names(sql: &str) -> String {
                 format!("{} FORMAT CSVWithNames", sql.trim_end())
             }
         }
+    }
+}
+
+fn ensure_rowbinary_with_names(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if let Some(idx) = lower.rfind("format") {
+        let head = sql[..idx].trim_end();
+        let mut out = String::with_capacity(sql.len() + 32);
+        out.push_str(head);
+        out.push_str(" FORMAT RowBinaryWithNamesAndTypes");
+        if sql.trim_end().ends_with(';') {
+            out.push(';');
+        }
+        return out;
+    }
+    if let Some(stripped) = sql.strip_suffix(';') {
+        format!(
+            "{} FORMAT RowBinaryWithNamesAndTypes;",
+            stripped.trim_end()
+        )
+    } else {
+        format!("{} FORMAT RowBinaryWithNamesAndTypes", sql.trim_end())
     }
 }
 
@@ -1290,6 +1568,15 @@ mod scheduler_tests {
         assert!(matches!(
             detect_wire_format(sql),
             ClickhouseWireFormat::Other
+        ));
+    }
+
+    #[test]
+    fn detect_wire_format_handles_rowbinary() {
+        let sql = "SELECT * FROM foo FORMAT RowBinaryWithNamesAndTypes";
+        assert!(matches!(
+            detect_wire_format(sql),
+            ClickhouseWireFormat::RowBinaryWithNamesAndTypes
         ));
     }
 
@@ -1434,6 +1721,47 @@ mod scheduler_tests {
         assert_eq!(rows.column_types, types);
         assert_eq!(rows.rows[0][0], ScalarValue::String("SYM1".to_string()));
         assert_eq!(rows.rows[0][1], ScalarValue::Int64(42));
+    }
+
+    #[test]
+    fn parse_rowbinary_with_names_and_types() {
+        fn push_uvarint(buf: &mut Vec<u8>, mut value: u64) {
+            while value >= 0x80 {
+                buf.push((value as u8) | 0x80);
+                value >>= 7;
+            }
+            buf.push(value as u8);
+        }
+
+        fn push_string(buf: &mut Vec<u8>, text: &str) {
+            push_uvarint(buf, text.len() as u64);
+            buf.extend_from_slice(text.as_bytes());
+        }
+
+        let mut buf = Vec::new();
+        push_uvarint(&mut buf, 2);
+        push_string(&mut buf, "id");
+        push_string(&mut buf, "Int64");
+        push_string(&mut buf, "name");
+        push_string(&mut buf, "String");
+        push_uvarint(&mut buf, 2);
+        buf.extend_from_slice(&1i64.to_le_bytes());
+        push_string(&mut buf, "alpha");
+        buf.extend_from_slice(&2i64.to_le_bytes());
+        push_string(&mut buf, "beta");
+
+        let expected_columns = vec!["id".to_string(), "name".to_string()];
+        let expected_types = vec![ColumnType::Int64, ColumnType::Text];
+        let rowset = parse_rowbinary_rows(&buf, &expected_columns, &expected_types)
+            .expect("parse rowbinary");
+        assert_eq!(rowset.columns, expected_columns);
+        assert_eq!(rowset.column_types, expected_types);
+        assert_eq!(rowset.rows.len(), 2);
+        assert!(matches!(rowset.rows[0][0], ScalarValue::Int64(1)));
+        assert!(matches!(
+            rowset.rows[0][1],
+            ScalarValue::String(ref s) if s == "alpha"
+        ));
     }
 
     #[test]

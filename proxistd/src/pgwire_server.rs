@@ -71,18 +71,22 @@ impl SimpleQueryHandler for PgHandler {
                     SqlResult::Rows(rows) => rows_response(rows),
                     SqlResult::TypedRows(rows) => rows_response_typed(rows, self.binary),
                     SqlResult::Text(text) => text_response(text),
-                    SqlResult::Clickhouse(wire) => match wire.format {
-                        crate::scheduler::ClickhouseWireFormat::JsonEachRow => {
-                            match parse_jsoneachrow_to_maps(&wire.body) {
-                                Ok(rows) => rows_response(rows),
-                                Err(err) => return Err(app_error_to_pg(AppError(err))),
+                    SqlResult::Clickhouse(wire) => {
+                        let body_text = String::from_utf8_lossy(&wire.body);
+                        match wire.format {
+                            crate::scheduler::ClickhouseWireFormat::JsonEachRow => {
+                                match parse_jsoneachrow_to_maps(&body_text) {
+                                    Ok(rows) => rows_response(rows),
+                                    Err(err) => return Err(app_error_to_pg(AppError(err))),
+                                }
+                            }
+                            crate::scheduler::ClickhouseWireFormat::Other
+                            | crate::scheduler::ClickhouseWireFormat::Unknown
+                            | crate::scheduler::ClickhouseWireFormat::RowBinaryWithNamesAndTypes => {
+                                text_response(body_text.to_string())
                             }
                         }
-                        crate::scheduler::ClickhouseWireFormat::Other
-                        | crate::scheduler::ClickhouseWireFormat::Unknown => {
-                            text_response(wire.body)
-                        }
-                    },
+                    }
                 },
             };
             responses.push(response);

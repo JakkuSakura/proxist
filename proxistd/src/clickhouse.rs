@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use bytes::Bytes;
 use proxist_core::ingest::IngestSegment;
 use crate::scheduler::{ColumnType, TableRegistry};
 use reqwest::Client;
@@ -286,6 +287,20 @@ impl ClickhouseNativeClient {
             anyhow::bail!("clickhouse-native feature not enabled");
         }
     }
+
+    pub async fn execute(&self, sql: &str) -> anyhow::Result<()> {
+        #[cfg(feature = "clickhouse-native")]
+        {
+            let mut handle = self.pool.get_handle().await?;
+            handle.execute(sql).await?;
+            Ok(())
+        }
+        #[cfg(not(feature = "clickhouse-native"))]
+        {
+            let _ = sql;
+            anyhow::bail!("clickhouse-native feature not enabled");
+        }
+    }
 }
 
 #[cfg(feature = "clickhouse-native")]
@@ -486,6 +501,26 @@ impl ClickhouseHttpClient {
             .text()
             .await
             .context("read raw ClickHouse query response")
+    }
+
+    pub async fn execute_raw_bytes(&self, sql: &str) -> anyhow::Result<Bytes> {
+        let mut request = self.client.post(self.url()).body(sql.to_string());
+        if let Some(username) = &self.config.username {
+            request = request.basic_auth(username, self.config.password.as_ref());
+        }
+        let response = request.send().await.context("send raw ClickHouse query")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unavailable>".into());
+            anyhow::bail!("clickhouse query failed: status={} body={}", status, body);
+        }
+        response
+            .bytes()
+            .await
+            .context("read raw ClickHouse query response bytes")
     }
 
     pub fn target(&self) -> ClickhouseTarget {

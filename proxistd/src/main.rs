@@ -562,20 +562,9 @@ enum SqlBatchResult {
     Scheduler(SqlResult),
 }
 
-async fn forward_sql_to_scheduler(state: &AppState, sql: &str) -> Result<String, AppError> {
+async fn forward_sql_to_scheduler(state: &AppState, sql: &str) -> Result<SqlResult, AppError> {
     let result = state.scheduler.execute(sql).await?;
-    let body = match result {
-        SqlResult::Clickhouse(ClickhouseWire { format, body }) => {
-            if matches!(format, ClickhouseWireFormat::Unknown | ClickhouseWireFormat::Other) {
-                // Future formats will be exposed once the API supports them.
-            }
-            body
-        }
-        SqlResult::Text(s) => s,
-        SqlResult::Rows(rows) => render_rows_as_jsoneachrow(rows),
-        SqlResult::TypedRows(rows) => render_typed_rows_as_jsoneachrow(&rows),
-    };
-    Ok(body)
+    Ok(result)
 }
 
 fn compile_statements(
@@ -620,8 +609,8 @@ async fn execute_sql_batch(
             let mut parsed = match parse_sql_with_dialect(&dialect, normalized) {
                 Ok(parsed) => parsed,
                 Err(_) => {
-                    let raw = forward_sql_to_scheduler(state, normalized).await?;
-                    outputs.push(SqlBatchResult::Text(raw));
+                    let result = forward_sql_to_scheduler(state, normalized).await?;
+                    outputs.push(SqlBatchResult::Scheduler(result));
                     continue;
                 }
             };
@@ -629,8 +618,8 @@ async fn execute_sql_batch(
                 continue;
             }
             if parsed.len() != 1 {
-                let raw = forward_sql_to_scheduler(state, normalized).await?;
-                outputs.push(SqlBatchResult::Text(raw));
+                let result = forward_sql_to_scheduler(state, normalized).await?;
+                outputs.push(SqlBatchResult::Scheduler(result));
                 continue;
             }
             let mut stmt = parsed.remove(0);
@@ -649,8 +638,8 @@ async fn execute_sql_batch(
                         let raw = client.execute_raw(&forwarded).await?;
                         outputs.push(SqlBatchResult::Text(raw));
                     } else {
-                        let raw = forward_sql_to_scheduler(state, &forwarded).await?;
-                        outputs.push(SqlBatchResult::Text(raw));
+                        let result = forward_sql_to_scheduler(state, &forwarded).await?;
+                        outputs.push(SqlBatchResult::Scheduler(result));
                     }
                     continue;
                 }
@@ -673,8 +662,8 @@ async fn execute_sql_batch(
         let parsed = match parse_sql_with_dialect(&dialect, normalized) {
             Ok(parsed) => parsed,
             Err(_) => {
-                let raw = forward_sql_to_scheduler(state, normalized).await?;
-                outputs.push(SqlBatchResult::Text(raw));
+                let result = forward_sql_to_scheduler(state, normalized).await?;
+                outputs.push(SqlBatchResult::Scheduler(result));
                 continue;
             }
         };
@@ -713,18 +702,18 @@ async fn execute_sql_batch(
                                 }
                                 outputs.push(SqlBatchResult::Text("Ok.\n".to_string()));
                             } else {
-                                let raw = forward_sql_to_scheduler(state, normalized).await?;
-                                outputs.push(SqlBatchResult::Text(raw));
+                                let result = forward_sql_to_scheduler(state, normalized).await?;
+                                outputs.push(SqlBatchResult::Scheduler(result));
                             }
                         }
                         _ => {
-                            let raw = forward_sql_to_scheduler(state, normalized).await?;
-                            outputs.push(SqlBatchResult::Text(raw));
+                            let result = forward_sql_to_scheduler(state, normalized).await?;
+                            outputs.push(SqlBatchResult::Scheduler(result));
                         }
                     }
                 } else {
-                    let raw = forward_sql_to_scheduler(state, normalized).await?;
-                    outputs.push(SqlBatchResult::Text(raw));
+                    let result = forward_sql_to_scheduler(state, normalized).await?;
+                    outputs.push(SqlBatchResult::Scheduler(result));
                 }
             }
             _ => {
@@ -1323,34 +1312,40 @@ impl ProxistDaemon {
                     .unwrap());
             }
 
-            let outputs = execute_sql_batch(&state, state.http_dialect.clone(), &sql_text).await?;
-            let mut body = String::new();
-            for output in outputs {
-                let chunk = match output {
-                    SqlBatchResult::Text(text) => text,
-                    SqlBatchResult::Scheduler(result) => match result {
-                        SqlResult::Clickhouse(ClickhouseWire { format, body }) => {
-                            if matches!(
-                                format,
-                                ClickhouseWireFormat::Unknown | ClickhouseWireFormat::Other
-                            ) {
-                                // Future formats will be exposed once the API supports them.
-                            }
-                            body
-                        }
-                        SqlResult::Text(text) => text,
-                        SqlResult::Rows(rows) => render_rows_as_jsoneachrow(rows),
-                        SqlResult::TypedRows(rows) => render_typed_rows_as_jsoneachrow(&rows),
-                    },
-                };
-                body.push_str(&chunk);
-            }
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/plain; charset=UTF-8")
-                .body(Body::from(body))
-                .unwrap())
+    let outputs = execute_sql_batch(&state, state.http_dialect.clone(), &sql_text).await?;
+    let mut body = Vec::new();
+    let mut content_type = "text/plain; charset=UTF-8";
+    for output in outputs {
+        match output {
+            SqlBatchResult::Text(text) => body.extend_from_slice(text.as_bytes()),
+            SqlBatchResult::Scheduler(result) => match result {
+                SqlResult::Clickhouse(ClickhouseWire { format, body: wire }) => {
+                    if matches!(
+                        format,
+                        ClickhouseWireFormat::RowBinaryWithNamesAndTypes
+                    ) {
+                        content_type = "application/octet-stream";
+                    }
+                    body.extend_from_slice(&wire);
+                }
+                SqlResult::Text(text) => body.extend_from_slice(text.as_bytes()),
+                SqlResult::Rows(rows) => {
+                    let chunk = render_rows_as_jsoneachrow(rows);
+                    body.extend_from_slice(chunk.as_bytes());
+                }
+                SqlResult::TypedRows(rows) => {
+                    let chunk = render_typed_rows_as_jsoneachrow(&rows);
+                    body.extend_from_slice(chunk.as_bytes());
+                }
+            },
         }
+    }
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .unwrap())
+}
 
         async fn auth_middleware(
             State(token): State<Option<String>>,
