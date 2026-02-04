@@ -426,7 +426,17 @@ impl SqlExecutor for ProxistScheduler {
                             } else {
                                 merged
                             };
-                            let sliced = apply_offset_limit(ordered, plan.offset, plan.limit);
+                            let projected = if !plan.output_items.is_empty()
+                                && !plan.has_wildcard
+                                && !has_aggregates
+                                && (plan.projection_exprs
+                                    || plan.output_items.len() != expected_columns(&plan).len())
+                            {
+                                apply_projection(ordered, &plan)?
+                            } else {
+                                ordered
+                            };
+                            let sliced = apply_offset_limit(projected, plan.offset, plan.limit);
                             if matches!(
                                 requested_format,
                                 ClickhouseWireFormat::RowBinaryWithNamesAndTypes
@@ -608,6 +618,8 @@ struct PlanAnalysis {
     has_wildcard: bool,
     output_columns: Vec<String>,
     output_types: Vec<ColumnType>,
+    output_items: Vec<OutputItem>,
+    projection_exprs: bool,
     group_by: Vec<String>,
     aggregates: Vec<ResolvedAggregate>,
     offset: Option<usize>,
@@ -711,7 +723,9 @@ fn analyze_select(stmt: &fp_core::sql_ast::Statement, registry: &TableRegistry) 
 
     let mut output_columns = Vec::new();
     let mut output_types = Vec::new();
+    let mut output_items = Vec::new();
     let mut aggregates = Vec::new();
+    let mut projection_exprs = false;
     let has_wildcard = plan.has_wildcard;
 
     if has_wildcard || plan.output_items.is_empty() {
@@ -720,14 +734,18 @@ fn analyze_select(stmt: &fp_core::sql_ast::Statement, registry: &TableRegistry) 
     } else {
         for (idx, item) in plan.output_items.iter().enumerate() {
             match item {
-                OutputItem::Column(name) => {
+                OutputItem::Column { source, alias } => {
                     let pos = cfg
                         .columns
                         .iter()
-                        .position(|col| col.eq_ignore_ascii_case(name))?;
+                        .position(|col| col.eq_ignore_ascii_case(source))?;
                     let ty = cfg.column_types.get(pos).copied().unwrap_or(ColumnType::Text);
-                    output_columns.push(name.clone());
+                    output_columns.push(alias.clone());
                     output_types.push(ty);
+                    output_items.push(OutputItem::Column {
+                        source: source.clone(),
+                        alias: alias.clone(),
+                    });
                 }
                 OutputItem::Aggregate(agg) => {
                     let source_index = agg
@@ -740,9 +758,10 @@ fn analyze_select(stmt: &fp_core::sql_ast::Statement, registry: &TableRegistry) 
                         });
                     let output_type = match agg.kind {
                         AggregateKind::Count => ColumnType::Int64,
-                        AggregateKind::Sum => source_index
+                        AggregateKind::Sum | AggregateKind::Min | AggregateKind::Max => source_index
                             .and_then(|pos| cfg.column_types.get(pos).copied())
                             .unwrap_or(ColumnType::Float64),
+                        AggregateKind::Avg => ColumnType::Float64,
                     };
                     output_columns.push(agg.alias.clone());
                     output_types.push(output_type);
@@ -754,6 +773,16 @@ fn analyze_select(stmt: &fp_core::sql_ast::Statement, registry: &TableRegistry) 
                         output_type,
                         output_index: idx,
                         slot,
+                    });
+                    output_items.push(OutputItem::Aggregate(agg.clone()));
+                }
+                OutputItem::Expr { expr, alias } => {
+                    projection_exprs = true;
+                    output_columns.push(alias.clone());
+                    output_types.push(ColumnType::Text);
+                    output_items.push(OutputItem::Expr {
+                        expr: expr.clone(),
+                        alias: alias.clone(),
                     });
                 }
             }
@@ -778,7 +807,11 @@ fn analyze_select(stmt: &fp_core::sql_ast::Statement, registry: &TableRegistry) 
         }
     }
     if plan.aggregates.is_empty() && plan.group_by.is_empty() {
-        if !plan.order_by.is_empty() && !output_columns.contains(&order_col) {
+        if !plan.order_by.is_empty()
+            && !output_columns
+                .iter()
+                .any(|col| col.eq_ignore_ascii_case(&order_col))
+        {
             return None;
         }
     } else {
@@ -805,6 +838,8 @@ fn analyze_select(stmt: &fp_core::sql_ast::Statement, registry: &TableRegistry) 
         has_wildcard,
         output_columns,
         output_types,
+        output_items,
+        projection_exprs,
         group_by: plan.group_by,
         aggregates,
         offset: plan.offset,
@@ -1282,6 +1317,27 @@ fn json_to_scalar(value: JsonValue, ty: ColumnType) -> ScalarValue {
     }
 }
 
+fn parse_value(value: &fp_core::sql_ast::Value) -> ScalarValue {
+    match value {
+        fp_core::sql_ast::Value::Number(n, _) => {
+            if n.contains('.') {
+                n.parse::<f64>()
+                    .map(ScalarValue::Float64)
+                    .unwrap_or_else(|_| ScalarValue::String(n.clone()))
+            } else {
+                n.parse::<i64>()
+                    .map(ScalarValue::Int64)
+                    .unwrap_or_else(|_| ScalarValue::String(n.clone()))
+            }
+        }
+        fp_core::sql_ast::Value::SingleQuotedString(s)
+        | fp_core::sql_ast::Value::DoubleQuotedString(s)
+        | fp_core::sql_ast::Value::UnquotedString(s) => ScalarValue::String(s.clone()),
+        fp_core::sql_ast::Value::Boolean(b) => ScalarValue::Bool(*b),
+        fp_core::sql_ast::Value::Null => ScalarValue::Null,
+    }
+}
+
 
 fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> RowSet {
     let columns = expected_columns(plan);
@@ -1323,6 +1379,8 @@ fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> RowSet {
 enum AggregateState {
     Int64(i64),
     Float64(f64),
+    MinMax(Option<ScalarValue>),
+    Avg { sum: f64, count: i64 },
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -1360,10 +1418,14 @@ fn aggregate_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> anyhow::Res
         let entry = groups.entry(key).or_insert_with(|| {
             let mut init = Vec::with_capacity(plan.aggregates.len());
             for agg in &plan.aggregates {
-                let state = match agg.output_type {
-                    ColumnType::Int64 => AggregateState::Int64(0),
-                    ColumnType::Float64 => AggregateState::Float64(0.0),
-                    ColumnType::Bool | ColumnType::Text => AggregateState::Int64(0),
+                let state = match agg.kind {
+                    AggregateKind::Count => AggregateState::Int64(0),
+                    AggregateKind::Sum => match agg.output_type {
+                        ColumnType::Int64 => AggregateState::Int64(0),
+                        _ => AggregateState::Float64(0.0),
+                    },
+                    AggregateKind::Min | AggregateKind::Max => AggregateState::MinMax(None),
+                    AggregateKind::Avg => AggregateState::Avg { sum: 0.0, count: 0 },
                 };
                 init.push(state);
             }
@@ -1437,6 +1499,63 @@ fn aggregate_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> anyhow::Res
                         _ => {}
                     }
                 }
+                AggregateKind::Min | AggregateKind::Max => {
+                    let Some(col_idx) = agg.source_index else {
+                        continue;
+                    };
+                    let ty = plan
+                        .cfg
+                        .column_types
+                        .get(col_idx)
+                        .copied()
+                        .unwrap_or(ColumnType::Text);
+                    let value = row
+                        .values
+                        .get(col_idx)
+                        .map(|v| bytes_to_scalar(v, ty))
+                        .unwrap_or(ScalarValue::Null);
+                    if matches!(value, ScalarValue::Null) {
+                        continue;
+                    }
+                    if let AggregateState::MinMax(ref mut current) = entry.1[agg.slot] {
+                        let replace = match current {
+                            None => true,
+                            Some(existing) => {
+                                let cmp = compare_scalar(&value, existing);
+                                if agg.kind == AggregateKind::Min {
+                                    cmp == std::cmp::Ordering::Less
+                                } else {
+                                    cmp == std::cmp::Ordering::Greater
+                                }
+                            }
+                        };
+                        if replace {
+                            *current = Some(value);
+                        }
+                    }
+                }
+                AggregateKind::Avg => {
+                    let Some(col_idx) = agg.source_index else {
+                        continue;
+                    };
+                    let ty = plan
+                        .cfg
+                        .column_types
+                        .get(col_idx)
+                        .copied()
+                        .unwrap_or(ColumnType::Text);
+                    let value = row
+                        .values
+                        .get(col_idx)
+                        .map(|v| bytes_to_scalar(v, ty))
+                        .unwrap_or(ScalarValue::Null);
+                    if let Some(num) = to_float(value) {
+                        if let AggregateState::Avg { sum, count } = &mut entry.1[agg.slot] {
+                            *sum += num;
+                            *count += 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1501,10 +1620,14 @@ fn merge_rowset_into_groups(
         let entry = groups.entry(key).or_insert_with(|| {
             let mut init = Vec::with_capacity(plan.aggregates.len());
             for agg in &plan.aggregates {
-                let state = match agg.output_type {
-                    ColumnType::Int64 => AggregateState::Int64(0),
-                    ColumnType::Float64 => AggregateState::Float64(0.0),
-                    ColumnType::Bool | ColumnType::Text => AggregateState::Int64(0),
+                let state = match agg.kind {
+                    AggregateKind::Count => AggregateState::Int64(0),
+                    AggregateKind::Sum => match agg.output_type {
+                        ColumnType::Int64 => AggregateState::Int64(0),
+                        _ => AggregateState::Float64(0.0),
+                    },
+                    AggregateKind::Min | AggregateKind::Max => AggregateState::MinMax(None),
+                    AggregateKind::Avg => AggregateState::Avg { sum: 0.0, count: 0 },
                 };
                 init.push(state);
             }
@@ -1553,6 +1676,44 @@ fn merge_rowset_into_groups(
                         *v += parsed;
                     }
                 }
+                (AggregateKind::Min, AggregateState::MinMax(ref mut current), value) => {
+                    if matches!(value, ScalarValue::Null) {
+                        continue;
+                    }
+                    let replace = match current {
+                        None => true,
+                        Some(existing) => compare_scalar(&value, existing) == std::cmp::Ordering::Less,
+                    };
+                    if replace {
+                        *current = Some(value);
+                    }
+                }
+                (AggregateKind::Max, AggregateState::MinMax(ref mut current), value) => {
+                    if matches!(value, ScalarValue::Null) {
+                        continue;
+                    }
+                    let replace = match current {
+                        None => true,
+                        Some(existing) => compare_scalar(&value, existing) == std::cmp::Ordering::Greater,
+                    };
+                    if replace {
+                        *current = Some(value);
+                    }
+                }
+                (AggregateKind::Avg, AggregateState::Avg { sum, count }, ScalarValue::Float64(v)) => {
+                    *sum += v;
+                    *count += 1;
+                }
+                (AggregateKind::Avg, AggregateState::Avg { sum, count }, ScalarValue::Int64(v)) => {
+                    *sum += v as f64;
+                    *count += 1;
+                }
+                (AggregateKind::Avg, AggregateState::Avg { sum, count }, ScalarValue::String(s)) => {
+                    if let Ok(parsed) = s.parse::<f64>() {
+                        *sum += parsed;
+                        *count += 1;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1570,8 +1731,14 @@ fn aggregate_groups_to_rowset(
     }
 
     let mut group_index_map = HashMap::new();
-    for (idx, name) in plan.group_by.iter().enumerate() {
-        group_index_map.insert(name.to_ascii_lowercase(), idx);
+    for (group_idx, name) in plan.group_by.iter().enumerate() {
+        for item in &plan.output_items {
+            if let OutputItem::Column { source, alias } = item {
+                if source.eq_ignore_ascii_case(name) {
+                    group_index_map.insert(alias.to_ascii_lowercase(), group_idx);
+                }
+            }
+        }
     }
 
     let mut rows = Vec::with_capacity(groups.len());
@@ -1586,6 +1753,15 @@ fn aggregate_groups_to_rowset(
                 let value = match agg_values.get(slot) {
                     Some(AggregateState::Int64(v)) => ScalarValue::Int64(*v),
                     Some(AggregateState::Float64(v)) => ScalarValue::Float64(*v),
+                    Some(AggregateState::MinMax(Some(v))) => v.clone(),
+                    Some(AggregateState::MinMax(None)) => ScalarValue::Null,
+                    Some(AggregateState::Avg { sum, count }) => {
+                        if *count > 0 {
+                            ScalarValue::Float64(*sum / (*count as f64))
+                        } else {
+                            ScalarValue::Null
+                        }
+                    }
                     None => ScalarValue::Null,
                 };
                 row.push(value);
@@ -1654,18 +1830,170 @@ fn scalar_key(value: &ScalarValue) -> String {
     }
 }
 
-fn expected_columns(plan: &PlanAnalysis) -> Vec<String> {
-    if plan.has_wildcard || plan.output_columns.is_empty() {
-        plan.cfg.columns.clone()
-    } else {
-        plan.output_columns.clone()
+fn apply_projection(mut rowset: RowSet, plan: &PlanAnalysis) -> anyhow::Result<RowSet> {
+    if plan.output_items.is_empty() {
+        return Ok(rowset);
+    }
+    let mut rows = Vec::with_capacity(rowset.rows.len());
+    for row in &rowset.rows {
+        let mut out = Vec::with_capacity(plan.output_items.len());
+        for item in &plan.output_items {
+            match item {
+                OutputItem::Column { source, .. } => {
+                    let idx = rowset
+                        .columns
+                        .iter()
+                        .position(|col| col.eq_ignore_ascii_case(source));
+                    let value = idx
+                        .and_then(|pos| row.get(pos).cloned())
+                        .unwrap_or(ScalarValue::Null);
+                    out.push(value);
+                }
+                OutputItem::Expr { expr, .. } => {
+                    let value = eval_expr(expr, &rowset.columns, row)?;
+                    out.push(value);
+                }
+                OutputItem::Aggregate(_) => {
+                    out.push(ScalarValue::Null);
+                }
+            }
+        }
+        rows.push(out);
+    }
+    rowset.columns = plan.output_columns.clone();
+    rowset.column_types = plan.output_types.clone();
+    rowset.rows = rows;
+    Ok(rowset)
+}
+
+fn eval_expr(expr: &fp_core::sql_ast::Expr, columns: &[String], row: &[ScalarValue]) -> anyhow::Result<ScalarValue> {
+    use fp_core::sql_ast::UnaryOperator;
+    match expr {
+        fp_core::sql_ast::Expr::Identifier(ident) => {
+            let idx = columns
+                .iter()
+                .position(|col| col.eq_ignore_ascii_case(&ident.value));
+            Ok(idx
+                .and_then(|pos| row.get(pos).cloned())
+                .unwrap_or(ScalarValue::Null))
+        }
+        fp_core::sql_ast::Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+            let name = &parts[parts.len() - 1].value;
+            let idx = columns.iter().position(|col| col.eq_ignore_ascii_case(name));
+            Ok(idx
+                .and_then(|pos| row.get(pos).cloned())
+                .unwrap_or(ScalarValue::Null))
+        }
+        fp_core::sql_ast::Expr::Value(value) => Ok(parse_value(value)),
+        fp_core::sql_ast::Expr::Nested(inner) => eval_expr(inner, columns, row),
+        fp_core::sql_ast::Expr::UnaryOp { op, expr } => {
+            let val = eval_expr(expr, columns, row)?;
+            match op {
+                UnaryOperator::Plus => Ok(val),
+                UnaryOperator::Minus => match val {
+                    ScalarValue::Int64(v) => Ok(ScalarValue::Int64(-v)),
+                    ScalarValue::Float64(v) => Ok(ScalarValue::Float64(-v)),
+                    _ => Ok(ScalarValue::Null),
+                },
+                _ => Ok(ScalarValue::Null),
+            }
+        }
+        fp_core::sql_ast::Expr::BinaryOp { left, op, right } => {
+            let l = eval_expr(left, columns, row)?;
+            let r = eval_expr(right, columns, row)?;
+            apply_binary(l, r, op)
+        }
+        fp_core::sql_ast::Expr::Cast { expr, .. } => eval_expr(expr, columns, row),
+        fp_core::sql_ast::Expr::Function(func) => {
+            let name = func.name.to_string().to_ascii_lowercase();
+            if func.args.len() != 1 {
+                return Ok(ScalarValue::Null);
+            }
+            let arg = match &func.args[0] {
+                fp_core::sql_ast::FunctionArg::Unnamed(
+                    fp_core::sql_ast::FunctionArgExpr::Expr(inner),
+                ) => eval_expr(inner, columns, row)?,
+            };
+            match name.as_str() {
+                "tofloat64" => Ok(to_float(arg).map(ScalarValue::Float64).unwrap_or(ScalarValue::Null)),
+                "toint64" => Ok(to_int(arg).map(ScalarValue::Int64).unwrap_or(ScalarValue::Null)),
+                _ => Ok(ScalarValue::Null),
+            }
+        }
+        _ => Ok(ScalarValue::Null),
     }
 }
 
+fn apply_binary(left: ScalarValue, right: ScalarValue, op: &fp_core::sql_ast::BinaryOperator) -> anyhow::Result<ScalarValue> {
+    use fp_core::sql_ast::BinaryOperator as BinOp;
+    match op {
+        BinOp::Plus | BinOp::Minus | BinOp::Multiply | BinOp::Divide => {
+            let l = to_float(left);
+            let r = to_float(right);
+            if let (Some(l), Some(r)) = (l, r) {
+                let out = match op {
+                    BinOp::Plus => l + r,
+                    BinOp::Minus => l - r,
+                    BinOp::Multiply => l * r,
+                    BinOp::Divide => l / r,
+                    _ => l,
+                };
+                Ok(ScalarValue::Float64(out))
+            } else {
+                Ok(ScalarValue::Null)
+            }
+        }
+        _ => Ok(ScalarValue::Null),
+    }
+}
+
+fn to_float(value: ScalarValue) -> Option<f64> {
+    match value {
+        ScalarValue::Int64(v) => Some(v as f64),
+        ScalarValue::Float64(v) => Some(v),
+        ScalarValue::String(s) => s.parse().ok(),
+        ScalarValue::Bool(v) => Some(if v { 1.0 } else { 0.0 }),
+        ScalarValue::Null => None,
+    }
+}
+
+fn to_int(value: ScalarValue) -> Option<i64> {
+    match value {
+        ScalarValue::Int64(v) => Some(v),
+        ScalarValue::Float64(v) => Some(v as i64),
+        ScalarValue::String(s) => s.parse().ok(),
+        ScalarValue::Bool(v) => Some(if v { 1 } else { 0 }),
+        ScalarValue::Null => None,
+    }
+}
+
+fn expected_columns(plan: &PlanAnalysis) -> Vec<String> {
+    if plan.has_wildcard || plan.output_columns.is_empty() || plan.projection_exprs {
+        return plan.cfg.columns.clone();
+    }
+    if !plan.aggregates.is_empty() {
+        return plan.output_columns.clone();
+    }
+    if !plan.output_items.is_empty() {
+        let mut cols = Vec::with_capacity(plan.output_items.len());
+        for item in &plan.output_items {
+            match item {
+                OutputItem::Column { source, .. } => cols.push(source.clone()),
+                OutputItem::Aggregate(_) => cols.push(String::new()),
+                OutputItem::Expr { .. } => {}
+            }
+        }
+        if !cols.is_empty() && cols.iter().all(|c| !c.is_empty()) {
+            return cols;
+        }
+    }
+    plan.output_columns.clone()
+}
+
 fn expected_column_types(plan: &PlanAnalysis) -> Vec<ColumnType> {
-    if plan.has_wildcard || plan.output_types.is_empty() {
+    if plan.has_wildcard || plan.output_types.is_empty() || plan.projection_exprs {
         let columns = expected_columns(plan);
-        columns
+        return columns
             .iter()
             .map(|col| {
                 plan.cfg
@@ -1675,10 +2003,9 @@ fn expected_column_types(plan: &PlanAnalysis) -> Vec<ColumnType> {
                     .and_then(|idx| plan.cfg.column_types.get(idx).copied())
                     .unwrap_or(ColumnType::Text)
             })
-            .collect()
-    } else {
-        plan.output_types.clone()
+            .collect();
     }
+    plan.output_types.clone()
 }
 
 fn align_rowset_columns(mut rowset: RowSet, columns: &[String]) -> anyhow::Result<RowSet> {
@@ -2112,6 +2439,17 @@ mod scheduler_tests {
             has_wildcard: false,
             output_columns: vec!["symbol".to_string(), "ts_micros".to_string()],
             output_types: vec![ColumnType::Text, ColumnType::Int64],
+            output_items: vec![
+                OutputItem::Column {
+                    source: "symbol".to_string(),
+                    alias: "symbol".to_string(),
+                },
+                OutputItem::Column {
+                    source: "ts_micros".to_string(),
+                    alias: "ts_micros".to_string(),
+                },
+            ],
+            projection_exprs: false,
             group_by: Vec::new(),
             aggregates: Vec::new(),
             offset: None,
@@ -2242,6 +2580,8 @@ mod scheduler_tests {
             has_wildcard: true,
             output_columns: Vec::new(),
             output_types: Vec::new(),
+            output_items: Vec::new(),
+            projection_exprs: false,
             group_by: Vec::new(),
             aggregates: Vec::new(),
             offset: None,

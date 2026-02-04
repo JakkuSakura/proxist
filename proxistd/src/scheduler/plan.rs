@@ -22,6 +22,9 @@ pub struct TablePlan {
 pub enum AggregateKind {
     Count,
     Sum,
+    Min,
+    Max,
+    Avg,
 }
 
 #[derive(Debug, Clone)]
@@ -33,8 +36,15 @@ pub struct AggregateExpr {
 
 #[derive(Debug, Clone)]
 pub enum OutputItem {
-    Column(String),
+    Column {
+        source: String,
+        alias: String,
+    },
     Aggregate(AggregateExpr),
+    Expr {
+        expr: Expr,
+        alias: String,
+    },
 }
 
 pub fn rewrite_with_bounds(
@@ -233,7 +243,10 @@ pub fn build_table_plan(stmt: &Statement) -> Option<TablePlan> {
                         return Some(TablePlan::unsupported(table));
                     }
                     select_cols.push(column.clone());
-                    output_items.push(OutputItem::Column(column));
+                    output_items.push(OutputItem::Column {
+                        source: column.clone(),
+                        alias: column,
+                    });
                 } else {
                     return Some(TablePlan::unsupported(table));
                 }
@@ -241,9 +254,6 @@ pub fn build_table_plan(stmt: &Statement) -> Option<TablePlan> {
             SelectItem::ExprWithAlias { expr, alias } => {
                 if let Some(column) = order_expr_ident(expr) {
                     let alias_lower = alias.value.to_ascii_lowercase();
-                    if alias_lower != column {
-                        return Some(TablePlan::unsupported(table));
-                    }
                     if !group_by_cols.is_empty()
                         && !group_by_cols
                             .iter()
@@ -252,7 +262,10 @@ pub fn build_table_plan(stmt: &Statement) -> Option<TablePlan> {
                         return Some(TablePlan::unsupported(table));
                     }
                     select_cols.push(column.clone());
-                    output_items.push(OutputItem::Column(column));
+                    output_items.push(OutputItem::Column {
+                        source: column,
+                        alias: alias_lower,
+                    });
                 } else if let Expr::Function(func) = expr {
                     let alias_lower = alias.value.to_ascii_lowercase();
                     let Some((kind, column)) = parse_aggregate(func) else {
@@ -266,7 +279,15 @@ pub fn build_table_plan(stmt: &Statement) -> Option<TablePlan> {
                     aggregates.push(aggregate.clone());
                     output_items.push(OutputItem::Aggregate(aggregate));
                 } else {
-                    return Some(TablePlan::unsupported(table));
+                    let alias_lower = alias.value.to_ascii_lowercase();
+                    if is_simple_expr(expr) {
+                        output_items.push(OutputItem::Expr {
+                            expr: expr.clone(),
+                            alias: alias_lower,
+                        });
+                    } else {
+                        return Some(TablePlan::unsupported(table));
+                    }
                 }
             }
         }
@@ -342,6 +363,26 @@ fn order_expr_ident(expr: &Expr) -> Option<String> {
             parts.last().map(|ident| ident.value.to_ascii_lowercase())
         }
         _ => None,
+    }
+}
+
+fn is_simple_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => true,
+        Expr::Nested(inner) => is_simple_expr(inner),
+        Expr::UnaryOp { expr, .. } => is_simple_expr(expr),
+        Expr::BinaryOp { left, right, .. } => is_simple_expr(left) && is_simple_expr(right),
+        Expr::Cast { expr, .. } => is_simple_expr(expr),
+        Expr::Function(func) => {
+            let name = func.name.to_string().to_ascii_lowercase();
+            matches!(name.as_str(), "tofloat64" | "toint64")
+                && func.args.len() == 1
+                && matches!(
+                    func.args[0],
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(_))
+                )
+        }
+        _ => false,
     }
 }
 
@@ -526,6 +567,36 @@ fn parse_aggregate(func: &fp_core::sql_ast::Function) -> Option<(AggregateKind, 
             match &func.args[0] {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
                     order_expr_ident(expr).map(|col| (AggregateKind::Sum, Some(col)))
+                }
+            }
+        }
+        "min" => {
+            if func.args.len() != 1 {
+                return None;
+            }
+            match &func.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                    order_expr_ident(expr).map(|col| (AggregateKind::Min, Some(col)))
+                }
+            }
+        }
+        "max" => {
+            if func.args.len() != 1 {
+                return None;
+            }
+            match &func.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                    order_expr_ident(expr).map(|col| (AggregateKind::Max, Some(col)))
+                }
+            }
+        }
+        "avg" => {
+            if func.args.len() != 1 {
+                return None;
+            }
+            match &func.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                    order_expr_ident(expr).map(|col| (AggregateKind::Avg, Some(col)))
                 }
             }
         }
