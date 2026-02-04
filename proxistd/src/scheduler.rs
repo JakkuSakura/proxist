@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 mod plan;
 use plan::{
-    build_table_plan, parse_table_schema_from_ddl, rewrite_with_bounds, OrderItem, Predicate,
+    build_table_plan, parse_table_schema_from_ddl, rewrite_with_bounds, AggregateKind, OrderItem,
+    OutputItem, Predicate,
 };
 use fp_core::query::SqlDialect;
 use fp_sql::sql_ast::parse_sql_ast;
@@ -296,9 +297,13 @@ impl SqlExecutor for ProxistScheduler {
                         }
                         // fall through to default executors if ClickHouse is unavailable
                     } else {
-                        let limit_hint = plan
-                            .limit
-                            .map(|limit| limit.saturating_add(plan.offset.unwrap_or(0)));
+                        let has_aggregates = !plan.aggregates.is_empty() || !plan.group_by.is_empty();
+                        let limit_hint = if has_aggregates {
+                            None
+                        } else {
+                            plan.limit
+                                .map(|limit| limit.saturating_add(plan.offset.unwrap_or(0)))
+                        };
 
                         let cutoff = self.persisted_cutoff_micros.load(Ordering::SeqCst);
                         let mut cold_rows: Option<RowSet> = None;
@@ -391,31 +396,48 @@ impl SqlExecutor for ProxistScheduler {
                                 select.start = micros_to_system_time(hot_lo);
                                 let rows = load_hot_rows(hot, &select, &plan.table).await?;
                                 if !rows.is_empty() {
-                                    hot_rows = Some(project_hot_rows(rows, &plan));
+                                    hot_rows = Some(if has_aggregates {
+                                        aggregate_hot_rows(rows, &plan)?
+                                    } else {
+                                        project_hot_rows(rows, &plan)
+                                    });
                                 }
                             }
                         } else {
                             let rows = load_hot_rows(hot, &plan.select, &plan.table).await?;
                             if !rows.is_empty() {
-                                hot_rows = Some(project_hot_rows(rows, &plan));
+                                hot_rows = Some(if has_aggregates {
+                                    aggregate_hot_rows(rows, &plan)?
+                                } else {
+                                    project_hot_rows(rows, &plan)
+                                });
                             }
                         }
 
-                            if !plan_failed && (cold_rows.is_some() || hot_rows.is_some()) {
+                        if !plan_failed && (cold_rows.is_some() || hot_rows.is_some()) {
+                            let merged = if has_aggregates {
+                                merge_aggregate_rows(cold_rows, hot_rows, &plan)?
+                            } else {
                                 let cold_sorted = plan.order_by.first().is_some();
-                                let merged = merge_rows(cold_rows, hot_rows, &plan, cold_sorted)?;
-                                let sliced = apply_offset_limit(merged, plan.offset, plan.limit);
-                                if matches!(
-                                    requested_format,
-                                    ClickhouseWireFormat::RowBinaryWithNamesAndTypes
-                                ) {
-                                    let body = render_rowbinary_rows(&sliced);
-                                    return Ok(SqlResult::Clickhouse(ClickhouseWire::rowbinary(
-                                        body,
-                                    )));
-                                }
-                                return Ok(SqlResult::TypedRows(sliced));
+                                merge_rows(cold_rows, hot_rows, &plan, cold_sorted)?
+                            };
+                            let ordered = if has_aggregates && !plan.order_by.is_empty() {
+                                sort_rowset(merged, &plan)?
+                            } else {
+                                merged
+                            };
+                            let sliced = apply_offset_limit(ordered, plan.offset, plan.limit);
+                            if matches!(
+                                requested_format,
+                                ClickhouseWireFormat::RowBinaryWithNamesAndTypes
+                            ) {
+                                let body = render_rowbinary_rows(&sliced);
+                                return Ok(SqlResult::Clickhouse(ClickhouseWire::rowbinary(
+                                    body,
+                                )));
                             }
+                            return Ok(SqlResult::TypedRows(sliced));
+                        }
                     }
                 }
             }
@@ -583,10 +605,23 @@ struct PlanAnalysis {
     cfg: TableConfig,
     select: SimpleSelect,
     order_by: Vec<OrderItem>,
-    select_cols: Vec<String>,
     has_wildcard: bool,
+    output_columns: Vec<String>,
+    output_types: Vec<ColumnType>,
+    group_by: Vec<String>,
+    aggregates: Vec<ResolvedAggregate>,
     offset: Option<usize>,
     limit: Option<usize>,
+}
+
+#[derive(Clone)]
+struct ResolvedAggregate {
+    kind: AggregateKind,
+    column: Option<String>,
+    source_index: Option<usize>,
+    output_type: ColumnType,
+    output_index: usize,
+    slot: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -674,20 +709,86 @@ fn analyze_select(stmt: &fp_core::sql_ast::Statement, registry: &TableRegistry) 
         }
     }
 
-    let select_cols = plan.select_cols.clone();
+    let mut output_columns = Vec::new();
+    let mut output_types = Vec::new();
+    let mut aggregates = Vec::new();
     let has_wildcard = plan.has_wildcard;
 
-    if !has_wildcard {
-        if select_cols.is_empty() {
-            return None;
-        }
-        for col in &select_cols {
-            if !cfg.columns.contains(col) {
-                return None;
+    if has_wildcard || plan.output_items.is_empty() {
+        output_columns = cfg.columns.clone();
+        output_types = cfg.column_types.clone();
+    } else {
+        for (idx, item) in plan.output_items.iter().enumerate() {
+            match item {
+                OutputItem::Column(name) => {
+                    let pos = cfg
+                        .columns
+                        .iter()
+                        .position(|col| col.eq_ignore_ascii_case(name))?;
+                    let ty = cfg.column_types.get(pos).copied().unwrap_or(ColumnType::Text);
+                    output_columns.push(name.clone());
+                    output_types.push(ty);
+                }
+                OutputItem::Aggregate(agg) => {
+                    let source_index = agg
+                        .column
+                        .as_ref()
+                        .and_then(|col| {
+                            cfg.columns
+                                .iter()
+                                .position(|name| name.eq_ignore_ascii_case(col))
+                        });
+                    let output_type = match agg.kind {
+                        AggregateKind::Count => ColumnType::Int64,
+                        AggregateKind::Sum => source_index
+                            .and_then(|pos| cfg.column_types.get(pos).copied())
+                            .unwrap_or(ColumnType::Float64),
+                    };
+                    output_columns.push(agg.alias.clone());
+                    output_types.push(output_type);
+                    let slot = aggregates.len();
+                    aggregates.push(ResolvedAggregate {
+                        kind: agg.kind,
+                        column: agg.column.clone(),
+                        source_index,
+                        output_type,
+                        output_index: idx,
+                        slot,
+                    });
+                }
             }
         }
-        if !plan.order_by.is_empty() && !select_cols.contains(&order_col) {
+    }
+
+    if !has_wildcard && output_columns.is_empty() {
+        return None;
+    }
+    for col in &plan.group_by {
+        if !cfg.columns.iter().any(|name| name.eq_ignore_ascii_case(col)) {
             return None;
+        }
+    }
+    for agg in &aggregates {
+        if plan
+            .group_by
+            .iter()
+            .any(|col| col.eq_ignore_ascii_case(&output_columns[agg.output_index]))
+        {
+            return None;
+        }
+    }
+    if plan.aggregates.is_empty() && plan.group_by.is_empty() {
+        if !plan.order_by.is_empty() && !output_columns.contains(&order_col) {
+            return None;
+        }
+    } else {
+        for order in &plan.order_by {
+            if !output_columns
+                .iter()
+                .any(|col| col.eq_ignore_ascii_case(&order.column))
+            {
+                return None;
+            }
         }
     }
 
@@ -701,8 +802,11 @@ fn analyze_select(stmt: &fp_core::sql_ast::Statement, registry: &TableRegistry) 
             end,
         },
         order_by: plan.order_by,
-        select_cols,
         has_wildcard,
+        output_columns,
+        output_types,
+        group_by: plan.group_by,
+        aggregates,
         offset: plan.offset,
         limit: plan.limit,
     })
@@ -1215,27 +1319,366 @@ fn project_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> RowSet {
     }
 }
 
+#[derive(Clone)]
+enum AggregateState {
+    Int64(i64),
+    Float64(f64),
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct GroupKey(Vec<String>);
+
+fn aggregate_hot_rows(rows: Vec<HotRowFlat>, plan: &PlanAnalysis) -> anyhow::Result<RowSet> {
+    let mut group_indices = Vec::with_capacity(plan.group_by.len());
+    let mut group_types = Vec::with_capacity(plan.group_by.len());
+    for col in &plan.group_by {
+        let idx = plan
+            .cfg
+            .columns
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(col));
+        group_indices.push(idx);
+        let ty = idx
+            .and_then(|pos| plan.cfg.column_types.get(pos).copied())
+            .unwrap_or(ColumnType::Text);
+        group_types.push(ty);
+    }
+
+    let mut groups: HashMap<GroupKey, (Vec<ScalarValue>, Vec<AggregateState>)> = HashMap::new();
+    for row in rows {
+        let mut group_values = Vec::with_capacity(group_indices.len());
+        let mut key_parts = Vec::with_capacity(group_indices.len());
+        for (idx, ty) in group_indices.iter().zip(group_types.iter().copied()) {
+            let value = idx
+                .and_then(|pos| row.values.get(pos))
+                .map(|v| bytes_to_scalar(v, ty))
+                .unwrap_or(ScalarValue::Null);
+            key_parts.push(scalar_key(&value));
+            group_values.push(value);
+        }
+        let key = GroupKey(key_parts);
+        let entry = groups.entry(key).or_insert_with(|| {
+            let mut init = Vec::with_capacity(plan.aggregates.len());
+            for agg in &plan.aggregates {
+                let state = match agg.output_type {
+                    ColumnType::Int64 => AggregateState::Int64(0),
+                    ColumnType::Float64 => AggregateState::Float64(0.0),
+                    ColumnType::Bool | ColumnType::Text => AggregateState::Int64(0),
+                };
+                init.push(state);
+            }
+            (group_values.clone(), init)
+        });
+
+        for agg in &plan.aggregates {
+            match agg.kind {
+                AggregateKind::Count => {
+                    if let Some(col_idx) = agg.source_index {
+                        let ty = plan
+                            .cfg
+                            .column_types
+                            .get(col_idx)
+                            .copied()
+                            .unwrap_or(ColumnType::Text);
+                        let value = row
+                            .values
+                            .get(col_idx)
+                            .map(|v| bytes_to_scalar(v, ty))
+                            .unwrap_or(ScalarValue::Null);
+                        if !matches!(value, ScalarValue::Null) {
+                            if let AggregateState::Int64(ref mut v) =
+                                entry.1[agg.slot]
+                            {
+                                *v += 1;
+                            }
+                        }
+                    } else if let AggregateState::Int64(ref mut v) = entry.1[agg.slot] {
+                        *v += 1;
+                    }
+                }
+                AggregateKind::Sum => {
+                    let Some(col_idx) = agg.source_index else {
+                        continue;
+                    };
+                    let ty = plan
+                        .cfg
+                        .column_types
+                        .get(col_idx)
+                        .copied()
+                        .unwrap_or(ColumnType::Text);
+                    let value = row
+                        .values
+                        .get(col_idx)
+                        .map(|v| bytes_to_scalar(v, ty))
+                        .unwrap_or(ScalarValue::Null);
+                    match (&mut entry.1[agg.slot], value) {
+                        (AggregateState::Int64(ref mut v), ScalarValue::Int64(n)) => {
+                            *v += n;
+                        }
+                        (AggregateState::Int64(ref mut v), ScalarValue::Float64(n)) => {
+                            *v += n as i64;
+                        }
+                        (AggregateState::Int64(ref mut v), ScalarValue::String(s)) => {
+                            if let Ok(parsed) = s.parse::<i64>() {
+                                *v += parsed;
+                            }
+                        }
+                        (AggregateState::Float64(ref mut v), ScalarValue::Int64(n)) => {
+                            *v += n as f64;
+                        }
+                        (AggregateState::Float64(ref mut v), ScalarValue::Float64(n)) => {
+                            *v += n;
+                        }
+                        (AggregateState::Float64(ref mut v), ScalarValue::String(s)) => {
+                            if let Ok(parsed) = s.parse::<f64>() {
+                                *v += parsed;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(aggregate_groups_to_rowset(groups, plan))
+}
+
+fn merge_aggregate_rows(
+    cold: Option<RowSet>,
+    hot: Option<RowSet>,
+    plan: &PlanAnalysis,
+) -> anyhow::Result<RowSet> {
+    let expected = expected_columns(plan);
+    let expected_types = expected_column_types(plan);
+    let mut cold = cold.unwrap_or_else(|| RowSet {
+        columns: expected.clone(),
+        column_types: expected_types.clone(),
+        rows: Vec::new(),
+    });
+    let mut hot = hot.unwrap_or_else(|| RowSet {
+        columns: expected.clone(),
+        column_types: expected_types.clone(),
+        rows: Vec::new(),
+    });
+
+    if cold.columns != expected {
+        cold = align_rowset_columns(cold, &expected)?;
+    }
+    if hot.columns != expected {
+        hot = align_rowset_columns(hot, &expected)?;
+    }
+
+    let mut groups: HashMap<GroupKey, (Vec<ScalarValue>, Vec<AggregateState>)> = HashMap::new();
+    merge_rowset_into_groups(&mut groups, cold, plan)?;
+    merge_rowset_into_groups(&mut groups, hot, plan)?;
+    Ok(aggregate_groups_to_rowset(groups, plan))
+}
+
+fn merge_rowset_into_groups(
+    groups: &mut HashMap<GroupKey, (Vec<ScalarValue>, Vec<AggregateState>)>,
+    rowset: RowSet,
+    plan: &PlanAnalysis,
+) -> anyhow::Result<()> {
+    let mut group_indices = Vec::with_capacity(plan.group_by.len());
+    for col in &plan.group_by {
+        let idx = rowset
+            .columns
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(col))
+            .ok_or_else(|| anyhow!("missing group-by column in result set"))?;
+        group_indices.push(idx);
+    }
+    for row in rowset.rows {
+        let mut group_values = Vec::with_capacity(group_indices.len());
+        let mut key_parts = Vec::with_capacity(group_indices.len());
+        for idx in &group_indices {
+            let value = row.get(*idx).cloned().unwrap_or(ScalarValue::Null);
+            key_parts.push(scalar_key(&value));
+            group_values.push(value);
+        }
+        let key = GroupKey(key_parts);
+        let entry = groups.entry(key).or_insert_with(|| {
+            let mut init = Vec::with_capacity(plan.aggregates.len());
+            for agg in &plan.aggregates {
+                let state = match agg.output_type {
+                    ColumnType::Int64 => AggregateState::Int64(0),
+                    ColumnType::Float64 => AggregateState::Float64(0.0),
+                    ColumnType::Bool | ColumnType::Text => AggregateState::Int64(0),
+                };
+                init.push(state);
+            }
+            (group_values.clone(), init)
+        });
+
+        for agg in &plan.aggregates {
+            let value = row
+                .get(agg.output_index)
+                .cloned()
+                .unwrap_or(ScalarValue::Null);
+            match (agg.kind, &mut entry.1[agg.slot], value) {
+                (AggregateKind::Count, AggregateState::Int64(ref mut v), ScalarValue::Int64(n)) => {
+                    *v += n;
+                }
+                (AggregateKind::Count, AggregateState::Int64(ref mut v), ScalarValue::Float64(n)) => {
+                    *v += n as i64;
+                }
+                (AggregateKind::Count, AggregateState::Int64(ref mut v), ScalarValue::String(s)) => {
+                    if let Ok(parsed) = s.parse::<i64>() {
+                        *v += parsed;
+                    }
+                }
+                (AggregateKind::Count, AggregateState::Int64(ref mut v), ScalarValue::Null) => {
+                    let _ = v;
+                }
+                (AggregateKind::Sum, AggregateState::Int64(ref mut v), ScalarValue::Int64(n)) => {
+                    *v += n;
+                }
+                (AggregateKind::Sum, AggregateState::Int64(ref mut v), ScalarValue::Float64(n)) => {
+                    *v += n as i64;
+                }
+                (AggregateKind::Sum, AggregateState::Int64(ref mut v), ScalarValue::String(s)) => {
+                    if let Ok(parsed) = s.parse::<i64>() {
+                        *v += parsed;
+                    }
+                }
+                (AggregateKind::Sum, AggregateState::Float64(ref mut v), ScalarValue::Int64(n)) => {
+                    *v += n as f64;
+                }
+                (AggregateKind::Sum, AggregateState::Float64(ref mut v), ScalarValue::Float64(n)) => {
+                    *v += n;
+                }
+                (AggregateKind::Sum, AggregateState::Float64(ref mut v), ScalarValue::String(s)) => {
+                    if let Ok(parsed) = s.parse::<f64>() {
+                        *v += parsed;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn aggregate_groups_to_rowset(
+    groups: HashMap<GroupKey, (Vec<ScalarValue>, Vec<AggregateState>)>,
+    plan: &PlanAnalysis,
+) -> RowSet {
+    let mut agg_by_output = vec![None; plan.output_columns.len()];
+    for agg in &plan.aggregates {
+        agg_by_output[agg.output_index] = Some(agg.slot);
+    }
+
+    let mut group_index_map = HashMap::new();
+    for (idx, name) in plan.group_by.iter().enumerate() {
+        group_index_map.insert(name.to_ascii_lowercase(), idx);
+    }
+
+    let mut rows = Vec::with_capacity(groups.len());
+    for (_key, (group_values, agg_values)) in groups {
+        let mut row = Vec::with_capacity(plan.output_columns.len());
+        for (idx, name) in plan.output_columns.iter().enumerate() {
+            if let Some(gidx) = group_index_map.get(&name.to_ascii_lowercase()) {
+                row.push(group_values.get(*gidx).cloned().unwrap_or(ScalarValue::Null));
+                continue;
+            }
+            if let Some(slot) = agg_by_output[idx] {
+                let value = match agg_values.get(slot) {
+                    Some(AggregateState::Int64(v)) => ScalarValue::Int64(*v),
+                    Some(AggregateState::Float64(v)) => ScalarValue::Float64(*v),
+                    None => ScalarValue::Null,
+                };
+                row.push(value);
+            } else {
+                row.push(ScalarValue::Null);
+            }
+        }
+        rows.push(row);
+    }
+    RowSet {
+        columns: plan.output_columns.clone(),
+        column_types: plan.output_types.clone(),
+        rows,
+    }
+}
+
+fn sort_rowset(mut rowset: RowSet, plan: &PlanAnalysis) -> anyhow::Result<RowSet> {
+    if plan.order_by.is_empty() {
+        return Ok(rowset);
+    }
+    let mut order_indices = Vec::with_capacity(plan.order_by.len());
+    for order in &plan.order_by {
+        let idx = rowset
+            .columns
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(&order.column))
+            .ok_or_else(|| anyhow!("missing order column in result set"))?;
+        order_indices.push((idx, order.descending));
+    }
+    rowset.rows.sort_by(|a, b| {
+        for (idx, desc) in &order_indices {
+            let left = a.get(*idx).unwrap_or(&ScalarValue::Null);
+            let right = b.get(*idx).unwrap_or(&ScalarValue::Null);
+            let cmp = compare_scalar(left, right);
+            if cmp != std::cmp::Ordering::Equal {
+                return if *desc { cmp.reverse() } else { cmp };
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    Ok(rowset)
+}
+
+fn compare_scalar(left: &ScalarValue, right: &ScalarValue) -> std::cmp::Ordering {
+    match (left, right) {
+        (ScalarValue::Null, ScalarValue::Null) => std::cmp::Ordering::Equal,
+        (ScalarValue::Null, _) => std::cmp::Ordering::Greater,
+        (_, ScalarValue::Null) => std::cmp::Ordering::Less,
+        (ScalarValue::Int64(a), ScalarValue::Int64(b)) => a.cmp(b),
+        (ScalarValue::Float64(a), ScalarValue::Float64(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+        (ScalarValue::Bool(a), ScalarValue::Bool(b)) => a.cmp(b),
+        (ScalarValue::String(a), ScalarValue::String(b)) => a.cmp(b),
+        (ScalarValue::Int64(a), ScalarValue::Float64(b)) => (*a as f64).partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+        (ScalarValue::Float64(a), ScalarValue::Int64(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(std::cmp::Ordering::Equal),
+        (a, b) => format!("{a:?}").cmp(&format!("{b:?}")),
+    }
+}
+
+fn scalar_key(value: &ScalarValue) -> String {
+    match value {
+        ScalarValue::Null => "null".to_string(),
+        ScalarValue::String(s) => format!("s:{s}"),
+        ScalarValue::Int64(v) => format!("i:{v}"),
+        ScalarValue::Float64(v) => format!("f:{v}"),
+        ScalarValue::Bool(v) => format!("b:{v}"),
+    }
+}
+
 fn expected_columns(plan: &PlanAnalysis) -> Vec<String> {
-    if plan.has_wildcard || plan.select_cols.is_empty() {
+    if plan.has_wildcard || plan.output_columns.is_empty() {
         plan.cfg.columns.clone()
     } else {
-        plan.select_cols.clone()
+        plan.output_columns.clone()
     }
 }
 
 fn expected_column_types(plan: &PlanAnalysis) -> Vec<ColumnType> {
-    let columns = expected_columns(plan);
-    columns
-        .iter()
-        .map(|col| {
-            plan.cfg
-                .columns
-                .iter()
-                .position(|name| name.eq_ignore_ascii_case(col))
-                .and_then(|idx| plan.cfg.column_types.get(idx).copied())
-                .unwrap_or(ColumnType::Text)
-        })
-        .collect()
+    if plan.has_wildcard || plan.output_types.is_empty() {
+        let columns = expected_columns(plan);
+        columns
+            .iter()
+            .map(|col| {
+                plan.cfg
+                    .columns
+                    .iter()
+                    .position(|name| name.eq_ignore_ascii_case(col))
+                    .and_then(|idx| plan.cfg.column_types.get(idx).copied())
+                    .unwrap_or(ColumnType::Text)
+            })
+            .collect()
+    } else {
+        plan.output_types.clone()
+    }
 }
 
 fn align_rowset_columns(mut rowset: RowSet, columns: &[String]) -> anyhow::Result<RowSet> {
@@ -1666,8 +2109,11 @@ mod scheduler_tests {
                 column: "ts_micros".to_string(),
                 descending: false,
             }],
-            select_cols: vec!["symbol".to_string(), "ts_micros".to_string()],
             has_wildcard: false,
+            output_columns: vec!["symbol".to_string(), "ts_micros".to_string()],
+            output_types: vec![ColumnType::Text, ColumnType::Int64],
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
             offset: None,
             limit: None,
         };
@@ -1793,8 +2239,11 @@ mod scheduler_tests {
                 column: "ts_micros".to_string(),
                 descending: false,
             }],
-            select_cols: vec![],
             has_wildcard: true,
+            output_columns: Vec::new(),
+            output_types: Vec::new(),
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
             offset: None,
             limit: None,
         };

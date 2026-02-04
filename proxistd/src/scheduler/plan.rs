@@ -1,6 +1,6 @@
 use fp_core::sql_ast::{
-    BinaryOperator as BinOp, Expr, GroupByExpr, Ident, SelectItem, SetExpr, Statement, TableFactor,
-    Value,
+    BinaryOperator as BinOp, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident, SelectItem,
+    SetExpr, Statement, TableFactor, Value,
 };
 
 #[derive(Debug, Clone)]
@@ -10,9 +10,31 @@ pub struct TablePlan {
     pub order_by: Vec<OrderItem>,
     pub select_cols: Vec<String>,
     pub has_wildcard: bool,
+    pub output_items: Vec<OutputItem>,
+    pub group_by: Vec<String>,
+    pub aggregates: Vec<AggregateExpr>,
     pub offset: Option<usize>,
     pub limit: Option<usize>,
     pub supports_hot: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateKind {
+    Count,
+    Sum,
+}
+
+#[derive(Debug, Clone)]
+pub struct AggregateExpr {
+    pub kind: AggregateKind,
+    pub column: Option<String>,
+    pub alias: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum OutputItem {
+    Column(String),
+    Aggregate(AggregateExpr),
 }
 
 pub fn rewrite_with_bounds(
@@ -176,13 +198,11 @@ pub fn build_table_plan(stmt: &Statement) -> Option<TablePlan> {
         _ => return Some(TablePlan::cold()),
     };
 
-    if !select.from[0].joins.is_empty()
-        || select.distinct.is_some()
-        || has_group_by(&select.group_by)
-        || select.having.is_some()
-    {
+    if !select.from[0].joins.is_empty() || select.distinct.is_some() || select.having.is_some() {
         return Some(TablePlan::unsupported(table));
     }
+
+    let group_by_cols = collect_group_by(&select.group_by)?;
 
     let mut filters = Vec::new();
     let selection_supported = if let Some(selection) = &select.selection {
@@ -192,15 +212,28 @@ pub fn build_table_plan(stmt: &Statement) -> Option<TablePlan> {
     };
 
     let mut select_cols = Vec::new();
+    let mut output_items = Vec::new();
+    let mut aggregates = Vec::new();
     let mut has_wildcard = false;
     for item in &select.projection {
         match item {
             SelectItem::Wildcard => {
+                if !group_by_cols.is_empty() {
+                    return Some(TablePlan::unsupported(table));
+                }
                 has_wildcard = true;
             }
             SelectItem::UnnamedExpr(expr) => {
                 if let Some(column) = order_expr_ident(expr) {
-                    select_cols.push(column);
+                    if !group_by_cols.is_empty()
+                        && !group_by_cols
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&column))
+                    {
+                        return Some(TablePlan::unsupported(table));
+                    }
+                    select_cols.push(column.clone());
+                    output_items.push(OutputItem::Column(column));
                 } else {
                     return Some(TablePlan::unsupported(table));
                 }
@@ -211,7 +244,27 @@ pub fn build_table_plan(stmt: &Statement) -> Option<TablePlan> {
                     if alias_lower != column {
                         return Some(TablePlan::unsupported(table));
                     }
-                    select_cols.push(column);
+                    if !group_by_cols.is_empty()
+                        && !group_by_cols
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&column))
+                    {
+                        return Some(TablePlan::unsupported(table));
+                    }
+                    select_cols.push(column.clone());
+                    output_items.push(OutputItem::Column(column));
+                } else if let Expr::Function(func) = expr {
+                    let alias_lower = alias.value.to_ascii_lowercase();
+                    let Some((kind, column)) = parse_aggregate(func) else {
+                        return Some(TablePlan::unsupported(table));
+                    };
+                    let aggregate = AggregateExpr {
+                        kind,
+                        column,
+                        alias: alias_lower.clone(),
+                    };
+                    aggregates.push(aggregate.clone());
+                    output_items.push(OutputItem::Aggregate(aggregate));
                 } else {
                     return Some(TablePlan::unsupported(table));
                 }
@@ -257,15 +310,28 @@ pub fn build_table_plan(stmt: &Statement) -> Option<TablePlan> {
         order_by,
         select_cols,
         has_wildcard,
+        output_items,
+        group_by: group_by_cols,
+        aggregates,
         offset,
         limit,
         supports_hot,
     })
 }
 
-fn has_group_by(group_by: &GroupByExpr) -> bool {
+fn collect_group_by(group_by: &GroupByExpr) -> Option<Vec<String>> {
     match group_by {
-        GroupByExpr::Expressions(exprs) => !exprs.is_empty(),
+        GroupByExpr::Expressions(exprs) => {
+            let mut out = Vec::new();
+            for expr in exprs {
+                if let Some(name) = order_expr_ident(expr) {
+                    out.push(name);
+                } else {
+                    return None;
+                }
+            }
+            Some(out)
+        }
     }
 }
 
@@ -287,6 +353,9 @@ impl TablePlan {
             order_by: Vec::new(),
             select_cols: Vec::new(),
             has_wildcard: false,
+            output_items: Vec::new(),
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
             offset: None,
             limit: None,
             supports_hot: false,
@@ -300,6 +369,9 @@ impl TablePlan {
             order_by: Vec::new(),
             select_cols: Vec::new(),
             has_wildcard: false,
+            output_items: Vec::new(),
+            group_by: Vec::new(),
+            aggregates: Vec::new(),
             offset: None,
             limit: None,
             supports_hot: false,
@@ -423,6 +495,40 @@ fn literal_i64(expr: &Expr) -> Option<i64> {
         Expr::Value(Value::SingleQuotedString(s)) => s.parse().ok(),
         Expr::Value(Value::DoubleQuotedString(s)) => s.parse().ok(),
         Expr::Value(Value::UnquotedString(s)) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn parse_aggregate(func: &fp_core::sql_ast::Function) -> Option<(AggregateKind, Option<String>)> {
+    let name = func.name.to_string().to_ascii_lowercase();
+    match name.as_str() {
+        "count" => {
+            if func.args.is_empty() {
+                return Some((AggregateKind::Count, None));
+            }
+            if func.args.len() != 1 {
+                return None;
+            }
+            match &func.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                    if let Some(col) = order_expr_ident(expr) {
+                        Some((AggregateKind::Count, Some(col)))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        "sum" => {
+            if func.args.len() != 1 {
+                return None;
+            }
+            match &func.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                    order_expr_ident(expr).map(|col| (AggregateKind::Sum, Some(col)))
+                }
+            }
+        }
         _ => None,
     }
 }
