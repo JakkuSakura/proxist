@@ -1197,9 +1197,7 @@ mod tests {
 
         let mut map = std::collections::HashMap::new();
         for row in summary {
-            let tenant = bytes_to_str_unchecked(&row.key0).to_string();
-            let symbol = bytes_to_str_unchecked(&row.key1).to_string();
-            map.insert((tenant, symbol), row.hot_rows);
+            map.insert((row.tenant.clone(), row.symbol.clone()), row.hot_rows);
         }
 
         assert_eq!(map.get(&("alpha".into(), "AAPL".into())), Some(&2));

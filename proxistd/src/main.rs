@@ -1777,11 +1777,13 @@ mod wal_replay_tests {
 
         let replay_store: Arc<dyn HotColumnStore> =
             Arc::new(InMemoryHotColumnStore::new(MemConfig::default()));
+        let registry = Arc::new(crate::scheduler::TableRegistry::new());
         let replay_service = Arc::new(IngestService::new(
             metadata.clone(),
             replay_store.clone(),
             None,
             Some(wal.clone()),
+            registry,
         ));
 
         replay_wal(&wal, &replay_store, &replay_service, &metadata, false).await?;
