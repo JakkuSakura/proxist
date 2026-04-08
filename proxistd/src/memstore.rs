@@ -36,6 +36,17 @@ impl MemStore {
             .and_then(|symbols| symbols.get(symbol))
             .and_then(|rows| rows.last())
     }
+
+    pub fn delete(&mut self, table: &str, symbol: &str) -> bool {
+        let Some(symbols) = self.data.get_mut(table) else {
+            return false;
+        };
+        let removed = symbols.remove(symbol).is_some();
+        if symbols.is_empty() {
+            self.data.remove(table);
+        }
+        removed
+    }
 }
 
 #[cfg(test)]
@@ -59,5 +70,16 @@ mod tests {
     fn get_last_none_for_missing_key() {
         let store = MemStore::new();
         assert!(store.get_last("ticks", "MSFT").is_none());
+    }
+
+    #[test]
+    fn delete_removes_symbol_rows() {
+        let mut store = MemStore::new();
+        store.put("ticks", "AAPL", 1, vec![0x01]);
+        store.put("ticks", "AAPL", 2, vec![0x02]);
+
+        assert!(store.delete("ticks", "AAPL"));
+        assert!(store.get_last("ticks", "AAPL").is_none());
+        assert!(!store.delete("ticks", "AAPL"));
     }
 }

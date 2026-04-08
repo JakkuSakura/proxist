@@ -13,6 +13,7 @@ pub enum Op {
     Pong = 2,
     Put = 3,
     Get = 4,
+    Delete = 5,
     Error = 255,
 }
 
@@ -23,6 +24,7 @@ impl Op {
             2 => Ok(Op::Pong),
             3 => Ok(Op::Put),
             4 => Ok(Op::Get),
+            5 => Ok(Op::Delete),
             255 => Ok(Op::Error),
             _ => Err(Error::Protocol("unknown op")),
         }
@@ -37,20 +39,19 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
-impl Frame {
-    #[cfg(test)]
-    pub fn encode(&self) -> Vec<u8> {
-        let frame_len = HEADER_LEN + self.payload.len();
-        let mut buf = Vec::with_capacity(4 + frame_len);
-        buf.extend_from_slice(&(frame_len as u32).to_le_bytes());
-        buf.extend_from_slice(&MAGIC);
-        buf.push(VERSION);
-        buf.push(self.flags);
-        buf.extend_from_slice(&self.req_id.to_le_bytes());
-        buf.push(self.op as u8);
-        buf.extend_from_slice(&self.payload);
-        buf
-    }
+pub fn encode_frame(frame: &Frame) -> Vec<u8> {
+    let frame_len = HEADER_LEN + frame.payload.len();
+    let mut buf = Vec::with_capacity(4 + frame_len);
+    buf.extend_from_slice(&(frame_len as u32).to_le_bytes());
+    let mut header = [0u8; HEADER_LEN];
+    header[0..2].copy_from_slice(&MAGIC);
+    header[2] = VERSION;
+    header[3] = frame.flags;
+    header[4..8].copy_from_slice(&frame.req_id.to_le_bytes());
+    header[8] = frame.op as u8;
+    buf.extend_from_slice(&header);
+    buf.extend_from_slice(&frame.payload);
+    buf
 }
 
 pub fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Frame>> {
@@ -119,6 +120,24 @@ pub fn encode_put_payload(table: &str, symbol: &str, ts: u64, value: &[u8]) -> R
     Ok(buf)
 }
 
+pub fn encode_get_payload(table: &str, symbol: &str) -> Result<Vec<u8>> {
+    let table_bytes = table.as_bytes();
+    let symbol_bytes = symbol.as_bytes();
+    if table_bytes.len() > u16::MAX as usize || symbol_bytes.len() > u16::MAX as usize {
+        return Err(Error::InvalidData("table/symbol too long".to_string()));
+    }
+    let mut buf = Vec::with_capacity(2 + table_bytes.len() + 2 + symbol_bytes.len());
+    buf.extend_from_slice(&(table_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(table_bytes);
+    buf.extend_from_slice(&(symbol_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(symbol_bytes);
+    Ok(buf)
+}
+
+pub fn encode_delete_payload(table: &str, symbol: &str) -> Result<Vec<u8>> {
+    encode_get_payload(table, symbol)
+}
+
 pub fn decode_put_payload<'a>(
     payload: &'a [u8],
 ) -> Result<(&'a str, &'a str, u64, &'a [u8])> {
@@ -148,6 +167,10 @@ pub fn decode_get_payload<'a>(payload: &'a [u8]) -> Result<(&'a str, &'a str)> {
     let symbol = std::str::from_utf8(symbol)
         .map_err(|_| Error::InvalidData("symbol utf8".to_string()))?;
     Ok((table, symbol))
+}
+
+pub fn decode_delete_payload<'a>(payload: &'a [u8]) -> Result<(&'a str, &'a str)> {
+    decode_get_payload(payload)
 }
 
 pub fn encode_get_response(ts: u64, value: &[u8]) -> Result<Vec<u8>> {
@@ -234,7 +257,7 @@ mod tests {
             op: Op::Ping,
             payload: vec![1, 2, 3],
         };
-        let buf = frame.encode();
+        let buf = encode_frame(&frame);
         let mut cursor = std::io::Cursor::new(buf);
         let decoded = read_frame(&mut cursor).unwrap().unwrap();
         assert_eq!(decoded.flags, 0);
@@ -251,5 +274,13 @@ mod tests {
         assert_eq!(symbol, "AAPL");
         assert_eq!(ts, 42);
         assert_eq!(value, b"v");
+    }
+
+    #[test]
+    fn delete_payload_roundtrip() {
+        let payload = encode_delete_payload("ticks", "AAPL").unwrap();
+        let (table, symbol) = decode_delete_payload(&payload).unwrap();
+        assert_eq!(table, "ticks");
+        assert_eq!(symbol, "AAPL");
     }
 }

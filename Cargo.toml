@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "proxistd",
+    "pxl-cli",
 ]
 resolver = "2"
 

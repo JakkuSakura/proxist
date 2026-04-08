@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::error::{Error, Result};
 use crate::memstore::MemStore;
 use crate::pxl::{
-    decode_get_payload, decode_put_payload, encode_error_payload, encode_get_response, Frame, Op,
+    decode_delete_payload, decode_get_payload, decode_put_payload, encode_error_payload,
+    encode_get_response, Frame, Op,
 };
 use crate::wal::Wal;
 
@@ -112,6 +113,23 @@ fn handle_frame(
                     payload: encode_error_payload("not found")?,
                 }),
             }
+        }
+        Op::Delete => {
+            let (table, symbol) = decode_delete_payload(&frame.payload)?;
+            if let Some(wal) = wal {
+                let mut wal = wal.lock().map_err(|_| Error::Protocol("wal lock"))?;
+                wal.append_delete(table, symbol)?;
+            }
+            {
+                let mut mem = mem.write().map_err(|_| Error::Protocol("mem lock"))?;
+                mem.delete(table, symbol);
+            }
+            Ok(Frame {
+                flags: 0,
+                req_id: frame.req_id,
+                op: Op::Pong,
+                payload: Vec::new(),
+            })
         }
         Op::Pong | Op::Error => Err(Error::Protocol("unexpected op")),
     }
