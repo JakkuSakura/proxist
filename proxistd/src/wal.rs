@@ -34,12 +34,12 @@ impl Wal {
     pub fn append_put(&mut self, table: &str, symbol: &str, ts: u64, value: &[u8]) -> Result<()> {
         let payload = encode_put_payload(table, symbol, ts, value)?;
         let checksum = checksum_u32(&payload);
-        let mut header = Vec::with_capacity(HEADER_LEN);
-        header.extend_from_slice(&MAGIC);
-        header.push(VERSION);
-        header.push(Op::Put as u8);
-        header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        header.extend_from_slice(&checksum.to_le_bytes());
+        let mut header = [0u8; HEADER_LEN];
+        header[0..2].copy_from_slice(&MAGIC);
+        header[2] = VERSION;
+        header[3] = Op::Put as u8;
+        header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        header[8..12].copy_from_slice(&checksum.to_le_bytes());
         self.file.write_all(&header)?;
         self.file.write_all(&payload)?;
         if self.sync {
@@ -85,7 +85,7 @@ fn replay_wal(path: &Path, mem: &mut MemStore) -> Result<()> {
         }
         if op == Op::Put {
             let (table, symbol, ts, value) = decode_put_payload(&payload)?;
-            mem.put(&table, &symbol, ts, value);
+            mem.put(table, symbol, ts, value.to_vec());
         }
         offset += (HEADER_LEN + len) as u64;
     }

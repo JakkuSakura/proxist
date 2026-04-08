@@ -119,7 +119,9 @@ pub fn encode_put_payload(table: &str, symbol: &str, ts: u64, value: &[u8]) -> R
     Ok(buf)
 }
 
-pub fn decode_put_payload(payload: &[u8]) -> Result<(String, String, u64, Vec<u8>)> {
+pub fn decode_put_payload<'a>(
+    payload: &'a [u8],
+) -> Result<(&'a str, &'a str, u64, &'a [u8])> {
     let mut offset = 0;
     let table_len = read_u16(payload, &mut offset)? as usize;
     let table = read_bytes(payload, &mut offset, table_len)?;
@@ -127,25 +129,25 @@ pub fn decode_put_payload(payload: &[u8]) -> Result<(String, String, u64, Vec<u8
     let symbol = read_bytes(payload, &mut offset, symbol_len)?;
     let ts = read_u64(payload, &mut offset)?;
     let value_len = read_u32(payload, &mut offset)? as usize;
-    let value = read_vec(payload, &mut offset, value_len)?;
-    Ok((
-        String::from_utf8(table).map_err(|_| Error::InvalidData("table utf8".to_string()))?,
-        String::from_utf8(symbol).map_err(|_| Error::InvalidData("symbol utf8".to_string()))?,
-        ts,
-        value,
-    ))
+    let value = read_bytes(payload, &mut offset, value_len)?;
+    let table = std::str::from_utf8(table)
+        .map_err(|_| Error::InvalidData("table utf8".to_string()))?;
+    let symbol = std::str::from_utf8(symbol)
+        .map_err(|_| Error::InvalidData("symbol utf8".to_string()))?;
+    Ok((table, symbol, ts, value))
 }
 
-pub fn decode_get_payload(payload: &[u8]) -> Result<(String, String)> {
+pub fn decode_get_payload<'a>(payload: &'a [u8]) -> Result<(&'a str, &'a str)> {
     let mut offset = 0;
     let table_len = read_u16(payload, &mut offset)? as usize;
     let table = read_bytes(payload, &mut offset, table_len)?;
     let symbol_len = read_u16(payload, &mut offset)? as usize;
     let symbol = read_bytes(payload, &mut offset, symbol_len)?;
-    Ok((
-        String::from_utf8(table).map_err(|_| Error::InvalidData("table utf8".to_string()))?,
-        String::from_utf8(symbol).map_err(|_| Error::InvalidData("symbol utf8".to_string()))?,
-    ))
+    let table = std::str::from_utf8(table)
+        .map_err(|_| Error::InvalidData("table utf8".to_string()))?;
+    let symbol = std::str::from_utf8(symbol)
+        .map_err(|_| Error::InvalidData("symbol utf8".to_string()))?;
+    Ok((table, symbol))
 }
 
 pub fn encode_get_response(ts: u64, value: &[u8]) -> Result<Vec<u8>> {
@@ -211,17 +213,13 @@ fn read_u64(payload: &[u8], offset: &mut usize) -> Result<u64> {
     Ok(val)
 }
 
-fn read_bytes(payload: &[u8], offset: &mut usize, len: usize) -> Result<Vec<u8>> {
+fn read_bytes<'a>(payload: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
     if *offset + len > payload.len() {
         return Err(Error::Protocol("payload too short"));
     }
     let slice = &payload[*offset..*offset + len];
     *offset += len;
-    Ok(slice.to_vec())
-}
-
-fn read_vec(payload: &[u8], offset: &mut usize, len: usize) -> Result<Vec<u8>> {
-    read_bytes(payload, offset, len)
+    Ok(slice)
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ pub struct Row {
 
 #[derive(Debug, Default)]
 pub struct MemStore {
-    data: HashMap<(String, String), Vec<Row>>,
+    data: HashMap<String, HashMap<String, Vec<Row>>>,
 }
 
 impl MemStore {
@@ -19,14 +19,22 @@ impl MemStore {
     }
 
     pub fn put(&mut self, table: &str, symbol: &str, ts: u64, value: Vec<u8>) {
-        let key = (table.to_string(), symbol.to_string());
-        let entry = self.data.entry(key).or_insert_with(Vec::new);
+        let symbols = match self.data.get_mut(table) {
+            Some(symbols) => symbols,
+            None => {
+                self.data.insert(table.to_string(), HashMap::new());
+                self.data.get_mut(table).expect("inserted map")
+            }
+        };
+        let entry = symbols.entry(symbol.to_string()).or_insert_with(Vec::new);
         entry.push(Row { ts, value });
     }
 
     pub fn get_last(&self, table: &str, symbol: &str) -> Option<&Row> {
-        let key = (table.to_string(), symbol.to_string());
-        self.data.get(&key).and_then(|rows| rows.last())
+        self.data
+            .get(table)
+            .and_then(|symbols| symbols.get(symbol))
+            .and_then(|rows| rows.last())
     }
 }
 

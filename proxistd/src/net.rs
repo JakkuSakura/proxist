@@ -79,11 +79,11 @@ fn handle_frame(
             let (table, symbol, ts, value) = decode_put_payload(&frame.payload)?;
             if let Some(wal) = wal {
                 let mut wal = wal.lock().map_err(|_| Error::Protocol("wal lock"))?;
-                wal.append_put(&table, &symbol, ts, &value)?;
+                wal.append_put(table, symbol, ts, value)?;
             }
             {
                 let mut mem = mem.write().map_err(|_| Error::Protocol("mem lock"))?;
-                mem.put(&table, &symbol, ts, value);
+                mem.put(table, symbol, ts, value.to_vec());
             }
             Ok(Frame {
                 flags: 0,
@@ -96,7 +96,7 @@ fn handle_frame(
             let (table, symbol) = decode_get_payload(&frame.payload)?;
             let row = {
                 let mem = mem.read().map_err(|_| Error::Protocol("mem lock"))?;
-                mem.get_last(&table, &symbol).cloned()
+                mem.get_last(table, symbol).cloned()
             };
             match row {
                 Some(row) => Ok(Frame {
