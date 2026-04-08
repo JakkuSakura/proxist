@@ -12,7 +12,7 @@ PROXIST_PID=""
 
 cleanup() {
   if [[ -n "${PROXIST_PID}" ]] && kill -0 "${PROXIST_PID}" >/dev/null 2>&1; then
-    echo "Stopping proxistd..."
+    echo "Stopping pxd..."
     kill "${PROXIST_PID}" >/dev/null 2>&1 || true
     wait "${PROXIST_PID}" 2>/dev/null || true
   fi
@@ -21,13 +21,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Starting proxistd (hot SQL engine only)..."
+echo "Starting pxd (hot SQL engine only)..."
 (
   cd "${ROOT_DIR}" && \
   PROXIST_METADATA_SQLITE_PATH="${METADATA_DB}" \
   PROXIST_HTTP_ADDR="${PROXIST_ADDR}" \
   PROXIST_WAL_DIR="${WAL_DIR}" \
-  cargo run --quiet --bin proxistd
+  cargo run --quiet --bin pxd
 ) >"${PROXIST_LOG}" 2>&1 &
 PROXIST_PID=$!
 
@@ -37,18 +37,18 @@ for _ in {1..60}; do
   fi
   sleep 1
   if ! kill -0 "${PROXIST_PID}" >/dev/null 2>&1; then
-    echo "proxistd exited unexpectedly. Logs:" >&2
+    echo "pxd exited unexpectedly. Logs:" >&2
     cat "${PROXIST_LOG}" >&2
     exit 1
   fi
   if [[ $_ -eq 60 ]]; then
-    echo "proxistd did not become ready in time. Logs:" >&2
+    echo "pxd did not become ready in time. Logs:" >&2
     cat "${PROXIST_LOG}" >&2
     exit 1
   fi
 done
 
-echo "proxistd is ready."
+echo "pxd is ready."
 
 STATUS=0
 TMP_OUTPUT="$(mktemp)"

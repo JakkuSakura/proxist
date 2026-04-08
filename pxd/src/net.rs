@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::error::{Error, Result};
 use crate::memstore::MemStore;
 use crate::pxl::{
-    decode_delete_payload, decode_get_payload, decode_put_payload, encode_error_payload,
-    encode_get_response, Frame, Op,
+    decode_delete_payload, decode_insert_payload, decode_query_payload, decode_schema_payload,
+    decode_update_payload, encode_error_payload, encode_result_payload, Frame, Op,
 };
 use crate::wal::Wal;
 
@@ -76,15 +76,15 @@ fn handle_frame(
             op: Op::Pong,
             payload: Vec::new(),
         }),
-        Op::Put => {
-            let (table, symbol, ts, value) = decode_put_payload(&frame.payload)?;
+        Op::Create => {
+            let (table, schema) = decode_schema_payload(&frame.payload)?;
             if let Some(wal) = wal {
                 let mut wal = wal.lock().map_err(|_| Error::Protocol("wal lock"))?;
-                wal.append_put(table, symbol, ts, value)?;
+                wal.append_create(&table, &schema)?;
             }
             {
                 let mut mem = mem.write().map_err(|_| Error::Protocol("mem lock"))?;
-                mem.put(table, symbol, ts, value.to_vec());
+                mem.create_table(&table, schema)?;
             }
             Ok(Frame {
                 flags: 0,
@@ -93,36 +93,49 @@ fn handle_frame(
                 payload: Vec::new(),
             })
         }
-        Op::Get => {
-            let (table, symbol) = decode_get_payload(&frame.payload)?;
-            let row = {
-                let mem = mem.read().map_err(|_| Error::Protocol("mem lock"))?;
-                mem.get_last(table, symbol).cloned()
-            };
-            match row {
-                Some(row) => Ok(Frame {
-                    flags: 0,
-                    req_id: frame.req_id,
-                    op: Op::Get,
-                    payload: encode_get_response(row.ts, &row.value)?,
-                }),
-                None => Ok(Frame {
-                    flags: 0,
-                    req_id: frame.req_id,
-                    op: Op::Error,
-                    payload: encode_error_payload("not found")?,
-                }),
+        Op::Insert => {
+            let (table, columns, rows) = decode_insert_payload(&frame.payload)?;
+            if let Some(wal) = wal {
+                let mut wal = wal.lock().map_err(|_| Error::Protocol("wal lock"))?;
+                wal.append_insert(&table, &columns, &rows)?;
             }
+            {
+                let mut mem = mem.write().map_err(|_| Error::Protocol("mem lock"))?;
+                mem.insert(&table, &columns, &rows)?;
+            }
+            Ok(Frame {
+                flags: 0,
+                req_id: frame.req_id,
+                op: Op::Pong,
+                payload: Vec::new(),
+            })
+        }
+        Op::Update => {
+            let (table, assignments, filter) = decode_update_payload(&frame.payload)?;
+            if let Some(wal) = wal {
+                let mut wal = wal.lock().map_err(|_| Error::Protocol("wal lock"))?;
+                wal.append_update(&table, &assignments, filter.as_ref())?;
+            }
+            {
+                let mut mem = mem.write().map_err(|_| Error::Protocol("mem lock"))?;
+                mem.update(&table, &assignments, filter.as_ref())?;
+            }
+            Ok(Frame {
+                flags: 0,
+                req_id: frame.req_id,
+                op: Op::Pong,
+                payload: Vec::new(),
+            })
         }
         Op::Delete => {
-            let (table, symbol) = decode_delete_payload(&frame.payload)?;
+            let (table, filter) = decode_delete_payload(&frame.payload)?;
             if let Some(wal) = wal {
                 let mut wal = wal.lock().map_err(|_| Error::Protocol("wal lock"))?;
-                wal.append_delete(table, symbol)?;
+                wal.append_delete(&table, filter.as_ref())?;
             }
             {
                 let mut mem = mem.write().map_err(|_| Error::Protocol("mem lock"))?;
-                mem.delete(table, symbol);
+                mem.delete(&table, filter.as_ref())?;
             }
             Ok(Frame {
                 flags: 0,
@@ -131,6 +144,21 @@ fn handle_frame(
                 payload: Vec::new(),
             })
         }
-        Op::Pong | Op::Error => Err(Error::Protocol("unexpected op")),
+        Op::Query => {
+            let plan = decode_query_payload(&frame.payload)?;
+            let result = {
+                let mem = mem.read().map_err(|_| Error::Protocol("mem lock"))?;
+                mem.query(&plan)?
+            };
+            Ok(Frame {
+                flags: 0,
+                req_id: frame.req_id,
+                op: Op::Result,
+                payload: encode_result_payload(&result.schema, &result.rows)?,
+            })
+        }
+        Op::Pong | Op::Error | Op::Result | Op::Schema => {
+            Err(Error::Protocol("unexpected op"))
+        }
     }
 }

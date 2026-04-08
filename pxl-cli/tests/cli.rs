@@ -1,8 +1,8 @@
 use std::io::Cursor;
 use std::process::Command;
 
-use proxistd::pxl::{
-    decode_delete_payload, decode_get_payload, decode_put_payload, read_frame, Op,
+use pxd::pxl::{
+    decode_delete_payload, decode_insert_payload, decode_query_payload, read_frame, Op,
 };
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
@@ -16,7 +16,7 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
     bytes
 }
 
-fn decode_frame(bytes: Vec<u8>) -> proxistd::pxl::Frame {
+fn decode_frame(bytes: Vec<u8>) -> pxd::pxl::Frame {
     let mut cursor = Cursor::new(bytes);
     read_frame(&mut cursor)
         .expect("read frame")
@@ -24,12 +24,12 @@ fn decode_frame(bytes: Vec<u8>) -> proxistd::pxl::Frame {
 }
 
 #[test]
-fn cli_sql_to_put_hex() {
+fn cli_sql_to_insert_hex() {
     let exe = env!("CARGO_BIN_EXE_pxl-cli");
     let output = Command::new(exe)
         .args([
             "--sql",
-            "INSERT INTO ticks (symbol, ts, value) VALUES ('AAPL', 7, 'v')",
+            "INSERT INTO ticks (symbol, ts, value) VALUES ('AAPL', 7, 1.5)",
             "--req-id",
             "7",
             "--hex",
@@ -41,16 +41,15 @@ fn cli_sql_to_put_hex() {
     let bytes = hex_to_bytes(stdout.trim());
     let frame = decode_frame(bytes);
     assert_eq!(frame.req_id, 7);
-    assert_eq!(frame.op, Op::Put);
-    let (table, symbol, ts, value) = decode_put_payload(&frame.payload).expect("payload");
+    assert_eq!(frame.op, Op::Insert);
+    let (table, cols, rows) = decode_insert_payload(&frame.payload).expect("payload");
     assert_eq!(table, "ticks");
-    assert_eq!(symbol, "AAPL");
-    assert_eq!(ts, 7);
-    assert_eq!(value, b"v");
+    assert_eq!(cols, vec!["symbol", "ts", "value"]);
+    assert_eq!(rows.len(), 1);
 }
 
 #[test]
-fn cli_prql_to_get_hex() {
+fn cli_prql_to_query_hex() {
     let exe = env!("CARGO_BIN_EXE_pxl-cli");
     let prql = r#"from ticks
 | filter symbol == "AAPL"
@@ -64,10 +63,9 @@ fn cli_prql_to_get_hex() {
     let bytes = hex_to_bytes(stdout.trim());
     let frame = decode_frame(bytes);
     assert_eq!(frame.req_id, 9);
-    assert_eq!(frame.op, Op::Get);
-    let (table, symbol) = decode_get_payload(&frame.payload).expect("payload");
-    assert_eq!(table, "ticks");
-    assert_eq!(symbol, "AAPL");
+    assert_eq!(frame.op, Op::Query);
+    let plan = decode_query_payload(&frame.payload).expect("payload");
+    assert_eq!(plan.table, "ticks");
 }
 
 #[test]
@@ -89,7 +87,7 @@ fn cli_sql_to_delete_hex() {
     let frame = decode_frame(bytes);
     assert_eq!(frame.req_id, 11);
     assert_eq!(frame.op, Op::Delete);
-    let (table, symbol) = decode_delete_payload(&frame.payload).expect("payload");
+    let (table, filter) = decode_delete_payload(&frame.payload).expect("payload");
     assert_eq!(table, "ticks");
-    assert_eq!(symbol, "AAPL");
+    assert!(filter.is_some());
 }

@@ -12,7 +12,7 @@ pub struct Config {
 impl Config {
     pub fn parse() -> Result<Self> {
         let mut addr = "127.0.0.1:9000".to_string();
-        let mut wal_path = PathBuf::from("proxist.wal");
+        let mut wal_path = PathBuf::from("pxd.wal");
         let mut wal_sync = true;
 
         let mut args = std::env::args();
@@ -58,6 +58,6 @@ impl Config {
 }
 
 fn print_usage() {
-    let usage = r#"proxistd (std-only)\n\nUSAGE:\n  proxistd [--addr 127.0.0.1:9000] [--wal proxist.wal] [--wal-sync|--no-wal-sync]\n\nOPTIONS:\n  --addr         listen address (default 127.0.0.1:9000)\n  --wal          wal file path (default proxist.wal)\n  --wal-sync     fsync after each write (default)\n  --no-wal-sync  skip fsync for higher throughput\n  -h, --help     show help\n"#;
+    let usage = r#"pxd (std-only)\n\nUSAGE:\n  pxd [--addr 127.0.0.1:9000] [--wal pxd.wal] [--wal-sync|--no-wal-sync]\n\nOPTIONS:\n  --addr         listen address (default 127.0.0.1:9000)\n  --wal          wal file path (default pxd.wal)\n  --wal-sync     fsync after each write (default)\n  --no-wal-sync  skip fsync for higher throughput\n  -h, --help     show help\n"#;
     println!("{usage}");
 }

@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-proxistd = { path = "../proxistd" }
+pxd = { path = "../pxd" }
 fp-core = { path = "../FerroPhase/crates/fp-core" }
 fp-prql = { path = "../FerroPhase/crates/fp-prql" }
 fp-sql = { path = "../FerroPhase/crates/fp-sql" }

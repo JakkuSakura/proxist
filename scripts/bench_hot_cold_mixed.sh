@@ -49,14 +49,14 @@ fi
 
 TMP_DIR="${ROOT_DIR}/.bench_tmp"
 mkdir -p "${TMP_DIR}"
-METADATA_DB="${TMP_DIR}/proxist-meta.db"
+METADATA_DB="${TMP_DIR}/pxd-meta.db"
 METADATA_URI="${PROXIST_METADATA_SQLITE_URI:-sqlite::memory:?cache=shared}"
 echo "Metadata DB: ${METADATA_URI}"
 
 if command -v lsof >/dev/null 2>&1; then
   EXISTING_PID=$(lsof -nP -iTCP:${PROXIST_PORT} -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print $2}' || true)
   if [[ -n "${EXISTING_PID}" ]]; then
-    echo "Stopping existing proxistd on port ${PROXIST_PORT} (pid ${EXISTING_PID})..."
+    echo "Stopping existing pxd on port ${PROXIST_PORT} (pid ${EXISTING_PID})..."
     kill "${EXISTING_PID}" >/dev/null 2>&1 || true
     sleep 1
   fi
@@ -70,14 +70,14 @@ HOT_LAST_MICROS=0
 
 cleanup() {
   if [[ -n "${PROXIST_PID}" ]] && kill -0 "${PROXIST_PID}" >/dev/null 2>&1; then
-    echo "Stopping proxistd..."
+    echo "Stopping pxd..."
     kill "${PROXIST_PID}" >/dev/null 2>&1 || true
     wait "${PROXIST_PID}" 2>/dev/null || true
   fi
   if [[ "${KEEP_LOG}" -eq 0 ]]; then
     rm -f "${PROXIST_LOG}"
   else
-    echo "proxistd log retained at ${PROXIST_LOG}"
+    echo "pxd log retained at ${PROXIST_LOG}"
   fi
   rm -rf "${TMP_DIR}"
   if [[ -n "${WAL_DIR}" ]]; then
@@ -102,11 +102,11 @@ for _ in {1..60}; do
   fi
 done
 
-start_proxistd() {
+start_pxd() {
   local cutoff="$1"
   local replay_persist="$2"
   PROXIST_LOG="$(mktemp)"
-  echo "Starting proxistd (release build) with cutoff ${cutoff}..."
+  echo "Starting pxd (release build) with cutoff ${cutoff}..."
   (
     cd "${ROOT_DIR}" && \
     PROXIST_METADATA_SQLITE_PATH="${METADATA_URI}" \
@@ -122,7 +122,7 @@ start_proxistd() {
     PROXIST_WAL_REPLAY_PERSIST="${replay_persist}" \
     PROXIST_PERSISTED_CUTOFF_OVERRIDE_MICROS="${cutoff}" \
     RUST_LOG="debug" \
-    cargo run --quiet --release --bin proxistd --features clickhouse-native
+    cargo run --quiet --release --bin pxd --features clickhouse-native
   ) >"${PROXIST_LOG}" 2>&1 &
   PROXIST_PID=$!
 
@@ -132,19 +132,19 @@ start_proxistd() {
     fi
     sleep 1
     if ! kill -0 "${PROXIST_PID}" >/dev/null 2>&1; then
-      echo "proxistd exited unexpectedly. Logs:" >&2
+      echo "pxd exited unexpectedly. Logs:" >&2
       cat "${PROXIST_LOG}" >&2
       return 1
     fi
   done
-  echo "proxistd did not become ready in time. Logs:" >&2
+  echo "pxd did not become ready in time. Logs:" >&2
   cat "${PROXIST_LOG}" >&2
   return 1
 }
 
-stop_proxistd() {
+stop_pxd() {
   if [[ -n "${PROXIST_PID}" ]] && kill -0 "${PROXIST_PID}" >/dev/null 2>&1; then
-    echo "Stopping proxistd..."
+    echo "Stopping pxd..."
     kill "${PROXIST_PID}" >/dev/null 2>&1 || true
     wait "${PROXIST_PID}" 2>/dev/null || true
   fi
@@ -308,20 +308,20 @@ setup_dataset() {
   HOT_SEQ=1
 
   echo "=== dataset setup (${name}) ==="
-  stop_proxistd
+  stop_pxd
   if command -v lsof >/dev/null 2>&1; then
     for port in "${PROXIST_PORT}" "${PROXIST_PG_PORT}"; do
       local pid
       pid=$(lsof -nP -iTCP:${port} -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print $2}' || true)
       if [[ -n "${pid}" ]]; then
-        echo "Stopping existing proxistd on port ${port} (pid ${pid})..."
+        echo "Stopping existing pxd on port ${port} (pid ${pid})..."
         kill "${pid}" >/dev/null 2>&1 || true
         sleep 1
       fi
     done
   fi
   ch_query "DROP TABLE IF EXISTS proxist.ticks"
-  if ! start_proxistd "${cutoff}" "true"; then
+  if ! start_pxd "${cutoff}" "true"; then
     KEEP_LOG=1
     exit 1
   fi
@@ -345,7 +345,7 @@ SQL
     cat "${CREATE_OUT}" >&2 || true
     KEEP_LOG=1
     rm -f "${CREATE_OUT}"
-    stop_proxistd
+    stop_pxd
     exit 1
   fi
   rm -f "${CREATE_OUT}"
@@ -373,11 +373,11 @@ SQL
   fi
 
   if [[ "${HOT_ROWS}" -gt 0 ]]; then
-    echo "Appending hot dataset through proxistd (psql)..."
+    echo "Appending hot dataset through pxd (psql)..."
     if ! append_hot_rows; then
       echo "hot append failed via psql" >&2
       KEEP_LOG=1
-      stop_proxistd
+      stop_pxd
       exit 1
     fi
   fi
@@ -393,7 +393,7 @@ run_mode() {
   fi
   echo "=== ${name} (hot ${hot_ratio}%, cutoff ${cutoff}) ==="
   bench_query "${name}"
-  stop_proxistd
+  stop_pxd
 }
 
 run_mode_with_setup() {

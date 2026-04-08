@@ -1,8 +1,11 @@
 mod config;
 mod error;
+mod expr;
 mod memstore;
 mod net;
 mod pxl;
+mod query;
+mod types;
 mod wal;
 
 use std::sync::{Arc, Mutex, RwLock};
@@ -15,7 +18,7 @@ use crate::wal::Wal;
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("proxistd error: {err}");
+        eprintln!("pxd error: {err}");
         std::process::exit(1);
     }
 }
