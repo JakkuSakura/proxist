@@ -617,7 +617,10 @@ fn project_with_window(
 mod tests {
     use super::MemStore;
     use crate::expr::{BinaryOp, Expr};
-    use crate::query::{AggFunc, AggregateExpr, QueryPlan, SelectExpr, SelectItem};
+    use crate::query::{
+        AggFunc, AggregateExpr, JoinSpec, JoinType, QueryPlan, SelectExpr, SelectItem,
+        WindowBound, WindowExpr, WindowFrameUnit, WindowSpec,
+    };
     use crate::types::{ColumnSpec, ColumnType, Schema, Value};
 
     #[test]
@@ -700,5 +703,281 @@ mod tests {
 
         let result = mem.query(&plan).expect("query");
         assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn update_adds_column_and_filters() {
+        let mut mem = MemStore::new();
+        mem.insert(
+            "ticks",
+            &["symbol".to_string(), "price".to_string()],
+            &[
+                vec![Value::String("AAPL".to_string()), Value::F64(10.0)],
+                vec![Value::String("MSFT".to_string()), Value::F64(5.0)],
+            ],
+        )
+        .expect("insert");
+
+        let filter = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column("symbol".to_string())),
+            right: Box::new(Expr::Literal(Value::String("AAPL".to_string()))),
+        };
+        let updated = mem
+            .update(
+                "ticks",
+                &[("notes".to_string(), Value::String("hot".to_string()))],
+                Some(&filter),
+            )
+            .expect("update");
+        assert_eq!(updated, 1);
+
+        let plan = QueryPlan {
+            table: "ticks".to_string(),
+            join: None,
+            filter: Some(filter),
+            group_by: Vec::new(),
+            select: vec![SelectItem {
+                expr: SelectExpr::Column("notes".to_string()),
+                alias: None,
+            }],
+        };
+        let result = mem.query(&plan).expect("query");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values[0],
+            Value::String("hot".to_string())
+        );
+    }
+
+    #[test]
+    fn delete_with_filter_removes_matches() {
+        let mut mem = MemStore::new();
+        mem.insert(
+            "ticks",
+            &["symbol".to_string(), "price".to_string()],
+            &[
+                vec![Value::String("AAPL".to_string()), Value::F64(10.0)],
+                vec![Value::String("MSFT".to_string()), Value::F64(5.0)],
+                vec![Value::String("AAPL".to_string()), Value::F64(12.0)],
+            ],
+        )
+        .expect("insert");
+
+        let filter = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column("symbol".to_string())),
+            right: Box::new(Expr::Literal(Value::String("MSFT".to_string()))),
+        };
+        let removed = mem.delete("ticks", Some(&filter)).expect("delete");
+        assert_eq!(removed, 1);
+
+        let plan = QueryPlan {
+            table: "ticks".to_string(),
+            join: None,
+            filter: None,
+            group_by: Vec::new(),
+            select: vec![SelectItem {
+                expr: SelectExpr::Column("symbol".to_string()),
+                alias: None,
+            }],
+        };
+        let result = mem.query(&plan).expect("query");
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn left_outer_join_keeps_unmatched_rows() {
+        let mut mem = MemStore::new();
+        mem.insert(
+            "trades",
+            &["symbol".to_string(), "price".to_string()],
+            &[
+                vec![Value::String("AAPL".to_string()), Value::F64(10.0)],
+                vec![Value::String("MSFT".to_string()), Value::F64(5.0)],
+            ],
+        )
+        .expect("insert left");
+        mem.insert(
+            "quotes",
+            &["symbol".to_string(), "bid".to_string()],
+            &[vec![Value::String("AAPL".to_string()), Value::F64(9.5)]],
+        )
+        .expect("insert right");
+
+        let plan = QueryPlan {
+            table: "trades".to_string(),
+            join: Some(JoinSpec {
+                join_type: JoinType::LeftOuter,
+                right_table: "quotes".to_string(),
+                left_on: "symbol".to_string(),
+                right_on: "symbol".to_string(),
+                left_ts: None,
+                right_ts: None,
+            }),
+            filter: None,
+            group_by: Vec::new(),
+            select: vec![SelectItem {
+                expr: SelectExpr::Wildcard,
+                alias: None,
+            }],
+        };
+
+        let result = mem.query(&plan).expect("join");
+        assert_eq!(result.rows.len(), 2);
+        let right_bid_idx = 3;
+        let msft_row = result
+            .rows
+            .iter()
+            .find(|row| row.values[0] == Value::String("MSFT".to_string()))
+            .expect("msft row");
+        assert_eq!(msft_row.values[right_bid_idx], Value::Null);
+    }
+
+    #[test]
+    fn asof_join_picks_latest_prior_row() {
+        let mut mem = MemStore::new();
+        mem.insert(
+            "trades",
+            &["symbol".to_string(), "ts".to_string(), "price".to_string()],
+            &[
+                vec![
+                    Value::String("AAPL".to_string()),
+                    Value::I64(3),
+                    Value::F64(10.0),
+                ],
+                vec![
+                    Value::String("AAPL".to_string()),
+                    Value::I64(6),
+                    Value::F64(12.0),
+                ],
+                vec![
+                    Value::String("MSFT".to_string()),
+                    Value::I64(3),
+                    Value::F64(5.0),
+                ],
+            ],
+        )
+        .expect("insert left");
+        mem.insert(
+            "quotes",
+            &["symbol".to_string(), "ts".to_string(), "bid".to_string()],
+            &[
+                vec![
+                    Value::String("AAPL".to_string()),
+                    Value::I64(1),
+                    Value::F64(9.5),
+                ],
+                vec![
+                    Value::String("AAPL".to_string()),
+                    Value::I64(4),
+                    Value::F64(10.5),
+                ],
+                vec![
+                    Value::String("MSFT".to_string()),
+                    Value::I64(5),
+                    Value::F64(4.5),
+                ],
+            ],
+        )
+        .expect("insert right");
+
+        let plan = QueryPlan {
+            table: "trades".to_string(),
+            join: Some(JoinSpec {
+                join_type: JoinType::Asof,
+                right_table: "quotes".to_string(),
+                left_on: "symbol".to_string(),
+                right_on: "symbol".to_string(),
+                left_ts: Some("ts".to_string()),
+                right_ts: Some("ts".to_string()),
+            }),
+            filter: None,
+            group_by: Vec::new(),
+            select: vec![SelectItem {
+                expr: SelectExpr::Wildcard,
+                alias: None,
+            }],
+        };
+
+        let result = mem.query(&plan).expect("asof join");
+        assert_eq!(result.rows.len(), 3);
+        let right_bid_idx = 5;
+        let aapl_ts3 = result
+            .rows
+            .iter()
+            .find(|row| row.values[0] == Value::String("AAPL".to_string()) && row.values[1] == Value::I64(3))
+            .expect("aapl ts3");
+        assert_eq!(aapl_ts3.values[right_bid_idx], Value::F64(9.5));
+        let msft_row = result
+            .rows
+            .iter()
+            .find(|row| row.values[0] == Value::String("MSFT".to_string()))
+            .expect("msft row");
+        assert_eq!(msft_row.values[right_bid_idx], Value::Null);
+    }
+
+    #[test]
+    fn window_preceding_frame_computes_avg() {
+        let mut mem = MemStore::new();
+        mem.insert(
+            "ticks",
+            &["symbol".to_string(), "ts".to_string(), "price".to_string()],
+            &[
+                vec![
+                    Value::String("AAPL".to_string()),
+                    Value::I64(1),
+                    Value::F64(10.0),
+                ],
+                vec![
+                    Value::String("AAPL".to_string()),
+                    Value::I64(2),
+                    Value::F64(30.0),
+                ],
+                vec![
+                    Value::String("AAPL".to_string()),
+                    Value::I64(3),
+                    Value::F64(20.0),
+                ],
+            ],
+        )
+        .expect("insert");
+
+        let plan = QueryPlan {
+            table: "ticks".to_string(),
+            join: None,
+            filter: None,
+            group_by: Vec::new(),
+            select: vec![
+                SelectItem {
+                    expr: SelectExpr::Column("symbol".to_string()),
+                    alias: None,
+                },
+                SelectItem {
+                    expr: SelectExpr::Column("ts".to_string()),
+                    alias: None,
+                },
+                SelectItem {
+                    expr: SelectExpr::Window(WindowExpr {
+                        func: AggFunc::Avg,
+                        arg: Expr::Column("price".to_string()),
+                        spec: WindowSpec {
+                            partition_by: vec!["symbol".to_string()],
+                            order_by: "ts".to_string(),
+                            unit: WindowFrameUnit::Rows,
+                            start: WindowBound::Preceding,
+                            start_value: Some(1),
+                        },
+                    }),
+                    alias: None,
+                },
+            ],
+        };
+
+        let result = mem.query(&plan).expect("window query");
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0].values[2], Value::F64(10.0));
+        assert_eq!(result.rows[1].values[2], Value::F64(20.0));
+        assert_eq!(result.rows[2].values[2], Value::F64(25.0));
     }
 }

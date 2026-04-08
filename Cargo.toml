@@ -2,6 +2,7 @@
 members = [
     "px-chd",
     "pxd",
+    "pxd-bench",
     "pxl-cli",
 ]
 resolver = "2"

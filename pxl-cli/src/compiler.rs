@@ -745,4 +745,31 @@ from ticks
         let plan = decode_query_payload(&frame.payload).expect("payload");
         assert_eq!(plan.table, "ticks");
     }
+
+    #[test]
+    fn compile_sql_multiple_statements_error() {
+        let sql = "SELECT 1; SELECT 2";
+        let err = compile_to_frame(sql, InputKind::Sql, 1).expect_err("error");
+        assert!(err.contains("multiple"));
+    }
+
+    #[test]
+    fn compile_insert_requires_columns_error() {
+        let sql = "INSERT INTO ticks VALUES (1)";
+        let err = compile_to_frame(sql, InputKind::Sql, 1).expect_err("error");
+        assert!(err.contains("column list"));
+    }
+
+    #[test]
+    fn compile_create_table_as_select_error() {
+        let sql = "CREATE TABLE t AS SELECT 1";
+        let err = compile_to_frame(sql, InputKind::Sql, 1).expect_err("error");
+        assert!(err.contains("CREATE TABLE AS SELECT"));
+    }
+
+    #[test]
+    fn compile_prql_error_path() {
+        let err = compile_to_frame("from", InputKind::Prql, 1).expect_err("error");
+        assert!(err.contains("PRQL"));
+    }
 }

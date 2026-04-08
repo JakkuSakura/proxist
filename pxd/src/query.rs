@@ -178,3 +178,99 @@ pub fn infer_select_schema(select: &[SelectItem], schema: &Schema) -> Vec<(Strin
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{infer_select_schema, AggFunc, AggregateExpr, SelectExpr, SelectItem, WindowBound,
+        WindowExpr, WindowFrameUnit, WindowSpec};
+    use crate::expr::Expr;
+    use crate::types::{ColumnSpec, ColumnType, Schema, Value};
+
+    fn base_schema() -> Schema {
+        Schema::new(vec![
+            ColumnSpec {
+                name: "symbol".to_string(),
+                col_type: ColumnType::String,
+                nullable: false,
+            },
+            ColumnSpec {
+                name: "ts".to_string(),
+                col_type: ColumnType::I64,
+                nullable: false,
+            },
+            ColumnSpec {
+                name: "price".to_string(),
+                col_type: ColumnType::F64,
+                nullable: false,
+            },
+        ])
+        .expect("schema")
+    }
+
+    #[test]
+    fn infer_schema_for_mixed_selects() {
+        let schema = base_schema();
+        let select = vec![
+            SelectItem {
+                expr: SelectExpr::Column("symbol".to_string()),
+                alias: None,
+            },
+            SelectItem {
+                expr: SelectExpr::Literal(Value::I64(7)),
+                alias: Some("const".to_string()),
+            },
+            SelectItem {
+                expr: SelectExpr::Aggregate(AggregateExpr {
+                    func: AggFunc::Count,
+                    arg: Expr::Column("price".to_string()),
+                }),
+                alias: None,
+            },
+            SelectItem {
+                expr: SelectExpr::Aggregate(AggregateExpr {
+                    func: AggFunc::Min,
+                    arg: Expr::Column("price".to_string()),
+                }),
+                alias: Some("min_price".to_string()),
+            },
+            SelectItem {
+                expr: SelectExpr::Window(WindowExpr {
+                    func: AggFunc::Avg,
+                    arg: Expr::Column("price".to_string()),
+                    spec: WindowSpec {
+                        partition_by: vec!["symbol".to_string()],
+                        order_by: "ts".to_string(),
+                        unit: WindowFrameUnit::Rows,
+                        start: WindowBound::CurrentRow,
+                        start_value: None,
+                    },
+                }),
+                alias: None,
+            },
+        ];
+
+        let inferred = infer_select_schema(&select, &schema);
+        assert_eq!(inferred[0].0, "symbol");
+        assert_eq!(inferred[0].1, ColumnType::String);
+        assert_eq!(inferred[1].0, "const");
+        assert_eq!(inferred[1].1, ColumnType::I64);
+        assert_eq!(inferred[2].1, ColumnType::I64);
+        assert_eq!(inferred[3].0, "min_price");
+        assert_eq!(inferred[3].1, ColumnType::F64);
+        assert_eq!(inferred[4].1, ColumnType::F64);
+    }
+
+    #[test]
+    fn infer_schema_wildcard_expands_all_columns() {
+        let schema = base_schema();
+        let select = vec![SelectItem {
+            expr: SelectExpr::Wildcard,
+            alias: None,
+        }];
+        let inferred = infer_select_schema(&select, &schema);
+        assert_eq!(inferred.len(), 3);
+        assert_eq!(inferred[0].0, "symbol");
+        assert_eq!(inferred[1].0, "ts");
+        assert_eq!(inferred[2].0, "price");
+    }
+}

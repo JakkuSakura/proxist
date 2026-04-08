@@ -4,5 +4,6 @@ pub mod memstore;
 pub mod pxl;
 pub mod query;
 pub mod types;
+pub mod wal;
 
 pub use error::{Error, Result};

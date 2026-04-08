@@ -442,6 +442,153 @@ fn read_value(cursor: &mut Cursor<'_>) -> Result<Value> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::{
+        decode_delete_payload, decode_insert_payload, decode_query_payload, decode_schema_payload,
+        decode_update_payload, encode_delete_payload, encode_insert_payload, encode_query_payload,
+        encode_schema_payload, encode_update_payload, read_frame, write_frame, Frame, Op,
+    };
+    use crate::expr::{BinaryOp, Expr};
+    use crate::query::{
+        AggFunc, AggregateExpr, JoinSpec, JoinType, QueryPlan, SelectExpr, SelectItem, WindowBound,
+        WindowExpr, WindowFrameUnit, WindowSpec,
+    };
+    use crate::types::{ColumnSpec, ColumnType, Schema, Value};
+
+    #[test]
+    fn frame_roundtrip() {
+        let frame = Frame {
+            flags: 1,
+            req_id: 42,
+            op: Op::Ping,
+            payload: vec![1, 2, 3],
+        };
+        let mut out = Vec::new();
+        write_frame(&mut out, &frame).expect("write");
+        let mut cursor = Cursor::new(out);
+        let decoded = read_frame(&mut cursor).expect("read").expect("frame");
+        assert_eq!(decoded.flags, 1);
+        assert_eq!(decoded.req_id, 42);
+        assert_eq!(decoded.op, Op::Ping);
+        assert_eq!(decoded.payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn schema_payload_roundtrip() {
+        let schema = Schema::new(vec![
+            ColumnSpec {
+                name: "symbol".to_string(),
+                col_type: ColumnType::String,
+                nullable: false,
+            },
+            ColumnSpec {
+                name: "ts".to_string(),
+                col_type: ColumnType::I64,
+                nullable: false,
+            },
+        ])
+        .expect("schema");
+        let payload = encode_schema_payload("ticks", &schema).expect("encode");
+        let (table, decoded) = decode_schema_payload(&payload).expect("decode");
+        assert_eq!(table, "ticks");
+        assert_eq!(decoded.columns().len(), 2);
+    }
+
+    #[test]
+    fn insert_update_delete_roundtrip() {
+        let payload = encode_insert_payload(
+            "ticks",
+            &["symbol".to_string(), "price".to_string()],
+            &[vec![Value::String("AAPL".to_string()), Value::F64(10.0)]],
+        )
+        .expect("encode insert");
+        let (table, cols, rows) = decode_insert_payload(&payload).expect("decode insert");
+        assert_eq!(table, "ticks");
+        assert_eq!(cols, vec!["symbol", "price"]);
+        assert_eq!(rows.len(), 1);
+
+        let filter = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column("symbol".to_string())),
+            right: Box::new(Expr::Literal(Value::String("AAPL".to_string()))),
+        };
+        let update = encode_update_payload(
+            "ticks",
+            &[("price".to_string(), Value::F64(12.5))],
+            Some(&filter),
+        )
+        .expect("encode update");
+        let (table, assigns, decoded_filter) =
+            decode_update_payload(&update).expect("decode update");
+        assert_eq!(table, "ticks");
+        assert_eq!(assigns.len(), 1);
+        assert!(decoded_filter.is_some());
+
+        let delete = encode_delete_payload("ticks", Some(&filter)).expect("encode delete");
+        let (table, decoded_filter) = decode_delete_payload(&delete).expect("decode delete");
+        assert_eq!(table, "ticks");
+        assert!(decoded_filter.is_some());
+    }
+
+    #[test]
+    fn query_payload_roundtrip() {
+        let plan = QueryPlan {
+            table: "ticks".to_string(),
+            join: Some(JoinSpec {
+                join_type: JoinType::Inner,
+                right_table: "quotes".to_string(),
+                left_on: "symbol".to_string(),
+                right_on: "symbol".to_string(),
+                left_ts: None,
+                right_ts: None,
+            }),
+            filter: Some(Expr::Binary {
+                op: BinaryOp::GtEq,
+                left: Box::new(Expr::Column("ts".to_string())),
+                right: Box::new(Expr::Literal(Value::I64(10))),
+            }),
+            group_by: vec!["symbol".to_string()],
+            select: vec![
+                SelectItem {
+                    expr: SelectExpr::Column("symbol".to_string()),
+                    alias: None,
+                },
+                SelectItem {
+                    expr: SelectExpr::Aggregate(AggregateExpr {
+                        func: AggFunc::Avg,
+                        arg: Expr::Column("price".to_string()),
+                    }),
+                    alias: Some("avg_price".to_string()),
+                },
+                SelectItem {
+                    expr: SelectExpr::Window(WindowExpr {
+                        func: AggFunc::Count,
+                        arg: Expr::Column("price".to_string()),
+                        spec: WindowSpec {
+                            partition_by: vec!["symbol".to_string()],
+                            order_by: "ts".to_string(),
+                            unit: WindowFrameUnit::Rows,
+                            start: WindowBound::Preceding,
+                            start_value: Some(2),
+                        },
+                    }),
+                    alias: Some("win_cnt".to_string()),
+                },
+            ],
+        };
+
+        let payload = encode_query_payload(&plan).expect("encode");
+        let decoded = decode_query_payload(&payload).expect("decode");
+        assert_eq!(decoded.table, "ticks");
+        assert_eq!(decoded.join.as_ref().unwrap().right_table, "quotes");
+        assert_eq!(decoded.group_by, vec!["symbol"]);
+        assert_eq!(decoded.select.len(), 3);
+    }
+}
+
 fn read_byte(cursor: &mut Cursor<'_>) -> Result<u8> {
     let bytes = cursor.take(1)?;
     Ok(bytes[0])

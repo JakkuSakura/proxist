@@ -104,3 +104,93 @@ where
         .ok_or_else(|| Error::InvalidData("values not comparable".to_string()))?;
     Ok(pred(ord))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{eval_predicate, eval_value, BinaryOp, Expr};
+    use crate::types::{ColumnSpec, ColumnType, Schema, Value};
+
+    fn base_schema() -> Schema {
+        Schema::new(vec![
+            ColumnSpec {
+                name: "a".to_string(),
+                col_type: ColumnType::I64,
+                nullable: false,
+            },
+            ColumnSpec {
+                name: "b".to_string(),
+                col_type: ColumnType::I64,
+                nullable: false,
+            },
+            ColumnSpec {
+                name: "sym".to_string(),
+                col_type: ColumnType::String,
+                nullable: false,
+            },
+        ])
+        .expect("schema")
+    }
+
+    #[test]
+    fn eval_predicate_and_or_not() {
+        let schema = base_schema();
+        let row = vec![
+            Value::I64(7),
+            Value::I64(3),
+            Value::String("AAPL".to_string()),
+        ];
+
+        let expr = Expr::And(
+            Box::new(Expr::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(Expr::Column("a".to_string())),
+                right: Box::new(Expr::Literal(Value::I64(1))),
+            }),
+            Box::new(Expr::Or(
+                Box::new(Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(Expr::Column("sym".to_string())),
+                    right: Box::new(Expr::Literal(Value::String("AAPL".to_string()))),
+                }),
+                Box::new(Expr::Not(Box::new(Expr::Binary {
+                    op: BinaryOp::Lt,
+                    left: Box::new(Expr::Column("b".to_string())),
+                    right: Box::new(Expr::Literal(Value::I64(0))),
+                }))),
+            )),
+        );
+
+        let result = eval_predicate(&expr, &row, &schema).expect("predicate");
+        assert!(result);
+
+        let value_expr = Expr::Binary {
+            op: BinaryOp::LtEq,
+            left: Box::new(Expr::Column("b".to_string())),
+            right: Box::new(Expr::Literal(Value::I64(3))),
+        };
+        let value = eval_value(&value_expr, &row, &schema).expect("value");
+        assert_eq!(value, Value::Bool(true));
+    }
+
+    #[test]
+    fn eval_predicate_non_comparable() {
+        let schema = base_schema();
+        let row = vec![
+            Value::I64(7),
+            Value::I64(3),
+            Value::String("AAPL".to_string()),
+        ];
+
+        let expr = Expr::Binary {
+            op: BinaryOp::Lt,
+            left: Box::new(Expr::Column("sym".to_string())),
+            right: Box::new(Expr::Column("a".to_string())),
+        };
+        let err = eval_predicate(&expr, &row, &schema).expect_err("should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not comparable"),
+            "unexpected error: {msg}"
+        );
+    }
+}
