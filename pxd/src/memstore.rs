@@ -93,6 +93,22 @@ impl MemStore {
         Ok(())
     }
 
+    pub fn table_schema(&self, table: &str) -> Option<&Schema> {
+        self.tables.get(table).map(|table| &table.schema)
+    }
+
+    pub fn table_rows(&self, table: &str) -> Option<&[Row]> {
+        self.tables.get(table).map(|table| table.rows.as_slice())
+    }
+
+    pub fn table_row_count(&self, table: &str) -> Option<usize> {
+        self.tables.get(table).map(|table| table.rows.len())
+    }
+
+    pub fn table_row(&self, table: &str, index: usize) -> Option<&Row> {
+        self.tables.get(table).and_then(|table| table.rows.get(index))
+    }
+
     pub fn update(
         &mut self,
         table: &str,
@@ -665,6 +681,31 @@ mod tests {
         let result = mem.query(&plan).expect("query");
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values[0], Value::F64(10.0));
+    }
+
+    #[test]
+    fn table_accessors_expose_rows() {
+        let mut mem = MemStore::new();
+        mem.insert(
+            "ticks",
+            &["symbol".to_string(), "price".to_string()],
+            &[
+                vec![Value::String("AAPL".to_string()), Value::F64(10.0)],
+                vec![Value::String("MSFT".to_string()), Value::F64(12.0)],
+            ],
+        )
+        .expect("insert");
+
+        let schema = mem.table_schema("ticks").expect("schema");
+        let price_idx = schema.column_index("price").expect("price idx");
+        assert_eq!(mem.table_row_count("ticks"), Some(2));
+
+        let rows = mem.table_rows("ticks").expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[price_idx], Value::F64(10.0));
+
+        let row = mem.table_row("ticks", 1).expect("row");
+        assert_eq!(row.values[price_idx], Value::F64(12.0));
     }
 
     #[test]
