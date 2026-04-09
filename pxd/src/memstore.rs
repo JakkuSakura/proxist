@@ -4,9 +4,9 @@ use crate::error::{Error, Result};
 use crate::expr::{eval_predicate, Expr};
 use crate::query::{
     infer_select_schema, AggFunc, AggregateExpr, JoinSpec, JoinType, QueryPlan, ResultSet,
-    SelectExpr, SelectItem, WindowBound, WindowExpr, WindowSpec,
+    SelectExpr, WindowBound, WindowExpr, WindowSpec,
 };
-use crate::types::{infer_column_type, ColumnSpec, Row, Schema, Value};
+use crate::types::{ColumnSpec, ColumnType, Row, Schema, Value};
 
 #[derive(Debug, Clone)]
 struct Table {
@@ -17,6 +17,13 @@ struct Table {
 #[derive(Debug, Default)]
 pub struct MemStore {
     tables: HashMap<String, Table>,
+}
+
+#[derive(Debug, Clone)]
+enum ProjectOp {
+    Column(usize),
+    Literal(Value),
+    Wildcard,
 }
 
 impl MemStore {
@@ -56,11 +63,7 @@ impl MemStore {
             let idx = match table.schema.column_index(name) {
                 Some(idx) => idx,
                 None => {
-                    let values: Vec<Value> = rows
-                        .iter()
-                        .filter_map(|row| row.get(col_pos).cloned())
-                        .collect();
-                    let col_type = infer_column_type(&values);
+                    let col_type = infer_column_type_from_rows(rows, col_pos);
                     table
                         .schema
                         .add_column(ColumnSpec {
@@ -78,13 +81,15 @@ impl MemStore {
             col_indices.push(idx);
         }
 
+        let schema_len = table.schema.columns().len();
+        table.rows.reserve(rows.len());
         for values in rows {
             if values.len() != columns.len() {
                 return Err(Error::InvalidData(
                     "insert row length mismatch".to_string(),
                 ));
             }
-            let mut row = vec![Value::Null; table.schema.columns().len()];
+            let mut row = vec![Value::Null; schema_len];
             for (idx, value) in col_indices.iter().zip(values.iter()) {
                 row[*idx] = value.clone();
             }
@@ -142,12 +147,22 @@ impl MemStore {
             assign_indices.push((idx, value.clone()));
         }
 
+        if filter.is_none() {
+            let mut updated = 0u64;
+            for row in &mut table.rows {
+                for (idx, value) in &assign_indices {
+                    row.values[*idx] = value.clone();
+                }
+                updated += 1;
+            }
+            return Ok(updated);
+        }
+
+        let expr = filter.expect("filter checked");
         let mut updated = 0u64;
         for row in &mut table.rows {
-            if let Some(expr) = filter {
-                if !eval_predicate(expr, &row.values, &table.schema)? {
-                    continue;
-                }
+            if !eval_predicate(expr, &row.values, &table.schema)? {
+                continue;
             }
             for (idx, value) in &assign_indices {
                 row.values[*idx] = value.clone();
@@ -184,20 +199,23 @@ impl MemStore {
             .tables
             .get(&plan.table)
             .ok_or_else(|| Error::InvalidData("table not found".to_string()))?;
-        let mut rows: Vec<Row> = left.rows.clone();
         let mut schema = left.schema.clone();
+        let mut rows: Vec<&Row> = left.rows.iter().collect();
 
-        if let Some(join) = &plan.join {
+        let joined_rows = if let Some(join) = &plan.join {
             let (joined_schema, joined_rows) = self.apply_join(join, &schema, &rows)?;
             schema = joined_schema;
-            rows = joined_rows;
+            Some(joined_rows)
+        } else {
+            None
+        };
+
+        if let Some(joined_rows) = &joined_rows {
+            rows = joined_rows.iter().collect();
         }
 
         if let Some(filter) = &plan.filter {
-            rows = rows
-                .into_iter()
-                .filter(|row| eval_predicate(filter, &row.values, &schema).unwrap_or(false))
-                .collect();
+            rows.retain(|row| eval_predicate(filter, &row.values, &schema).unwrap_or(false));
         }
 
         let has_window = plan.select.iter().any(|item| matches!(item.expr, SelectExpr::Window(_)));
@@ -231,10 +249,51 @@ impl MemStore {
                 .collect(),
         )?;
 
+        let mut proj_ops = Vec::with_capacity(plan.select.len());
+        let mut proj_capacity = 0usize;
+        for item in &plan.select {
+            match &item.expr {
+                SelectExpr::Column(name) => {
+                    let idx = schema.column_index(name).ok_or_else(|| {
+                        Error::InvalidData(format!("unknown column {name}"))
+                    })?;
+                    proj_ops.push(ProjectOp::Column(idx));
+                    proj_capacity += 1;
+                }
+                SelectExpr::Literal(value) => {
+                    proj_ops.push(ProjectOp::Literal(value.clone()));
+                    proj_capacity += 1;
+                }
+                SelectExpr::Wildcard => {
+                    proj_ops.push(ProjectOp::Wildcard);
+                    proj_capacity += schema.columns().len();
+                }
+                SelectExpr::Aggregate(_) => {
+                    return Err(Error::InvalidData(
+                        "aggregate not allowed without group by".to_string(),
+                    ));
+                }
+                SelectExpr::Window(_) => {
+                    return Err(Error::InvalidData(
+                        "window not allowed without window context".to_string(),
+                    ));
+                }
+            }
+        }
+
         let mut out_rows = Vec::with_capacity(rows.len());
         for row in rows {
-            let values = project_row(&plan.select, &schema, &row.values)?;
-            out_rows.push(Row { values });
+            let mut out = Vec::with_capacity(proj_capacity);
+            for op in &proj_ops {
+                match op {
+                    ProjectOp::Column(idx) => {
+                        out.push(row.values.get(*idx).cloned().unwrap_or(Value::Null));
+                    }
+                    ProjectOp::Literal(value) => out.push(value.clone()),
+                    ProjectOp::Wildcard => out.extend_from_slice(&row.values),
+                }
+            }
+            out_rows.push(Row { values: out });
         }
 
         Ok(ResultSet {
@@ -247,7 +306,7 @@ impl MemStore {
         &self,
         join: &JoinSpec,
         left_schema: &Schema,
-        left_rows: &[Row],
+        left_rows: &[&Row],
     ) -> Result<(Schema, Vec<Row>)> {
         let right = self
             .tables
@@ -265,8 +324,10 @@ impl MemStore {
             .column_index(&join.right_on)
             .ok_or_else(|| Error::InvalidData("join right key not found".to_string()))?;
 
-        let mut rows = Vec::new();
+        let right_null = right_null_row(&right.schema);
+        let mut rows = Vec::with_capacity(left_rows.len());
         for left_row in left_rows {
+            let left_row = *left_row;
             let mut matched = false;
             match join.join_type {
                 JoinType::Inner | JoinType::LeftOuter => {
@@ -317,10 +378,10 @@ impl MemStore {
             }
 
             if !matched && join.join_type == JoinType::LeftOuter {
-                rows.push(merge_rows(left_row, &right_null_row(&right.schema)));
+                rows.push(merge_rows(left_row, &right_null));
             }
             if !matched && join.join_type == JoinType::Asof {
-                rows.push(merge_rows(left_row, &right_null_row(&right.schema)));
+                rows.push(merge_rows(left_row, &right_null));
             }
         }
 
@@ -331,7 +392,7 @@ impl MemStore {
         &self,
         plan: &QueryPlan,
         schema: &Schema,
-        rows: &[Row],
+        rows: &[&Row],
     ) -> Result<ResultSet> {
         let mut groups: HashMap<Vec<Value>, Vec<&Row>> = HashMap::new();
         let mut key_indices = Vec::with_capacity(plan.group_by.len());
@@ -343,10 +404,14 @@ impl MemStore {
         }
 
         if key_indices.is_empty() {
-            groups.insert(Vec::new(), rows.iter().collect());
+            groups.insert(Vec::new(), rows.iter().copied().collect());
         } else {
             for row in rows {
-                let key: Vec<Value> = key_indices.iter().map(|idx| row.values[*idx].clone()).collect();
+                let row = *row;
+                let key: Vec<Value> = key_indices
+                    .iter()
+                    .map(|idx| row.values[*idx].clone())
+                    .collect();
                 groups.entry(key).or_default().push(row);
             }
         }
@@ -362,6 +427,13 @@ impl MemStore {
                 .collect(),
         )?;
 
+        let mut key_pos = vec![None; schema.columns().len()];
+        for (pos, idx) in key_indices.iter().enumerate() {
+            if let Some(slot) = key_pos.get_mut(*idx) {
+                *slot = Some(pos);
+            }
+        }
+
         let mut out_rows = Vec::with_capacity(groups.len());
         for (key, group_rows) in groups {
             let mut out = Vec::with_capacity(plan.select.len());
@@ -371,21 +443,20 @@ impl MemStore {
                         let idx = schema.column_index(name).ok_or_else(|| {
                             Error::InvalidData(format!("unknown column {name}"))
                         })?;
-                        if !key_indices.contains(&idx) {
-                            return Err(Error::InvalidData(format!(
-                                "column {name} must appear in group by"
-                            )));
-                        }
                         if key_indices.is_empty() {
                             group_rows
                                 .first()
                                 .and_then(|row| row.values.get(idx).cloned())
                                 .unwrap_or(Value::Null)
                         } else {
-                            let key_idx = key_indices
-                                .iter()
-                                .position(|v| *v == idx)
-                                .unwrap_or(0);
+                            let key_idx = key_pos
+                                .get(idx)
+                                .and_then(|pos| *pos)
+                                .ok_or_else(|| {
+                                    Error::InvalidData(format!(
+                                        "column {name} must appear in group by"
+                                    ))
+                                })?;
                             key.get(key_idx).cloned().unwrap_or(Value::Null)
                         }
                     }
@@ -417,7 +488,7 @@ impl MemStore {
         &self,
         plan: &QueryPlan,
         schema: &Schema,
-        rows: &[Row],
+        rows: &[&Row],
     ) -> Result<ResultSet> {
         let result_schema = Schema::new(
             infer_select_schema(&plan.select, schema)
@@ -448,12 +519,20 @@ impl MemStore {
 
         let order_idx = order_idx.ok_or_else(|| Error::InvalidData("window order missing".to_string()))?;
 
-        for (idx, row) in rows.iter().enumerate() {
-            let key: Vec<Value> = partition_indices
-                .iter()
-                .map(|i| row.values[*i].clone())
-                .collect();
-            partitions.entry(key).or_default().push((idx, row));
+        if partition_indices.is_empty() {
+            let bucket = partitions.entry(Vec::new()).or_default();
+            for (idx, row) in rows.iter().enumerate() {
+                bucket.push((idx, *row));
+            }
+        } else {
+            for (idx, row) in rows.iter().enumerate() {
+                let row = *row;
+                let key: Vec<Value> = partition_indices
+                    .iter()
+                    .map(|i| row.values[*i].clone())
+                    .collect();
+                partitions.entry(key).or_default().push((idx, row));
+            }
         }
 
         let mut out_rows = vec![Row { values: Vec::new() }; rows.len()];
@@ -477,6 +556,17 @@ impl MemStore {
     }
 }
 
+fn infer_column_type_from_rows(rows: &[Vec<Value>], col_pos: usize) -> ColumnType {
+    for row in rows {
+        if let Some(value) = row.get(col_pos) {
+            if !value.is_null() {
+                return value.column_type();
+            }
+        }
+    }
+    ColumnType::String
+}
+
 fn right_null_row(schema: &Schema) -> Row {
     Row {
         values: vec![Value::Null; schema.columns().len()],
@@ -488,33 +578,6 @@ fn merge_rows(left: &Row, right: &Row) -> Row {
     values.extend_from_slice(&left.values);
     values.extend_from_slice(&right.values);
     Row { values }
-}
-
-fn project_row(select: &[SelectItem], schema: &Schema, row: &[Value]) -> Result<Vec<Value>> {
-    let mut out = Vec::with_capacity(select.len());
-    for item in select {
-        match &item.expr {
-            SelectExpr::Column(name) => {
-                let idx = schema.column_index(name).ok_or_else(|| {
-                    Error::InvalidData(format!("unknown column {name}"))
-                })?;
-                out.push(row.get(idx).cloned().unwrap_or(Value::Null));
-            }
-            SelectExpr::Literal(value) => out.push(value.clone()),
-            SelectExpr::Aggregate(_) => {
-                return Err(Error::InvalidData(
-                    "aggregate not allowed without group by".to_string(),
-                ));
-            }
-            SelectExpr::Window(_) => {
-                return Err(Error::InvalidData(
-                    "window not allowed without window context".to_string(),
-                ));
-            }
-            SelectExpr::Wildcard => out.extend_from_slice(row),
-        }
-    }
-    Ok(out)
 }
 
 fn aggregate_value(

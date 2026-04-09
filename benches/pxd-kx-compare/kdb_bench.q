@@ -1,10 +1,18 @@
 / pxd-kx-compare: aligned micro benchmarks (write/reread/randomread/cpu/cpucache)
 
-rows: 10000000;
-randreads: 1000000;
-cacherows: 1000000;
+rowsEnv: getenv `ROWS;
+randEnv: getenv `RANDOM_READS;
+cacheEnv: getenv `CACHE_ROWS;
+
+rows: $[count rowsEnv; "J"$rowsEnv; 10000000];
+randreads: $[count randEnv; "J"$randEnv; 1000000];
+cacherows: $[count cacheEnv; "J"$cacheEnv; 1000000];
 
 rowbytes: 24
+lcgmult: 6364136223846793005j;
+lcginc: 1j;
+lcgshift: 33;
+seed0: 1311768467463790320j;
 
 emit:{[name;rows;ops;bytes;elapsed]
   secs: elapsed % 1000f;
@@ -25,23 +33,33 @@ elapsedMs:{[f]
 
 sym:{[n]`$"S",/:string each til n};
 
- / write
-t_sym: sym rows;
-t_ts: til rows;
-t_val: (til rows) mod 10000f;
-t0:.z.p;
-trades: ([] sym:t_sym; ts: t_ts; val: t_val);
-t1:.z.p;
-writeMs: 1e-6 * (t1 - t0);
+/ write
+writeMs: elapsedMs{
+  t_sym: sym rows;
+  t_ts: til rows;
+  t_val: til rows;
+  t_val: 0f + (t_val mod 10000);
+  t: ([] symbol:t_sym; ts: t_ts; val: t_val);
+  trades:: `symbol`ts`value xcol t;
+ };
 emit["write"; rows; rows; rows*rowbytes; writeMs];
 
 / reread
-rereadMs: elapsedMs{sum trades`val};
+rereadMs: elapsedMs{sum trades[`value]};
 emit["reread"; rows; rows; rows*rowbytes; rereadMs];
 
 / randomread
-ridx: randreads ? rows;
-randomMs: elapsedMs{sum (trades`val) ridx};
+randomMs: elapsedMs{
+  s: seed0;
+  acc: 0f;
+  n: rows;
+  do[randreads;
+    s: s * lcgmult + lcginc;
+    i: (s >> lcgshift) mod n;
+    acc+: trades[`value] i;
+    ];
+  acc
+ };
 emit["randomread"; rows; randreads; randreads*rowbytes; randomMs];
 
 / cpu

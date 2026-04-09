@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use pxd::memstore::MemStore;
 use pxd::types::Value;
+use pxd_bench::{lcg_index, LCG_SEED};
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -87,7 +88,7 @@ fn main() {
         let mut batch = Vec::with_capacity(batch_count);
         for offset in 0..batch_count {
             let idx = inserted + offset;
-            let symbol = format!("S{:07}", idx % 1_000_000);
+            let symbol = format!("S{}", idx);
             batch.push(vec![
                 Value::String(symbol),
                 Value::I64(idx as i64),
@@ -116,12 +117,11 @@ fn main() {
     emit("reread", config.rows, config.rows, config.rows * row_bytes, elapsed);
 
     let start = Instant::now();
-    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut seed = LCG_SEED;
     let mut rand_sum = 0.0f64;
     let row_len = rows.len();
     for _ in 0..config.random_reads {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let idx = (seed >> 33) as usize % row_len;
+        let idx = lcg_index(&mut seed, row_len);
         if let Value::F64(v) = rows[idx].values[value_idx] {
             rand_sum += v;
         }
@@ -144,6 +144,8 @@ fn main() {
     let mut acc = 0.0f64;
     for v in vec.iter_mut() {
         *v = *v * 1.0001 + 0.1;
+    }
+    for v in vec.iter() {
         acc += *v;
     }
     black_box(acc);
@@ -161,6 +163,8 @@ fn main() {
     for _ in 0..5 {
         for v in cache_vec.iter_mut() {
             *v = *v * 1.0001 + 0.2;
+        }
+        for v in cache_vec.iter() {
             cache_acc += *v;
         }
     }
