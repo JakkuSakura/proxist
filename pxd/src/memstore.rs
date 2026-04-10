@@ -762,25 +762,36 @@ impl MemStore {
         for column in &mut table.columns {
             column.reserve(rows.len());
         }
-
         for values in rows {
             if values.len() != columns.len() {
                 return Err(Error::InvalidData("insert row length mismatch".to_string()));
             }
-            for (col_idx, column) in table.columns.iter_mut().enumerate() {
-                let raw_value = match value_pos.get(col_idx).and_then(|pos| *pos) {
-                    Some(value_idx) => values.get(value_idx).unwrap_or(&Value::Null),
-                    None => defaults.get(col_idx).unwrap_or(&Value::Null),
-                };
-                let col_type = table.schema.columns()[col_idx].col_type;
-                let mut value = raw_value.clone();
-                if !value.is_null() && value.column_type() != col_type {
-                    value = coerce_value(value, col_type)?;
-                }
-                column.push_value(value)?;
-            }
-            table.row_count += 1;
         }
+
+        let schema_columns = table.schema.columns();
+        for (col_idx, column) in table.columns.iter_mut().enumerate() {
+            let col_type = schema_columns[col_idx].col_type;
+            let default_value = defaults.get(col_idx).unwrap_or(&Value::Null);
+            match value_pos.get(col_idx).and_then(|pos| *pos) {
+                Some(value_idx) => {
+                    for values in rows {
+                        let raw_value = values.get(value_idx).unwrap_or(&Value::Null);
+                        let value = if raw_value.is_null() {
+                            Value::Null
+                        } else if raw_value.column_type() == col_type {
+                            raw_value.clone()
+                        } else {
+                            coerce_value(raw_value.clone(), col_type)?
+                        };
+                        column.push_value(value)?;
+                    }
+                }
+                None => {
+                    column.fill_with_default(default_value, rows.len())?;
+                }
+            }
+        }
+        table.row_count += rows.len();
         Ok(())
     }
 

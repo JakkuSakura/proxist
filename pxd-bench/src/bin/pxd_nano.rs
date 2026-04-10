@@ -14,6 +14,7 @@ struct Config {
     random_reads: usize,
     cache_rows: usize,
     batch_size: usize,
+    symbol_card: usize,
 }
 
 impl Config {
@@ -22,6 +23,7 @@ impl Config {
         let mut random_reads: Option<usize> = None;
         let mut cache_rows: Option<usize> = None;
         let mut batch_size = 100_000usize;
+        let mut symbol_card: Option<usize> = None;
 
         let mut args = env::args().skip(1).peekable();
         while let Some(arg) = args.next() {
@@ -46,18 +48,25 @@ impl Config {
                         batch_size = value.parse().unwrap_or(batch_size);
                     }
                 }
+                "--symbol-card" => {
+                    if let Some(value) = args.next() {
+                        symbol_card = value.parse().ok();
+                    }
+                }
                 _ => {}
             }
         }
 
         let random_reads = random_reads.unwrap_or_else(|| rows / 10).max(1);
         let cache_rows = cache_rows.unwrap_or_else(|| rows.min(1_000_000));
+        let symbol_card = symbol_card.unwrap_or_else(|| rows.min(100_000)).max(1);
 
         Self {
             rows,
             random_reads,
             cache_rows,
             batch_size: batch_size.max(1),
+            symbol_card,
         }
     }
 }
@@ -104,6 +113,35 @@ impl Drop for RawF64Buf {
     }
 }
 
+struct RawUsizeBuf {
+    ptr: *mut usize,
+    len: usize,
+    layout: Layout,
+}
+
+impl RawUsizeBuf {
+    fn new(len: usize) -> Self {
+        let layout = Layout::array::<usize>(len.max(1)).expect("layout");
+        let ptr = unsafe { alloc(layout) as *mut usize };
+        if ptr.is_null() {
+            panic!("alloc failed");
+        }
+        Self { ptr, len, layout }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [usize] {
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for RawUsizeBuf {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr as *mut u8, self.layout);
+        }
+    }
+}
+
 fn main() {
     let config = Config::from_env();
     let columns = vec!["symbol".to_string(), "ts".to_string(), "value".to_string()];
@@ -119,7 +157,7 @@ fn main() {
         let mut batch = Vec::with_capacity(batch_count);
         for offset in 0..batch_count {
             let idx = inserted + offset;
-            let symbol = format!("S{}", idx);
+            let symbol = format!("S{}", idx % config.symbol_card);
             batch.push(vec![
                 Value::String(symbol),
                 Value::I64(idx as i64),
@@ -156,18 +194,21 @@ fn main() {
     emit("reread", config.rows, config.rows, config.rows * row_bytes, elapsed);
 
     let start = Instant::now();
+    let mut idx_buf = RawUsizeBuf::new(config.random_reads);
+    let idxs = idx_buf.as_mut_slice();
     let mut seed = LCG_SEED;
-    let mut rand_sum = 0.0f64;
     let row_len = values.len();
+    for slot in idxs.iter_mut() {
+        *slot = lcg_index(&mut seed, row_len);
+    }
+    let mut rand_sum = 0.0f64;
     if let Some(values) = values.as_f64() {
-        for _ in 0..config.random_reads {
-            let idx = lcg_index(&mut seed, row_len);
-            rand_sum += values[idx];
+        for idx in idxs.iter() {
+            rand_sum += values[*idx];
         }
     } else {
-        for _ in 0..config.random_reads {
-            let idx = lcg_index(&mut seed, row_len);
-            if let Some(value) = values.get_value(idx) {
+        for idx in idxs.iter() {
+            if let Some(value) = values.get_value(*idx) {
                 if let Value::F64(v) = value.to_value() {
                     rand_sum += v;
                 }

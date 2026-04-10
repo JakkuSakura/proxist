@@ -13,8 +13,11 @@ if[not "full" ~ lower getenv `DBSIZE;
 
 HUGELENGTH: `long$MODIFIER * "J"$getenv `HUGELENGTH;
 DECAY:1+2 xlog processcount;
-if[ .Q.w[][`mphy] < processcount*16*HUGELENGTH;
-  HUGELENGTH: .Q.w[][`mphy] div 2 * 16 * processcount; / use half of the physical memory
+memBytes: .Q.w[][`mphy];
+maxHuge: (memBytes div 2) div (16 * processcount);
+if[maxHuge < HUGELENGTH;
+  HUGELENGTH: maxHuge;
+  if[HUGELENGTH < 1; HUGELENGTH: 1];
   .qlog.info "Reducing HUGELENGTH to ", string[HUGELENGTH], " due to memory limit"];
 hugeVec: til HUGELENGTH;
 largeSymVec: LARGELENGTH?sym;
