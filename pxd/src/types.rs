@@ -34,6 +34,7 @@ pub struct ColumnSpec {
     pub name: String,
     pub col_type: ColumnType,
     pub nullable: bool,
+    pub default: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +45,10 @@ pub struct Schema {
 
 impl Schema {
     pub fn new(columns: Vec<ColumnSpec>) -> Result<Self> {
+        let mut columns = columns;
+        for column in &mut columns {
+            normalize_column_spec(column)?;
+        }
         let mut index = HashMap::with_capacity(columns.len() * 2);
         for (idx, column) in columns.iter().enumerate() {
             let key = column.name.to_ascii_lowercase();
@@ -67,6 +72,8 @@ impl Schema {
     }
 
     pub fn add_column(&mut self, column: ColumnSpec) -> Result<()> {
+        let mut column = column;
+        normalize_column_spec(&mut column)?;
         let key = column.name.to_ascii_lowercase();
         if self.index.contains_key(&key) {
             return Err(Error::InvalidData(format!(
@@ -80,6 +87,46 @@ impl Schema {
         Ok(())
     }
 
+    pub fn remove_column(&mut self, name: &str) -> Result<usize> {
+        let key = name.to_ascii_lowercase();
+        let idx = self.index.get(&key).copied().ok_or_else(|| {
+            Error::InvalidData(format!("unknown column name: {name}"))
+        })?;
+        self.columns.remove(idx);
+        self.rebuild_index();
+        Ok(idx)
+    }
+
+    pub fn rename_column(&mut self, from: &str, to: &str) -> Result<()> {
+        let from_key = from.to_ascii_lowercase();
+        let idx = self.index.get(&from_key).copied().ok_or_else(|| {
+            Error::InvalidData(format!("unknown column name: {from}"))
+        })?;
+        let to_key = to.to_ascii_lowercase();
+        if self.index.contains_key(&to_key) {
+            return Err(Error::InvalidData(format!(
+                "duplicate column name: {to}"
+            )));
+        }
+        self.columns[idx].name = to.to_string();
+        self.index.remove(&from_key);
+        self.index.insert(to_key, idx);
+        Ok(())
+    }
+
+    pub fn set_column_default(&mut self, idx: usize, default: Option<Value>) -> Result<()> {
+        if idx >= self.columns.len() {
+            return Err(Error::InvalidData(format!(
+                "column index out of bounds: {idx}"
+            )));
+        }
+        let col_type = self.columns[idx].col_type;
+        let nullable = self.columns[idx].nullable;
+        let normalized = normalize_default(default, col_type, nullable)?;
+        self.columns[idx].default = normalized;
+        Ok(())
+    }
+
     pub fn with_aliases(mut self, aliases: &[(String, usize)]) -> Self {
         for (alias, idx) in aliases {
             self.index
@@ -87,6 +134,22 @@ impl Schema {
                 .or_insert(*idx);
         }
         self
+    }
+
+    pub fn default_row(&self) -> Vec<Value> {
+        self.columns
+            .iter()
+            .map(|col| col.default.clone().unwrap_or(Value::Null))
+            .collect()
+    }
+
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        self.index
+            .reserve(self.columns.len().saturating_mul(2));
+        for (idx, column) in self.columns.iter().enumerate() {
+            self.index.insert(column.name.to_ascii_lowercase(), idx);
+        }
     }
 
     pub fn merge_with_prefix(
@@ -99,6 +162,7 @@ impl Schema {
                 name: format!("{}.{}", left.0, col.name),
                 col_type: col.col_type,
                 nullable: col.nullable,
+                default: None,
             });
         }
         for col in &right.1.columns {
@@ -106,6 +170,7 @@ impl Schema {
                 name: format!("{}.{}", right.0, col.name),
                 col_type: col.col_type,
                 nullable: col.nullable,
+                default: None,
             });
         }
         let mut schema = Schema::new(columns)?;
@@ -231,6 +296,36 @@ impl Value {
 
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
+    }
+}
+
+fn normalize_column_spec(column: &mut ColumnSpec) -> Result<()> {
+    if column.name.trim().is_empty() {
+        return Err(Error::InvalidData("column name cannot be empty".to_string()));
+    }
+    if let Some(default) = column.default.take() {
+        column.default = normalize_default(Some(default), column.col_type, column.nullable)?;
+    }
+    Ok(())
+}
+
+fn normalize_default(
+    default: Option<Value>,
+    col_type: ColumnType,
+    nullable: bool,
+) -> Result<Option<Value>> {
+    match default {
+        None => Ok(None),
+        Some(value) if value.is_null() => {
+            if nullable {
+                Ok(Some(Value::Null))
+            } else {
+                Err(Error::InvalidData(
+                    "non-nullable column cannot have NULL default".to_string(),
+                ))
+            }
+        }
+        Some(value) => Ok(Some(coerce_value(value, col_type)?)),
     }
 }
 

@@ -6,10 +6,17 @@ use crate::error::Result;
 use crate::expr::Expr;
 use crate::memstore::MemStore;
 use crate::pxl::{
-    decode_delete_payload, decode_insert_payload, decode_schema_payload, decode_update_payload,
-    encode_delete_payload, encode_insert_payload, encode_schema_payload, encode_update_payload, Op,
+    decode_alter_add_column_payload, decode_alter_drop_column_payload,
+    decode_alter_rename_column_payload, decode_alter_set_default_payload,
+    decode_create_as_payload, decode_delete_payload, decode_drop_table_payload,
+    decode_insert_payload, decode_rename_table_payload, decode_schema_payload,
+    decode_update_payload, encode_alter_add_column_payload, encode_alter_drop_column_payload,
+    encode_alter_rename_column_payload, encode_alter_set_default_payload, encode_create_as_payload,
+    encode_delete_payload, encode_drop_table_payload, encode_insert_payload,
+    encode_rename_table_payload, encode_schema_payload, encode_update_payload, Op,
 };
-use crate::types::Schema;
+use crate::query::QueryPlan;
+use crate::types::{ColumnSpec, Schema, Value};
 
 const MAGIC: [u8; 2] = *b"PW";
 const VERSION: u8 = 2;
@@ -71,6 +78,59 @@ impl Wal {
     pub fn append_delete(&mut self, table: &str, filter: Option<&Expr>) -> Result<u64> {
         let payload = encode_delete_payload(table, filter)?;
         self.append_record(Op::Delete, &payload)
+    }
+
+    pub fn append_alter_add_column(
+        &mut self,
+        table: &str,
+        column: &ColumnSpec,
+    ) -> Result<u64> {
+        let payload = encode_alter_add_column_payload(table, column)?;
+        self.append_record(Op::AlterAddColumn, &payload)
+    }
+
+    pub fn append_alter_drop_column(&mut self, table: &str, column: &str) -> Result<u64> {
+        let payload = encode_alter_drop_column_payload(table, column)?;
+        self.append_record(Op::AlterDropColumn, &payload)
+    }
+
+    pub fn append_alter_rename_column(
+        &mut self,
+        table: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<u64> {
+        let payload = encode_alter_rename_column_payload(table, from, to)?;
+        self.append_record(Op::AlterRenameColumn, &payload)
+    }
+
+    pub fn append_alter_set_default(
+        &mut self,
+        table: &str,
+        column: &str,
+        default: Option<&Value>,
+    ) -> Result<u64> {
+        let payload = encode_alter_set_default_payload(table, column, default)?;
+        self.append_record(Op::AlterSetDefault, &payload)
+    }
+
+    pub fn append_drop_table(&mut self, table: &str) -> Result<u64> {
+        let payload = encode_drop_table_payload(table)?;
+        self.append_record(Op::DropTable, &payload)
+    }
+
+    pub fn append_rename_table(&mut self, from: &str, to: &str) -> Result<u64> {
+        let payload = encode_rename_table_payload(from, to)?;
+        self.append_record(Op::RenameTable, &payload)
+    }
+
+    pub fn append_create_as(
+        &mut self,
+        table: &str,
+        plan: &QueryPlan,
+    ) -> Result<u64> {
+        let payload = encode_create_as_payload(table, plan)?;
+        self.append_record(Op::CreateAs, &payload)
     }
 
     fn append_record(&mut self, op: Op, payload: &[u8]) -> Result<u64> {
@@ -149,6 +209,34 @@ fn replay_wal(path: &Path, mem: &mut MemStore) -> Result<u64> {
                 let (table, filter) = decode_delete_payload(&payload)?;
                 mem.delete(&table, filter.as_ref())?;
             }
+            Op::AlterAddColumn => {
+                let (table, column) = decode_alter_add_column_payload(&payload)?;
+                mem.alter_add_column(&table, column)?;
+            }
+            Op::AlterDropColumn => {
+                let (table, column) = decode_alter_drop_column_payload(&payload)?;
+                mem.alter_drop_column(&table, &column)?;
+            }
+            Op::AlterRenameColumn => {
+                let (table, from, to) = decode_alter_rename_column_payload(&payload)?;
+                mem.alter_rename_column(&table, &from, &to)?;
+            }
+            Op::AlterSetDefault => {
+                let (table, column, default) = decode_alter_set_default_payload(&payload)?;
+                mem.alter_set_default(&table, &column, default)?;
+            }
+            Op::DropTable => {
+                let table = decode_drop_table_payload(&payload)?;
+                mem.drop_table(&table)?;
+            }
+            Op::RenameTable => {
+                let (from, to) = decode_rename_table_payload(&payload)?;
+                mem.rename_table(&from, &to)?;
+            }
+            Op::CreateAs => {
+                let (table, plan) = decode_create_as_payload(&payload)?;
+                mem.create_table_as(&table, &plan)?;
+            }
             _ => {}
         }
         last_lsn = last_lsn.max(lsn);
@@ -197,16 +285,19 @@ mod tests {
                 name: "symbol".to_string(),
                 col_type: ColumnType::String,
                 nullable: false,
+                default: None,
             },
             ColumnSpec {
                 name: "ts".to_string(),
                 col_type: ColumnType::I64,
                 nullable: false,
+                default: None,
             },
             ColumnSpec {
                 name: "price".to_string(),
                 col_type: ColumnType::F64,
                 nullable: false,
+                default: None,
             },
         ])
         .expect("schema")
@@ -337,6 +428,86 @@ mod tests {
         };
         let result = replayed.query(&plan).expect("query");
         assert!(result.rows.is_empty());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wal_replay_applies_ddl() {
+        let path = temp_wal_path("ddl");
+        let _ = fs::remove_file(&path);
+
+        let mut mem = MemStore::new();
+        {
+            let mut wal = Wal::open(&path, &mut mem, true).expect("open wal");
+            wal.append_create("ticks", &ticks_schema())
+                .expect("append create");
+            wal.append_insert(
+                "ticks",
+                &["symbol".to_string(), "ts".to_string(), "price".to_string()],
+                &[vec![
+                    Value::String("AAPL".to_string()),
+                    Value::I64(1),
+                    Value::F64(10.0),
+                ]],
+            )
+            .expect("append insert");
+            wal.append_alter_add_column(
+                "ticks",
+                &ColumnSpec {
+                    name: "lot".to_string(),
+                    col_type: ColumnType::I64,
+                    nullable: false,
+                    default: Some(Value::I64(100)),
+                },
+            )
+            .expect("append alter add");
+            wal.append_alter_set_default("ticks", "price", Some(&Value::I64(7)))
+                .expect("append alter default");
+            wal.append_alter_rename_column("ticks", "lot", "lots")
+                .expect("append rename column");
+            wal.append_alter_drop_column("ticks", "ts")
+                .expect("append drop column");
+            wal.append_rename_table("ticks", "trades")
+                .expect("append rename table");
+
+            let plan = crate::query::QueryPlan {
+                table: "trades".to_string(),
+                join: None,
+                filter: None,
+                group_by: Vec::new(),
+                select: vec![
+                    crate::query::SelectItem {
+                        expr: crate::query::SelectExpr::Column("symbol".to_string()),
+                        alias: None,
+                    },
+                    crate::query::SelectItem {
+                        expr: crate::query::SelectExpr::Column("price".to_string()),
+                        alias: None,
+                    },
+                ],
+            };
+            wal.append_create_as("snap", &plan)
+                .expect("append create as");
+        }
+
+        let mut replayed = MemStore::new();
+        let _wal = Wal::open(&path, &mut replayed, true).expect("replay wal");
+
+        let schema = replayed.table_schema("trades").expect("schema");
+        assert!(schema.column_index("ts").is_none());
+        assert!(schema.column_index("lot").is_none());
+        assert!(schema.column_index("lots").is_some());
+        let price_idx = schema.column_index("price").expect("price idx");
+        assert_eq!(schema.columns()[price_idx].default, Some(Value::F64(7.0)));
+
+        let row = replayed.table_row("trades", 0).expect("row");
+        let lots_idx = schema.column_index("lots").expect("lots idx");
+        assert_eq!(row.values[lots_idx], Value::I64(100));
+
+        let snap_schema = replayed.table_schema("snap").expect("snap schema");
+        assert_eq!(snap_schema.columns().len(), 2);
+        assert_eq!(replayed.table_row_count("snap"), Some(1));
 
         let _ = fs::remove_file(&path);
     }

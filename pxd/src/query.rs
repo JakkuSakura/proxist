@@ -192,16 +192,19 @@ mod tests {
                 name: "symbol".to_string(),
                 col_type: ColumnType::String,
                 nullable: false,
+                default: None,
             },
             ColumnSpec {
                 name: "ts".to_string(),
                 col_type: ColumnType::I64,
                 nullable: false,
+                default: None,
             },
             ColumnSpec {
                 name: "price".to_string(),
                 col_type: ColumnType::F64,
                 nullable: false,
+                default: None,
             },
         ])
         .expect("schema")

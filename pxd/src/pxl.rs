@@ -25,6 +25,13 @@ pub enum Op {
     Query = 14,
     Result = 15,
     Schema = 16,
+    AlterAddColumn = 17,
+    AlterDropColumn = 18,
+    AlterRenameColumn = 19,
+    AlterSetDefault = 20,
+    DropTable = 21,
+    RenameTable = 22,
+    CreateAs = 23,
 }
 
 impl Op {
@@ -40,6 +47,13 @@ impl Op {
             14 => Ok(Op::Query),
             15 => Ok(Op::Result),
             16 => Ok(Op::Schema),
+            17 => Ok(Op::AlterAddColumn),
+            18 => Ok(Op::AlterDropColumn),
+            19 => Ok(Op::AlterRenameColumn),
+            20 => Ok(Op::AlterSetDefault),
+            21 => Ok(Op::DropTable),
+            22 => Ok(Op::RenameTable),
+            23 => Ok(Op::CreateAs),
             _ => Err(Error::Protocol("unknown op")),
         }
     }
@@ -110,15 +124,122 @@ pub fn decode_error_payload(bytes: &[u8]) -> Result<String> {
 pub fn encode_schema_payload(table: &str, schema: &Schema) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     write_string(&mut out, table)?;
-    write_schema(&mut out, schema)?;
+    write_schema_with_defaults(&mut out, schema)?;
     Ok(out)
 }
 
 pub fn decode_schema_payload(bytes: &[u8]) -> Result<(String, Schema)> {
     let mut cursor = Cursor::new(bytes);
     let table = read_string(&mut cursor)?;
-    let schema = read_schema(&mut cursor)?;
+    let schema = read_schema_with_defaults(&mut cursor)?;
     Ok((table, schema))
+}
+
+pub fn encode_alter_add_column_payload(table: &str, column: &ColumnSpec) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_string(&mut out, table)?;
+    write_column_spec(&mut out, column)?;
+    Ok(out)
+}
+
+pub fn decode_alter_add_column_payload(bytes: &[u8]) -> Result<(String, ColumnSpec)> {
+    let mut cursor = Cursor::new(bytes);
+    let table = read_string(&mut cursor)?;
+    let column = read_column_spec(&mut cursor)?;
+    Ok((table, column))
+}
+
+pub fn encode_alter_drop_column_payload(table: &str, column: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_string(&mut out, table)?;
+    write_string(&mut out, column)?;
+    Ok(out)
+}
+
+pub fn decode_alter_drop_column_payload(bytes: &[u8]) -> Result<(String, String)> {
+    let mut cursor = Cursor::new(bytes);
+    let table = read_string(&mut cursor)?;
+    let column = read_string(&mut cursor)?;
+    Ok((table, column))
+}
+
+pub fn encode_alter_rename_column_payload(
+    table: &str,
+    from: &str,
+    to: &str,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_string(&mut out, table)?;
+    write_string(&mut out, from)?;
+    write_string(&mut out, to)?;
+    Ok(out)
+}
+
+pub fn decode_alter_rename_column_payload(bytes: &[u8]) -> Result<(String, String, String)> {
+    let mut cursor = Cursor::new(bytes);
+    let table = read_string(&mut cursor)?;
+    let from = read_string(&mut cursor)?;
+    let to = read_string(&mut cursor)?;
+    Ok((table, from, to))
+}
+
+pub fn encode_alter_set_default_payload(
+    table: &str,
+    column: &str,
+    default: Option<&Value>,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_string(&mut out, table)?;
+    write_string(&mut out, column)?;
+    write_default_value(&mut out, default)?;
+    Ok(out)
+}
+
+pub fn decode_alter_set_default_payload(bytes: &[u8]) -> Result<(String, String, Option<Value>)> {
+    let mut cursor = Cursor::new(bytes);
+    let table = read_string(&mut cursor)?;
+    let column = read_string(&mut cursor)?;
+    let default = read_default_value(&mut cursor)?;
+    Ok((table, column, default))
+}
+
+pub fn encode_drop_table_payload(table: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_string(&mut out, table)?;
+    Ok(out)
+}
+
+pub fn decode_drop_table_payload(bytes: &[u8]) -> Result<String> {
+    let mut cursor = Cursor::new(bytes);
+    read_string(&mut cursor)
+}
+
+pub fn encode_rename_table_payload(from: &str, to: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_string(&mut out, from)?;
+    write_string(&mut out, to)?;
+    Ok(out)
+}
+
+pub fn decode_rename_table_payload(bytes: &[u8]) -> Result<(String, String)> {
+    let mut cursor = Cursor::new(bytes);
+    let from = read_string(&mut cursor)?;
+    let to = read_string(&mut cursor)?;
+    Ok((from, to))
+}
+
+pub fn encode_create_as_payload(table: &str, plan: &QueryPlan) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_string(&mut out, table)?;
+    write_query_payload(&mut out, plan)?;
+    Ok(out)
+}
+
+pub fn decode_create_as_payload(bytes: &[u8]) -> Result<(String, QueryPlan)> {
+    let mut cursor = Cursor::new(bytes);
+    let table = read_string(&mut cursor)?;
+    let plan = read_query_payload(&mut cursor)?;
+    Ok((table, plan))
 }
 
 pub fn encode_insert_payload(
@@ -199,27 +320,36 @@ pub fn decode_delete_payload(bytes: &[u8]) -> Result<(String, Option<Expr>)> {
 
 pub fn encode_query_payload(plan: &QueryPlan) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    write_string(&mut out, &plan.table)?;
-    write_join_option(&mut out, plan.join.as_ref())?;
-    write_expr_option(&mut out, plan.filter.as_ref())?;
-    write_string_list(&mut out, &plan.group_by)?;
-    write_u32(&mut out, plan.select.len() as u32)?;
-    for item in &plan.select {
-        write_select_item(&mut out, item)?;
-    }
+    write_query_payload(&mut out, plan)?;
     Ok(out)
 }
 
 pub fn decode_query_payload(bytes: &[u8]) -> Result<QueryPlan> {
     let mut cursor = Cursor::new(bytes);
-    let table = read_string(&mut cursor)?;
-    let join = read_join_option(&mut cursor)?;
-    let filter = read_expr_option(&mut cursor)?;
-    let group_by = read_string_list(&mut cursor)?;
-    let select_count = read_u32(&mut cursor)? as usize;
+    read_query_payload(&mut cursor)
+}
+
+fn write_query_payload(out: &mut Vec<u8>, plan: &QueryPlan) -> Result<()> {
+    write_string(out, &plan.table)?;
+    write_join_option(out, plan.join.as_ref())?;
+    write_expr_option(out, plan.filter.as_ref())?;
+    write_string_list(out, &plan.group_by)?;
+    write_u32(out, plan.select.len() as u32)?;
+    for item in &plan.select {
+        write_select_item(out, item)?;
+    }
+    Ok(())
+}
+
+fn read_query_payload(cursor: &mut Cursor<'_>) -> Result<QueryPlan> {
+    let table = read_string(cursor)?;
+    let join = read_join_option(cursor)?;
+    let filter = read_expr_option(cursor)?;
+    let group_by = read_string_list(cursor)?;
+    let select_count = read_u32(cursor)? as usize;
     let mut select = Vec::with_capacity(select_count);
     for _ in 0..select_count {
-        select.push(read_select_item(&mut cursor)?);
+        select.push(read_select_item(cursor)?);
     }
     Ok(QueryPlan {
         table,
@@ -372,9 +502,93 @@ fn read_schema(cursor: &mut Cursor<'_>) -> Result<Schema> {
             name,
             col_type,
             nullable,
+            default: None,
         });
     }
     Schema::new(columns)
+}
+
+fn write_schema_with_defaults(out: &mut Vec<u8>, schema: &Schema) -> Result<()> {
+    write_schema(out, schema)?;
+    write_schema_defaults(out, schema)?;
+    Ok(())
+}
+
+fn write_schema_defaults(out: &mut Vec<u8>, schema: &Schema) -> Result<()> {
+    out.push(1);
+    write_u32(out, schema.columns().len() as u32)?;
+    for col in schema.columns() {
+        write_default_value(out, col.default.as_ref())?;
+    }
+    Ok(())
+}
+
+fn read_schema_with_defaults(cursor: &mut Cursor<'_>) -> Result<Schema> {
+    let mut schema = read_schema(cursor)?;
+    if cursor.pos >= cursor.bytes.len() {
+        return Ok(schema);
+    }
+    let marker = read_byte(cursor)?;
+    if marker == 0 {
+        return Ok(schema);
+    }
+    if marker != 1 {
+        return Err(Error::Protocol("unknown schema defaults marker"));
+    }
+    let count = read_u32(cursor)? as usize;
+    if count != schema.columns().len() {
+        return Err(Error::InvalidData(
+            "schema defaults count mismatch".to_string(),
+        ));
+    }
+    for idx in 0..count {
+        let default = read_default_value(cursor)?;
+        schema.set_column_default(idx, default)?;
+    }
+    Ok(schema)
+}
+
+fn write_column_spec(out: &mut Vec<u8>, column: &ColumnSpec) -> Result<()> {
+    write_string(out, &column.name)?;
+    out.push(column.col_type as u8);
+    out.push(column.nullable as u8);
+    write_default_value(out, column.default.as_ref())?;
+    Ok(())
+}
+
+fn read_column_spec(cursor: &mut Cursor<'_>) -> Result<ColumnSpec> {
+    let name = read_string(cursor)?;
+    let col_type = ColumnType::from_u8(read_byte(cursor)?)?;
+    let nullable = read_byte(cursor)? != 0;
+    let default = read_default_value(cursor)?;
+    Ok(ColumnSpec {
+        name,
+        col_type,
+        nullable,
+        default,
+    })
+}
+
+fn write_default_value(out: &mut Vec<u8>, default: Option<&Value>) -> Result<()> {
+    match default {
+        Some(value) => {
+            out.push(1);
+            write_value(out, value)?;
+        }
+        None => {
+            out.push(0);
+        }
+    }
+    Ok(())
+}
+
+fn read_default_value(cursor: &mut Cursor<'_>) -> Result<Option<Value>> {
+    let tag = read_byte(cursor)?;
+    match tag {
+        0 => Ok(None),
+        1 => Ok(Some(read_value(cursor)?)),
+        _ => Err(Error::Protocol("unknown default tag")),
+    }
 }
 
 fn write_values(out: &mut Vec<u8>, values: &[Value]) -> Result<()> {
@@ -447,9 +661,15 @@ mod tests {
     use std::io::Cursor;
 
     use super::{
-        decode_delete_payload, decode_insert_payload, decode_query_payload, decode_schema_payload,
-        decode_update_payload, encode_delete_payload, encode_insert_payload, encode_query_payload,
-        encode_schema_payload, encode_update_payload, read_frame, write_frame, Frame, Op,
+        decode_alter_add_column_payload, decode_alter_drop_column_payload,
+        decode_alter_rename_column_payload, decode_alter_set_default_payload,
+        decode_create_as_payload, decode_delete_payload, decode_insert_payload,
+        decode_query_payload, decode_schema_payload, decode_update_payload,
+        encode_alter_add_column_payload, encode_alter_drop_column_payload,
+        encode_alter_rename_column_payload, encode_alter_set_default_payload,
+        encode_create_as_payload, encode_delete_payload, encode_insert_payload,
+        encode_query_payload, encode_schema_payload, encode_update_payload, read_frame, write_frame,
+        Frame, Op,
     };
     use crate::expr::{BinaryOp, Expr};
     use crate::query::{
@@ -483,11 +703,13 @@ mod tests {
                 name: "symbol".to_string(),
                 col_type: ColumnType::String,
                 nullable: false,
+                default: None,
             },
             ColumnSpec {
                 name: "ts".to_string(),
                 col_type: ColumnType::I64,
                 nullable: false,
+                default: None,
             },
         ])
         .expect("schema");
@@ -495,6 +717,32 @@ mod tests {
         let (table, decoded) = decode_schema_payload(&payload).expect("decode");
         assert_eq!(table, "ticks");
         assert_eq!(decoded.columns().len(), 2);
+    }
+
+    #[test]
+    fn schema_defaults_roundtrip() {
+        let schema = Schema::new(vec![
+            ColumnSpec {
+                name: "symbol".to_string(),
+                col_type: ColumnType::String,
+                nullable: false,
+                default: Some(Value::String("AAPL".to_string())),
+            },
+            ColumnSpec {
+                name: "price".to_string(),
+                col_type: ColumnType::F64,
+                nullable: true,
+                default: Some(Value::Null),
+            },
+        ])
+        .expect("schema");
+        let payload = encode_schema_payload("ticks", &schema).expect("encode");
+        let (_, decoded) = decode_schema_payload(&payload).expect("decode");
+        assert_eq!(
+            decoded.columns()[0].default,
+            Some(Value::String("AAPL".to_string()))
+        );
+        assert_eq!(decoded.columns()[1].default, Some(Value::Null));
     }
 
     #[test]
@@ -586,6 +834,65 @@ mod tests {
         assert_eq!(decoded.join.as_ref().unwrap().right_table, "quotes");
         assert_eq!(decoded.group_by, vec!["symbol"]);
         assert_eq!(decoded.select.len(), 3);
+    }
+
+    #[test]
+    fn ddl_payload_roundtrip() {
+        let col = ColumnSpec {
+            name: "qty".to_string(),
+            col_type: ColumnType::I64,
+            nullable: false,
+            default: Some(Value::I64(1)),
+        };
+        let add = encode_alter_add_column_payload("ticks", &col).expect("encode add");
+        let (table, decoded) = decode_alter_add_column_payload(&add).expect("decode add");
+        assert_eq!(table, "ticks");
+        assert_eq!(decoded.name, "qty");
+        assert_eq!(decoded.default, Some(Value::I64(1)));
+
+        let drop = encode_alter_drop_column_payload("ticks", "old")
+            .expect("encode drop");
+        let (table, col) = decode_alter_drop_column_payload(&drop).expect("decode drop");
+        assert_eq!(table, "ticks");
+        assert_eq!(col, "old");
+
+        let rename = encode_alter_rename_column_payload("ticks", "a", "b")
+            .expect("encode rename");
+        let (table, from, to) =
+            decode_alter_rename_column_payload(&rename).expect("decode rename");
+        assert_eq!(table, "ticks");
+        assert_eq!(from, "a");
+        assert_eq!(to, "b");
+
+        let set_default = encode_alter_set_default_payload(
+            "ticks",
+            "qty",
+            Some(&Value::I64(9)),
+        )
+        .expect("encode set default");
+        let (table, col, default) =
+            decode_alter_set_default_payload(&set_default).expect("decode set default");
+        assert_eq!(table, "ticks");
+        assert_eq!(col, "qty");
+        assert_eq!(default, Some(Value::I64(9)));
+    }
+
+    #[test]
+    fn create_as_payload_roundtrip() {
+        let plan = QueryPlan {
+            table: "ticks".to_string(),
+            join: None,
+            filter: None,
+            group_by: Vec::new(),
+            select: vec![SelectItem {
+                expr: SelectExpr::Column("symbol".to_string()),
+                alias: None,
+            }],
+        };
+        let payload = encode_create_as_payload("snap", &plan).expect("encode");
+        let (table, decoded) = decode_create_as_payload(&payload).expect("decode");
+        assert_eq!(table, "snap");
+        assert_eq!(decoded.table, "ticks");
     }
 }
 

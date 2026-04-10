@@ -1,15 +1,18 @@
 use fp_core::query::SqlDialect;
 use fp_core::sql_ast::{
-    BinaryOperator, ColumnDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr, GroupByExpr,
-    JoinConstraint, JoinOperator, ObjectName, OrderByExpr, SetExpr, Statement, TableFactor,
-    TableWithJoins, UnaryOperator, Value as SqlValue, WindowFrameBound, WindowFrameUnits,
-    WindowType,
+    AlterTableOperation, BinaryOperator, ColumnDef, ColumnOption, DataType, Expr, Function,
+    FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint, JoinOperator, ObjectName,
+    OrderByExpr, SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator,
+    Value as SqlValue, WindowFrameBound, WindowFrameUnits, WindowType,
 };
 use fp_prql::compile_prql;
 use fp_sql::sql_ast::parse_sql_ast;
 use pxd::expr::{BinaryOp as PxlBinaryOp, Expr as PxlExpr};
 use pxd::pxl::{
-    encode_delete_payload, encode_frame, encode_insert_payload, encode_query_payload,
+    encode_alter_add_column_payload, encode_alter_drop_column_payload,
+    encode_alter_rename_column_payload, encode_alter_set_default_payload,
+    encode_create_as_payload, encode_delete_payload, encode_drop_table_payload, encode_frame,
+    encode_insert_payload, encode_query_payload, encode_rename_table_payload,
     encode_schema_payload, encode_update_payload, Frame, Op,
 };
 use pxd::query::{
@@ -25,8 +28,20 @@ pub enum InputKind {
 }
 
 pub fn compile_to_frame(input: &str, kind: InputKind, req_id: u32) -> Result<Vec<u8>, String> {
-    let statement = match kind {
-        InputKind::Sql => parse_single_sql(input)?,
+    let frame = match kind {
+        InputKind::Sql => match parse_single_sql(input) {
+            Ok(statement) => match statement_to_frame(statement, req_id) {
+                Ok(frame) => frame,
+                Err(err) => match parse_manual_ddl(input)? {
+                    Some(manual) => manual_to_frame(manual, req_id)?,
+                    None => return Err(err),
+                },
+            },
+            Err(err) => match parse_manual_ddl(input)? {
+                Some(manual) => manual_to_frame(manual, req_id)?,
+                None => return Err(err),
+            },
+        },
         InputKind::Prql => {
             let compiled = compile_prql(input, Some(SqlDialect::Generic))
                 .map_err(|err| format!("PRQL compile failed: {err}"))?;
@@ -36,11 +51,10 @@ pub fn compile_to_frame(input: &str, kind: InputKind, req_id: u32) -> Result<Vec
             if compiled.statements.len() != 1 {
                 return Err("PRQL compile produced multiple statements".to_string());
             }
-            parse_single_sql(&compiled.statements[0])?
+            let statement = parse_single_sql(&compiled.statements[0])?;
+            statement_to_frame(statement, req_id)?
         }
     };
-
-    let frame = statement_to_frame(statement, req_id)?;
     Ok(encode_frame(&frame))
 }
 
@@ -59,10 +73,20 @@ fn parse_single_sql(input: &str) -> Result<Statement, String> {
 fn statement_to_frame(statement: Statement, req_id: u32) -> Result<Frame, String> {
     match statement {
         Statement::CreateTable { name, columns, query, .. } => {
-            if query.is_some() {
-                return Err("CREATE TABLE AS SELECT is not supported".to_string());
+            if let Some(query) = query {
+                if !columns.is_empty() {
+                    return Err("CTAS does not support column definitions".to_string());
+                }
+                compile_create_as(name, *query, req_id)
+            } else {
+                compile_create(name, columns, req_id)
             }
-            compile_create(name, columns, req_id)
+        }
+        Statement::AlterTable { name, operations } => {
+            compile_alter_table(name, operations, req_id)
+        }
+        Statement::Drop { object_type, names } => {
+            compile_drop_table(object_type, names, req_id)
         }
         Statement::Insert {
             table_name,
@@ -92,10 +116,12 @@ fn compile_create(
     let mut specs = Vec::with_capacity(columns.len());
     for col in columns {
         let col_type = map_data_type(&col.data_type)?;
+        let default = column_default_from_options(&col.options)?;
         specs.push(ColumnSpec {
             name: col.name.value.clone(),
             col_type,
             nullable: true,
+            default,
         });
     }
     let schema = Schema::new(specs).map_err(|err| format!("invalid schema: {err}"))?;
@@ -105,6 +131,88 @@ fn compile_create(
         flags: 0,
         req_id,
         op: Op::Create,
+        payload,
+    })
+}
+
+fn compile_create_as(
+    name: ObjectName,
+    query: fp_core::sql_ast::Query,
+    req_id: u32,
+) -> Result<Frame, String> {
+    validate_query_shape(&query)?;
+    let plan = build_query_plan(query)?;
+    let payload = encode_create_as_payload(&name.to_string(), &plan)
+        .map_err(|err| format!("encode CTAS payload failed: {err}"))?;
+    Ok(Frame {
+        flags: 0,
+        req_id,
+        op: Op::CreateAs,
+        payload,
+    })
+}
+
+fn compile_alter_table(
+    name: ObjectName,
+    operations: Vec<AlterTableOperation>,
+    req_id: u32,
+) -> Result<Frame, String> {
+    if operations.len() != 1 {
+        return Err("ALTER TABLE supports one operation at a time".to_string());
+    }
+    let op = operations.into_iter().next().expect("operation");
+    match op {
+        AlterTableOperation::AddColumn { column_def } => {
+            compile_alter_add_column(name, column_def, req_id)
+        }
+    }
+}
+
+fn compile_alter_add_column(
+    name: ObjectName,
+    column: ColumnDef,
+    req_id: u32,
+) -> Result<Frame, String> {
+    let col_type = map_data_type(&column.data_type)?;
+    let default = column_default_from_options(&column.options)?;
+    let spec = ColumnSpec {
+        name: column.name.value,
+        col_type,
+        nullable: true,
+        default,
+    };
+    let payload = encode_alter_add_column_payload(&name.to_string(), &spec)
+        .map_err(|err| format!("encode alter add column payload failed: {err}"))?;
+    Ok(Frame {
+        flags: 0,
+        req_id,
+        op: Op::AlterAddColumn,
+        payload,
+    })
+}
+
+fn compile_drop_table(
+    object_type: fp_core::sql_ast::ObjectType,
+    names: Vec<ObjectName>,
+    req_id: u32,
+) -> Result<Frame, String> {
+    if object_type != fp_core::sql_ast::ObjectType::Table {
+        return Err("only DROP TABLE is supported".to_string());
+    }
+    if names.len() != 1 {
+        return Err("DROP TABLE supports one table at a time".to_string());
+    }
+    let table = names
+        .into_iter()
+        .next()
+        .expect("table")
+        .to_string();
+    let payload = encode_drop_table_payload(&table)
+        .map_err(|err| format!("encode drop table payload failed: {err}"))?;
+    Ok(Frame {
+        flags: 0,
+        req_id,
+        op: Op::DropTable,
         payload,
     })
 }
@@ -218,6 +326,166 @@ fn compile_delete(
         op: Op::Delete,
         payload,
     })
+}
+
+#[derive(Debug, Clone)]
+enum ManualDdl {
+    AlterDropColumn { table: String, column: String },
+    AlterRenameColumn { table: String, from: String, to: String },
+    AlterSetDefault {
+        table: String,
+        column: String,
+        default: PxlValue,
+    },
+    RenameTable { from: String, to: String },
+}
+
+fn parse_manual_ddl(input: &str) -> Result<Option<ManualDdl>, String> {
+    let trimmed = input.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.len() < 4 {
+        return Ok(None);
+    }
+    let upper: Vec<String> = tokens.iter().map(|t| t.to_ascii_uppercase()).collect();
+    if upper[0] == "RENAME" && upper[1] == "TABLE" && upper.len() >= 5 && upper[3] == "TO" {
+        return Ok(Some(ManualDdl::RenameTable {
+            from: tokens[2].to_string(),
+            to: tokens[4].to_string(),
+        }));
+    }
+    if upper[0] == "ALTER" && upper[1] == "TABLE" && upper.len() >= 6 {
+        let table = tokens[2].to_string();
+        if upper[3] == "DROP" && upper.get(4) == Some(&"COLUMN".to_string()) {
+            return Ok(Some(ManualDdl::AlterDropColumn {
+                table,
+                column: tokens[5].to_string(),
+            }));
+        }
+        if upper[3] == "RENAME"
+            && upper.get(4) == Some(&"COLUMN".to_string())
+            && upper.len() >= 8
+            && upper[6] == "TO"
+        {
+            return Ok(Some(ManualDdl::AlterRenameColumn {
+                table,
+                from: tokens[5].to_string(),
+                to: tokens[7].to_string(),
+            }));
+        }
+        if upper[3] == "ALTER" && upper.get(4) == Some(&"COLUMN".to_string()) {
+            let column = tokens[5].to_string();
+            if let Some(set_idx) = upper.iter().position(|v| v == "SET") {
+                if upper.get(set_idx + 1) == Some(&"DEFAULT".to_string())
+                    && set_idx + 2 < tokens.len()
+                {
+                    let expr_tokens = &tokens[(set_idx + 2)..];
+                    let expr = expr_tokens.join(" ");
+                    let default = parse_default_expr(&expr)?;
+                    return Ok(Some(ManualDdl::AlterSetDefault {
+                        table,
+                        column,
+                        default,
+                    }));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn manual_to_frame(manual: ManualDdl, req_id: u32) -> Result<Frame, String> {
+    match manual {
+        ManualDdl::AlterDropColumn { table, column } => {
+            let payload = encode_alter_drop_column_payload(&table, &column)
+                .map_err(|err| format!("encode alter drop column payload failed: {err}"))?;
+            Ok(Frame {
+                flags: 0,
+                req_id,
+                op: Op::AlterDropColumn,
+                payload,
+            })
+        }
+        ManualDdl::AlterRenameColumn { table, from, to } => {
+            let payload = encode_alter_rename_column_payload(&table, &from, &to)
+                .map_err(|err| format!("encode alter rename column payload failed: {err}"))?;
+            Ok(Frame {
+                flags: 0,
+                req_id,
+                op: Op::AlterRenameColumn,
+                payload,
+            })
+        }
+        ManualDdl::AlterSetDefault {
+            table,
+            column,
+            default,
+        } => {
+            let payload = encode_alter_set_default_payload(&table, &column, Some(&default))
+                .map_err(|err| format!("encode alter set default payload failed: {err}"))?;
+            Ok(Frame {
+                flags: 0,
+                req_id,
+                op: Op::AlterSetDefault,
+                payload,
+            })
+        }
+        ManualDdl::RenameTable { from, to } => {
+            let payload = encode_rename_table_payload(&from, &to)
+                .map_err(|err| format!("encode rename table payload failed: {err}"))?;
+            Ok(Frame {
+                flags: 0,
+                req_id,
+                op: Op::RenameTable,
+                payload,
+            })
+        }
+    }
+}
+
+fn column_default_from_options(
+    options: &[fp_core::sql_ast::ColumnOptionDef],
+) -> Result<Option<PxlValue>, String> {
+    let mut found: Option<PxlValue> = None;
+    for option in options {
+        match &option.option {
+            ColumnOption::Default(expr) => {
+                if found.is_some() {
+                    return Err("column default specified more than once".to_string());
+                }
+                let value = expr_to_literal_value(expr)?;
+                found = Some(value);
+            }
+            ColumnOption::Materialized(_) => {
+                return Err("MATERIALIZED columns are not supported".to_string());
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn parse_default_expr(expr: &str) -> Result<PxlValue, String> {
+    let sql = format!("SELECT {expr}");
+    let statement = parse_single_sql(&sql)?;
+    let Statement::Query(query) = statement else {
+        return Err("DEFAULT expression parse failed".to_string());
+    };
+    let SetExpr::Select(select) = *query.body else {
+        return Err("DEFAULT expression parse failed".to_string());
+    };
+    let select = *select;
+    if select.projection.len() != 1 {
+        return Err("DEFAULT expression must be a single literal".to_string());
+    }
+    match &select.projection[0] {
+        fp_core::sql_ast::SelectItem::UnnamedExpr(expr)
+        | fp_core::sql_ast::SelectItem::ExprWithAlias { expr, .. } => {
+            expr_to_literal_value(expr)
+        }
+        _ => Err("DEFAULT expression must be a literal".to_string()),
+    }
 }
 
 fn validate_query_shape(query: &fp_core::sql_ast::Query) -> Result<(), String> {
@@ -663,7 +931,10 @@ fn expr_to_u64(expr: &Expr) -> Result<u64, String> {
 mod tests {
     use super::*;
     use pxd::pxl::{
-        decode_delete_payload, decode_insert_payload, decode_query_payload,
+        decode_alter_add_column_payload, decode_alter_drop_column_payload,
+        decode_alter_rename_column_payload, decode_alter_set_default_payload,
+        decode_create_as_payload, decode_delete_payload, decode_drop_table_payload,
+        decode_insert_payload, decode_query_payload, decode_rename_table_payload,
         decode_schema_payload, decode_update_payload, read_frame,
     };
     use std::io::Cursor;
@@ -684,6 +955,33 @@ mod tests {
         let (table, schema) = decode_schema_payload(&frame.payload).expect("payload");
         assert_eq!(table, "ticks");
         assert_eq!(schema.columns().len(), 3);
+    }
+
+    #[test]
+    fn compile_create_table_with_defaults() {
+        let sql = "CREATE TABLE ticks (symbol String DEFAULT 'AAPL', ts Int64 DEFAULT 1, value Float64 DEFAULT 1.5)";
+        let bytes = compile_to_frame(sql, InputKind::Sql, 11).expect("compile");
+        let frame = decode_frame(bytes);
+        assert_eq!(frame.op, Op::Create);
+        let (_, schema) = decode_schema_payload(&frame.payload).expect("payload");
+        let symbol = schema.columns().iter().find(|c| c.name == "symbol").expect("symbol");
+        let ts = schema.columns().iter().find(|c| c.name == "ts").expect("ts");
+        let value = schema.columns().iter().find(|c| c.name == "value").expect("value");
+        assert_eq!(symbol.default, Some(PxlValue::String("AAPL".to_string())));
+        assert_eq!(ts.default, Some(PxlValue::I64(1)));
+        assert_eq!(value.default, Some(PxlValue::F64(1.5)));
+    }
+
+    #[test]
+    fn compile_alter_add_column_with_default() {
+        let sql = "ALTER TABLE ticks ADD COLUMN lot Int64 DEFAULT 100";
+        let bytes = compile_to_frame(sql, InputKind::Sql, 12).expect("compile");
+        let frame = decode_frame(bytes);
+        assert_eq!(frame.op, Op::AlterAddColumn);
+        let (table, column) = decode_alter_add_column_payload(&frame.payload).expect("payload");
+        assert_eq!(table, "ticks");
+        assert_eq!(column.name, "lot");
+        assert_eq!(column.default, Some(PxlValue::I64(100)));
     }
 
     #[test]
@@ -733,6 +1031,75 @@ mod tests {
     }
 
     #[test]
+    fn compile_drop_table_sql() {
+        let sql = "DROP TABLE ticks";
+        let bytes = compile_to_frame(sql, InputKind::Sql, 13).expect("compile");
+        let frame = decode_frame(bytes);
+        assert_eq!(frame.op, Op::DropTable);
+        let table = decode_drop_table_payload(&frame.payload).expect("payload");
+        assert_eq!(table, "ticks");
+    }
+
+    #[test]
+    fn compile_rename_table_manual() {
+        let sql = "RENAME TABLE ticks TO trades";
+        let bytes = compile_to_frame(sql, InputKind::Sql, 14).expect("compile");
+        let frame = decode_frame(bytes);
+        assert_eq!(frame.op, Op::RenameTable);
+        let (from, to) = decode_rename_table_payload(&frame.payload).expect("payload");
+        assert_eq!(from, "ticks");
+        assert_eq!(to, "trades");
+    }
+
+    #[test]
+    fn compile_alter_drop_column_manual() {
+        let sql = "ALTER TABLE ticks DROP COLUMN price";
+        let bytes = compile_to_frame(sql, InputKind::Sql, 15).expect("compile");
+        let frame = decode_frame(bytes);
+        assert_eq!(frame.op, Op::AlterDropColumn);
+        let (table, column) = decode_alter_drop_column_payload(&frame.payload).expect("payload");
+        assert_eq!(table, "ticks");
+        assert_eq!(column, "price");
+    }
+
+    #[test]
+    fn compile_alter_rename_column_manual() {
+        let sql = "ALTER TABLE ticks RENAME COLUMN price TO px";
+        let bytes = compile_to_frame(sql, InputKind::Sql, 16).expect("compile");
+        let frame = decode_frame(bytes);
+        assert_eq!(frame.op, Op::AlterRenameColumn);
+        let (table, from, to) =
+            decode_alter_rename_column_payload(&frame.payload).expect("payload");
+        assert_eq!(table, "ticks");
+        assert_eq!(from, "price");
+        assert_eq!(to, "px");
+    }
+
+    #[test]
+    fn compile_alter_set_default_manual() {
+        let sql = "ALTER TABLE ticks ALTER COLUMN price SET DEFAULT 9";
+        let bytes = compile_to_frame(sql, InputKind::Sql, 17).expect("compile");
+        let frame = decode_frame(bytes);
+        assert_eq!(frame.op, Op::AlterSetDefault);
+        let (table, column, default) =
+            decode_alter_set_default_payload(&frame.payload).expect("payload");
+        assert_eq!(table, "ticks");
+        assert_eq!(column, "price");
+        assert_eq!(default, Some(PxlValue::I64(9)));
+    }
+
+    #[test]
+    fn compile_create_table_as_select() {
+        let sql = "CREATE TABLE snap AS SELECT symbol, price FROM ticks";
+        let bytes = compile_to_frame(sql, InputKind::Sql, 18).expect("compile");
+        let frame = decode_frame(bytes);
+        assert_eq!(frame.op, Op::CreateAs);
+        let (table, plan) = decode_create_as_payload(&frame.payload).expect("payload");
+        assert_eq!(table, "snap");
+        assert_eq!(plan.table, "ticks");
+    }
+
+    #[test]
     fn compile_prql_to_query() {
         let prql = r#"
 from ticks
@@ -764,7 +1131,7 @@ from ticks
     fn compile_create_table_as_select_error() {
         let sql = "CREATE TABLE t AS SELECT 1";
         let err = compile_to_frame(sql, InputKind::Sql, 1).expect_err("error");
-        assert!(err.contains("CREATE TABLE AS SELECT"));
+        assert!(err.contains("FROM"));
     }
 
     #[test]

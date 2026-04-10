@@ -49,6 +49,111 @@ impl MemStore {
         Ok(())
     }
 
+    pub fn create_table_as(&mut self, name: &str, plan: &QueryPlan) -> Result<()> {
+        if self.tables.contains_key(name) {
+            return Err(Error::InvalidData(format!(
+                "table already exists: {name}"
+            )));
+        }
+        let result = {
+            let mem_ref: &MemStore = &*self;
+            mem_ref.query(plan)?
+        };
+        let schema = result.schema.clone();
+        self.create_table(name, schema)?;
+        if !result.rows.is_empty() {
+            let columns: Vec<String> = result
+                .schema
+                .columns()
+                .iter()
+                .map(|col| col.name.clone())
+                .collect();
+            let rows: Vec<Vec<Value>> = result.rows.into_iter().map(|row| row.values).collect();
+            self.insert(name, &columns, &rows)?;
+        }
+        Ok(())
+    }
+
+    pub fn alter_add_column(&mut self, table: &str, column: ColumnSpec) -> Result<()> {
+        let table = self.tables.get_mut(table).ok_or_else(|| {
+            Error::InvalidData(format!("table not found: {table}"))
+        })?;
+        table.schema.add_column(column)?;
+        let idx = table.schema.columns().len().saturating_sub(1);
+        let default_value = table
+            .schema
+            .columns()
+            .get(idx)
+            .and_then(|col| col.default.clone())
+            .unwrap_or(Value::Null);
+        for row in &mut table.rows {
+            row.values.push(default_value.clone());
+        }
+        Ok(())
+    }
+
+    pub fn alter_drop_column(&mut self, table: &str, column: &str) -> Result<()> {
+        let table = self.tables.get_mut(table).ok_or_else(|| {
+            Error::InvalidData(format!("table not found: {table}"))
+        })?;
+        let idx = table.schema.remove_column(column)?;
+        for row in &mut table.rows {
+            if idx < row.values.len() {
+                row.values.remove(idx);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn alter_rename_column(&mut self, table: &str, from: &str, to: &str) -> Result<()> {
+        let table = self.tables.get_mut(table).ok_or_else(|| {
+            Error::InvalidData(format!("table not found: {table}"))
+        })?;
+        table.schema.rename_column(from, to)?;
+        Ok(())
+    }
+
+    pub fn alter_set_default(
+        &mut self,
+        table: &str,
+        column: &str,
+        default: Option<Value>,
+    ) -> Result<()> {
+        let table = self.tables.get_mut(table).ok_or_else(|| {
+            Error::InvalidData(format!("table not found: {table}"))
+        })?;
+        let idx = table.schema.column_index(column).ok_or_else(|| {
+            Error::InvalidData(format!("unknown column name: {column}"))
+        })?;
+        table.schema.set_column_default(idx, default)?;
+        Ok(())
+    }
+
+    pub fn drop_table(&mut self, table: &str) -> Result<()> {
+        if self.tables.remove(table).is_none() {
+            return Err(Error::InvalidData(format!(
+                "table not found: {table}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn rename_table(&mut self, from: &str, to: &str) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        if self.tables.contains_key(to) {
+            return Err(Error::InvalidData(format!(
+                "table already exists: {to}"
+            )));
+        }
+        let table = self.tables.remove(from).ok_or_else(|| {
+            Error::InvalidData(format!("table not found: {from}"))
+        })?;
+        self.tables.insert(to.to_string(), table);
+        Ok(())
+    }
+
     pub fn insert(&mut self, table: &str, columns: &[String], rows: &[Vec<Value>]) -> Result<()> {
         let table = self
             .tables
@@ -70,6 +175,7 @@ impl MemStore {
                             name: name.clone(),
                             col_type,
                             nullable: true,
+                            default: None,
                         })?;
                     let idx = table.schema.columns().len() - 1;
                     for row in &mut table.rows {
@@ -82,6 +188,7 @@ impl MemStore {
         }
 
         let schema_len = table.schema.columns().len();
+        let base_row = table.schema.default_row();
         table.rows.reserve(rows.len());
         for values in rows {
             if values.len() != columns.len() {
@@ -89,7 +196,10 @@ impl MemStore {
                     "insert row length mismatch".to_string(),
                 ));
             }
-            let mut row = vec![Value::Null; schema_len];
+            let mut row = base_row.clone();
+            if row.len() != schema_len {
+                row.resize(schema_len, Value::Null);
+            }
             for (idx, value) in col_indices.iter().zip(values.iter()) {
                 row[*idx] = value.clone();
             }
@@ -136,6 +246,7 @@ impl MemStore {
                             name: name.clone(),
                             col_type,
                             nullable: true,
+                            default: None,
                         })?;
                     let idx = table.schema.columns().len() - 1;
                     for row in &mut table.rows {
@@ -245,6 +356,7 @@ impl MemStore {
                     name,
                     col_type,
                     nullable: true,
+                    default: None,
                 })
                 .collect(),
         )?;
@@ -423,6 +535,7 @@ impl MemStore {
                     name,
                     col_type,
                     nullable: true,
+                    default: None,
                 })
                 .collect(),
         )?;
@@ -497,6 +610,7 @@ impl MemStore {
                     name,
                     col_type,
                     nullable: true,
+                    default: None,
                 })
                 .collect(),
         )?;
@@ -710,11 +824,13 @@ mod tests {
                 name: "symbol".to_string(),
                 col_type: ColumnType::String,
                 nullable: false,
+                default: None,
             },
             ColumnSpec {
                 name: "price".to_string(),
                 col_type: ColumnType::F64,
                 nullable: false,
+                default: None,
             },
         ])
         .expect("schema");
@@ -888,6 +1004,127 @@ mod tests {
         };
         let result = mem.query(&plan).expect("query");
         assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn alter_column_add_rename_drop() {
+        let mut mem = MemStore::new();
+        let schema = Schema::new(vec![
+            ColumnSpec {
+                name: "symbol".to_string(),
+                col_type: ColumnType::String,
+                nullable: false,
+                default: None,
+            },
+            ColumnSpec {
+                name: "price".to_string(),
+                col_type: ColumnType::F64,
+                nullable: false,
+                default: None,
+            },
+        ])
+        .expect("schema");
+        mem.create_table("ticks", schema).expect("create");
+        mem.insert(
+            "ticks",
+            &["symbol".to_string(), "price".to_string()],
+            &[vec![Value::String("AAPL".to_string()), Value::F64(10.0)]],
+        )
+        .expect("insert");
+
+        mem.alter_add_column(
+            "ticks",
+            ColumnSpec {
+                name: "lot".to_string(),
+                col_type: ColumnType::I64,
+                nullable: false,
+                default: Some(Value::I64(100)),
+            },
+        )
+        .expect("alter add");
+        let schema = mem.table_schema("ticks").expect("schema");
+        let lot_idx = schema.column_index("lot").expect("lot idx");
+        let row = mem.table_row("ticks", 0).expect("row");
+        assert_eq!(row.values[lot_idx], Value::I64(100));
+
+        mem.alter_rename_column("ticks", "lot", "lots")
+            .expect("rename");
+        let schema = mem.table_schema("ticks").expect("schema");
+        assert!(schema.column_index("lot").is_none());
+        assert!(schema.column_index("lots").is_some());
+
+        mem.alter_drop_column("ticks", "price")
+            .expect("drop column");
+        let schema = mem.table_schema("ticks").expect("schema");
+        assert!(schema.column_index("price").is_none());
+        let row = mem.table_row("ticks", 0).expect("row");
+        assert_eq!(row.values.len(), schema.columns().len());
+    }
+
+    #[test]
+    fn alter_set_default_applies_on_insert() {
+        let mut mem = MemStore::new();
+        let schema = Schema::new(vec![
+            ColumnSpec {
+                name: "symbol".to_string(),
+                col_type: ColumnType::String,
+                nullable: false,
+                default: None,
+            },
+            ColumnSpec {
+                name: "price".to_string(),
+                col_type: ColumnType::F64,
+                nullable: false,
+                default: None,
+            },
+        ])
+        .expect("schema");
+        mem.create_table("ticks", schema).expect("create");
+        mem.alter_set_default("ticks", "price", Some(Value::I64(7)))
+            .expect("set default");
+        mem.insert(
+            "ticks",
+            &["symbol".to_string()],
+            &[vec![Value::String("AAPL".to_string())]],
+        )
+        .expect("insert");
+        let schema = mem.table_schema("ticks").expect("schema");
+        let price_idx = schema.column_index("price").expect("price idx");
+        let row = mem.table_row("ticks", 0).expect("row");
+        assert_eq!(row.values[price_idx], Value::F64(7.0));
+    }
+
+    #[test]
+    fn create_table_as_select() {
+        let mut mem = MemStore::new();
+        mem.insert(
+            "ticks",
+            &["symbol".to_string(), "price".to_string()],
+            &[
+                vec![Value::String("AAPL".to_string()), Value::F64(10.0)],
+                vec![Value::String("MSFT".to_string()), Value::F64(12.0)],
+            ],
+        )
+        .expect("insert");
+        let plan = QueryPlan {
+            table: "ticks".to_string(),
+            join: None,
+            filter: None,
+            group_by: Vec::new(),
+            select: vec![
+                SelectItem {
+                    expr: SelectExpr::Column("symbol".to_string()),
+                    alias: None,
+                },
+                SelectItem {
+                    expr: SelectExpr::Column("price".to_string()),
+                    alias: None,
+                },
+            ],
+        };
+        mem.create_table_as("snap", &plan).expect("ctas");
+        assert!(mem.table_schema("snap").is_some());
+        assert_eq!(mem.table_row_count("snap"), Some(2));
     }
 
     #[test]

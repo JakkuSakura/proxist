@@ -116,16 +116,19 @@ mod tests {
                 name: "a".to_string(),
                 col_type: ColumnType::I64,
                 nullable: false,
+                default: None,
             },
             ColumnSpec {
                 name: "b".to_string(),
                 col_type: ColumnType::I64,
                 nullable: false,
+                default: None,
             },
             ColumnSpec {
                 name: "sym".to_string(),
                 col_type: ColumnType::String,
                 nullable: false,
+                default: None,
             },
         ])
         .expect("schema")

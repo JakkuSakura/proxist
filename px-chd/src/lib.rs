@@ -265,6 +265,7 @@ fn apply_create(
             name: column.name.clone(),
             col_type: column.col_type,
             nullable: column.nullable,
+            default: None,
         });
     }
 
@@ -288,6 +289,7 @@ fn apply_update(
             name: name.clone(),
             col_type: value.column_type(),
             nullable: true,
+            default: None,
         });
     }
 
@@ -365,6 +367,7 @@ fn flush_batch(
             name: name.clone(),
             col_type,
             nullable: true,
+            default: None,
         }) {
             new_columns.push(name.clone());
         }
