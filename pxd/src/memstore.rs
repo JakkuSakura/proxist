@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::mem::MaybeUninit;
+use std::slice;
 
 use crate::error::{Error, Result};
-use crate::expr::{eval_predicate, Expr};
+use crate::expr::{eval_predicate, Expr, RowAccess};
 use crate::query::{
     infer_select_schema, AggFunc, AggregateExpr, JoinSpec, JoinType, QueryPlan, ResultSet,
     SelectExpr, WindowBound, WindowExpr, WindowSpec,
@@ -11,7 +14,173 @@ use crate::types::{ColumnSpec, ColumnType, Row, Schema, Value};
 #[derive(Debug, Clone)]
 struct Table {
     schema: Schema,
-    rows: Vec<Row>,
+    columns: Vec<Vec<Value>>,
+    row_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RowView<'a> {
+    table: &'a Table,
+    row: usize,
+}
+
+impl<'a> RowView<'a> {
+    fn new(table: &'a Table, row: usize) -> Option<Self> {
+        if row < table.row_count {
+            Some(Self { table, row })
+        } else {
+            None
+        }
+    }
+}
+
+impl RowAccess for RowView<'_> {
+    fn get_value(&self, idx: usize) -> Option<&Value> {
+        self.table
+            .columns
+            .get(idx)
+            .and_then(|col| col.get(self.row))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RowRef<'a> {
+    Table(RowView<'a>),
+    Joined(&'a Row),
+}
+
+impl RowAccess for RowRef<'_> {
+    fn get_value(&self, idx: usize) -> Option<&Value> {
+        match self {
+            RowRef::Table(view) => view.get_value(idx),
+            RowRef::Joined(row) => row.values.get(idx),
+        }
+    }
+}
+
+fn rowref_push_values(out: &mut Vec<Value>, row: &RowRef<'_>, width: usize) {
+    for idx in 0..width {
+        out.push(row.get_value(idx).cloned().unwrap_or(Value::Null));
+    }
+}
+
+const INLINE_KEY_CAP: usize = 4;
+
+struct KeyBuf {
+    len: usize,
+    inline: [MaybeUninit<Value>; INLINE_KEY_CAP],
+    heap: Option<Vec<Value>>,
+}
+
+impl KeyBuf {
+    fn new_empty() -> Self {
+        Self {
+            len: 0,
+            inline: unsafe { MaybeUninit::uninit().assume_init() },
+            heap: None,
+        }
+    }
+
+    fn from_indices(row: &RowRef<'_>, indices: &[usize]) -> Self {
+        if indices.is_empty() {
+            return Self::new_empty();
+        }
+        let len = indices.len();
+        if len <= INLINE_KEY_CAP {
+            let mut inline: [MaybeUninit<Value>; INLINE_KEY_CAP] =
+                unsafe { MaybeUninit::uninit().assume_init() };
+            for (pos, idx) in indices.iter().enumerate() {
+                let value = row.get_value(*idx).cloned().unwrap_or(Value::Null);
+                inline[pos].write(value);
+            }
+            Self {
+                len,
+                inline,
+                heap: None,
+            }
+        } else {
+            let mut values = Vec::with_capacity(len);
+            for idx in indices {
+                values.push(row.get_value(*idx).cloned().unwrap_or(Value::Null));
+            }
+            Self {
+                len,
+                inline: unsafe { MaybeUninit::uninit().assume_init() },
+                heap: Some(values),
+            }
+        }
+    }
+
+    fn from_values(values: &[Value]) -> Self {
+        if values.is_empty() {
+            return Self::new_empty();
+        }
+        let len = values.len();
+        if len <= INLINE_KEY_CAP {
+            let mut inline: [MaybeUninit<Value>; INLINE_KEY_CAP] =
+                unsafe { MaybeUninit::uninit().assume_init() };
+            for (pos, value) in values.iter().enumerate() {
+                inline[pos].write(value.clone());
+            }
+            Self {
+                len,
+                inline,
+                heap: None,
+            }
+        } else {
+            Self {
+                len,
+                inline: unsafe { MaybeUninit::uninit().assume_init() },
+                heap: Some(values.to_vec()),
+            }
+        }
+    }
+
+    fn as_slice(&self) -> &[Value] {
+        match &self.heap {
+            Some(values) => values.as_slice(),
+            None => unsafe {
+                slice::from_raw_parts(self.inline.as_ptr() as *const Value, self.len)
+            },
+        }
+    }
+
+    fn get(&self, idx: usize) -> Option<&Value> {
+        self.as_slice().get(idx)
+    }
+}
+
+impl Clone for KeyBuf {
+    fn clone(&self) -> Self {
+        Self::from_values(self.as_slice())
+    }
+}
+
+impl Drop for KeyBuf {
+    fn drop(&mut self) {
+        if self.heap.is_some() {
+            return;
+        }
+        for idx in 0..self.len {
+            unsafe {
+                self.inline[idx].assume_init_drop();
+            }
+        }
+    }
+}
+
+impl PartialEq for KeyBuf {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for KeyBuf {}
+
+impl Hash for KeyBuf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -35,25 +204,25 @@ impl MemStore {
 
     pub fn create_table(&mut self, name: &str, schema: Schema) -> Result<()> {
         if self.tables.contains_key(name) {
-            return Err(Error::InvalidData(format!(
-                "table already exists: {name}"
-            )));
+            return Err(Error::InvalidData(format!("table already exists: {name}")));
         }
         self.tables.insert(
             name.to_string(),
             Table {
                 schema,
-                rows: Vec::new(),
+                columns: Vec::new(),
+                row_count: 0,
             },
         );
+        if let Some(table) = self.tables.get_mut(name) {
+            table.columns = vec![Vec::new(); table.schema.columns().len()];
+        }
         Ok(())
     }
 
     pub fn create_table_as(&mut self, name: &str, plan: &QueryPlan) -> Result<()> {
         if self.tables.contains_key(name) {
-            return Err(Error::InvalidData(format!(
-                "table already exists: {name}"
-            )));
+            return Err(Error::InvalidData(format!("table already exists: {name}")));
         }
         let result = {
             let mem_ref: &MemStore = &*self;
@@ -75,9 +244,10 @@ impl MemStore {
     }
 
     pub fn alter_add_column(&mut self, table: &str, column: ColumnSpec) -> Result<()> {
-        let table = self.tables.get_mut(table).ok_or_else(|| {
-            Error::InvalidData(format!("table not found: {table}"))
-        })?;
+        let table = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| Error::InvalidData(format!("table not found: {table}")))?;
         table.schema.add_column(column)?;
         let idx = table.schema.columns().len().saturating_sub(1);
         let default_value = table
@@ -86,29 +256,27 @@ impl MemStore {
             .get(idx)
             .and_then(|col| col.default.clone())
             .unwrap_or(Value::Null);
-        for row in &mut table.rows {
-            row.values.push(default_value.clone());
-        }
+        table.columns.push(vec![default_value; table.row_count]);
         Ok(())
     }
 
     pub fn alter_drop_column(&mut self, table: &str, column: &str) -> Result<()> {
-        let table = self.tables.get_mut(table).ok_or_else(|| {
-            Error::InvalidData(format!("table not found: {table}"))
-        })?;
+        let table = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| Error::InvalidData(format!("table not found: {table}")))?;
         let idx = table.schema.remove_column(column)?;
-        for row in &mut table.rows {
-            if idx < row.values.len() {
-                row.values.remove(idx);
-            }
+        if idx < table.columns.len() {
+            table.columns.remove(idx);
         }
         Ok(())
     }
 
     pub fn alter_rename_column(&mut self, table: &str, from: &str, to: &str) -> Result<()> {
-        let table = self.tables.get_mut(table).ok_or_else(|| {
-            Error::InvalidData(format!("table not found: {table}"))
-        })?;
+        let table = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| Error::InvalidData(format!("table not found: {table}")))?;
         table.schema.rename_column(from, to)?;
         Ok(())
     }
@@ -119,21 +287,21 @@ impl MemStore {
         column: &str,
         default: Option<Value>,
     ) -> Result<()> {
-        let table = self.tables.get_mut(table).ok_or_else(|| {
-            Error::InvalidData(format!("table not found: {table}"))
-        })?;
-        let idx = table.schema.column_index(column).ok_or_else(|| {
-            Error::InvalidData(format!("unknown column name: {column}"))
-        })?;
+        let table = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| Error::InvalidData(format!("table not found: {table}")))?;
+        let idx = table
+            .schema
+            .column_index(column)
+            .ok_or_else(|| Error::InvalidData(format!("unknown column name: {column}")))?;
         table.schema.set_column_default(idx, default)?;
         Ok(())
     }
 
     pub fn drop_table(&mut self, table: &str) -> Result<()> {
         if self.tables.remove(table).is_none() {
-            return Err(Error::InvalidData(format!(
-                "table not found: {table}"
-            )));
+            return Err(Error::InvalidData(format!("table not found: {table}")));
         }
         Ok(())
     }
@@ -143,13 +311,12 @@ impl MemStore {
             return Ok(());
         }
         if self.tables.contains_key(to) {
-            return Err(Error::InvalidData(format!(
-                "table already exists: {to}"
-            )));
+            return Err(Error::InvalidData(format!("table already exists: {to}")));
         }
-        let table = self.tables.remove(from).ok_or_else(|| {
-            Error::InvalidData(format!("table not found: {from}"))
-        })?;
+        let table = self
+            .tables
+            .remove(from)
+            .ok_or_else(|| Error::InvalidData(format!("table not found: {from}")))?;
         self.tables.insert(to.to_string(), table);
         Ok(())
     }
@@ -160,7 +327,8 @@ impl MemStore {
             .entry(table.to_string())
             .or_insert_with(|| Table {
                 schema: Schema::new(Vec::new()).expect("empty schema"),
-                rows: Vec::new(),
+                columns: Vec::new(),
+                row_count: 0,
             });
 
         let mut col_indices = Vec::with_capacity(columns.len());
@@ -169,18 +337,14 @@ impl MemStore {
                 Some(idx) => idx,
                 None => {
                     let col_type = infer_column_type_from_rows(rows, col_pos);
-                    table
-                        .schema
-                        .add_column(ColumnSpec {
-                            name: name.clone(),
-                            col_type,
-                            nullable: true,
-                            default: None,
-                        })?;
+                    table.schema.add_column(ColumnSpec {
+                        name: name.clone(),
+                        col_type,
+                        nullable: true,
+                        default: None,
+                    })?;
                     let idx = table.schema.columns().len() - 1;
-                    for row in &mut table.rows {
-                        row.values.push(Value::Null);
-                    }
+                    table.columns.push(vec![Value::Null; table.row_count]);
                     idx
                 }
             };
@@ -188,22 +352,29 @@ impl MemStore {
         }
 
         let schema_len = table.schema.columns().len();
-        let base_row = table.schema.default_row();
-        table.rows.reserve(rows.len());
+        let mut value_pos = vec![None; schema_len];
+        for (value_idx, col_idx) in col_indices.iter().enumerate() {
+            if let Some(pos) = value_pos.get_mut(*col_idx) {
+                *pos = Some(value_idx);
+            }
+        }
+        let defaults = table.schema.default_row();
+        for column in &mut table.columns {
+            column.reserve(rows.len());
+        }
+
         for values in rows {
             if values.len() != columns.len() {
-                return Err(Error::InvalidData(
-                    "insert row length mismatch".to_string(),
-                ));
+                return Err(Error::InvalidData("insert row length mismatch".to_string()));
             }
-            let mut row = base_row.clone();
-            if row.len() != schema_len {
-                row.resize(schema_len, Value::Null);
+            for (col_idx, column) in table.columns.iter_mut().enumerate() {
+                let value = match value_pos.get(col_idx).and_then(|pos| *pos) {
+                    Some(value_idx) => values.get(value_idx).unwrap_or(&Value::Null),
+                    None => defaults.get(col_idx).unwrap_or(&Value::Null),
+                };
+                column.push(value.clone());
             }
-            for (idx, value) in col_indices.iter().zip(values.iter()) {
-                row[*idx] = value.clone();
-            }
-            table.rows.push(Row { values: row });
+            table.row_count += 1;
         }
         Ok(())
     }
@@ -212,16 +383,29 @@ impl MemStore {
         self.tables.get(table).map(|table| &table.schema)
     }
 
-    pub fn table_rows(&self, table: &str) -> Option<&[Row]> {
-        self.tables.get(table).map(|table| table.rows.as_slice())
-    }
-
     pub fn table_row_count(&self, table: &str) -> Option<usize> {
-        self.tables.get(table).map(|table| table.rows.len())
+        self.tables.get(table).map(|table| table.row_count)
     }
 
-    pub fn table_row(&self, table: &str, index: usize) -> Option<&Row> {
-        self.tables.get(table).and_then(|table| table.rows.get(index))
+    pub fn table_rows(&self, table: &str) -> Option<Vec<Row>> {
+        let table = self.tables.get(table)?;
+        Some(table_rows(table))
+    }
+
+    pub fn table_row(&self, table: &str, index: usize) -> Option<Row> {
+        let table = self.tables.get(table)?;
+        table_row(table, index)
+    }
+
+    pub fn table_column(&self, table: &str, column: &str) -> Option<&[Value]> {
+        let table = self.tables.get(table)?;
+        let idx = table.schema.column_index(column)?;
+        table.columns.get(idx).map(|col| col.as_slice())
+    }
+
+    pub fn table_column_at(&self, table: &str, index: usize) -> Option<&[Value]> {
+        let table = self.tables.get(table)?;
+        table.columns.get(index).map(|col| col.as_slice())
     }
 
     pub fn update(
@@ -240,18 +424,14 @@ impl MemStore {
                 Some(idx) => idx,
                 None => {
                     let col_type = value.column_type();
-                    table
-                        .schema
-                        .add_column(ColumnSpec {
-                            name: name.clone(),
-                            col_type,
-                            nullable: true,
-                            default: None,
-                        })?;
+                    table.schema.add_column(ColumnSpec {
+                        name: name.clone(),
+                        col_type,
+                        nullable: true,
+                        default: None,
+                    })?;
                     let idx = table.schema.columns().len() - 1;
-                    for row in &mut table.rows {
-                        row.values.push(Value::Null);
-                    }
+                    table.columns.push(vec![Value::Null; table.row_count]);
                     idx
                 }
             };
@@ -260,23 +440,33 @@ impl MemStore {
 
         if filter.is_none() {
             let mut updated = 0u64;
-            for row in &mut table.rows {
-                for (idx, value) in &assign_indices {
-                    row.values[*idx] = value.clone();
+            for (idx, value) in &assign_indices {
+                if let Some(column) = table.columns.get_mut(*idx) {
+                    for cell in column.iter_mut() {
+                        *cell = value.clone();
+                    }
                 }
-                updated += 1;
             }
+            updated += table.row_count as u64;
             return Ok(updated);
         }
 
         let expr = filter.expect("filter checked");
         let mut updated = 0u64;
-        for row in &mut table.rows {
-            if !eval_predicate(expr, &row.values, &table.schema)? {
+        for row_idx in 0..table.row_count {
+            let view = RowView {
+                table,
+                row: row_idx,
+            };
+            if !eval_predicate(expr, &view, &table.schema)? {
                 continue;
             }
             for (idx, value) in &assign_indices {
-                row.values[*idx] = value.clone();
+                if let Some(column) = table.columns.get_mut(*idx) {
+                    if let Some(cell) = column.get_mut(row_idx) {
+                        *cell = value.clone();
+                    }
+                }
             }
             updated += 1;
         }
@@ -288,20 +478,37 @@ impl MemStore {
             return Ok(0);
         };
         if filter.is_none() {
-            let count = table.rows.len() as u64;
-            table.rows.clear();
+            let count = table.row_count as u64;
+            for column in &mut table.columns {
+                column.clear();
+            }
+            table.row_count = 0;
             return Ok(count);
         }
         let expr = filter.expect("filter checked");
-        let mut removed = 0u64;
-        table.rows.retain(|row| match eval_predicate(expr, &row.values, &table.schema) {
-            Ok(true) => {
-                removed += 1;
-                false
+        let mut keep_indices = Vec::with_capacity(table.row_count);
+        for row_idx in 0..table.row_count {
+            let view = RowView {
+                table,
+                row: row_idx,
+            };
+            match eval_predicate(expr, &view, &table.schema) {
+                Ok(true) => {}
+                Ok(false) => keep_indices.push(row_idx),
+                Err(_) => keep_indices.push(row_idx),
             }
-            Ok(false) => true,
-            Err(_) => true,
-        });
+        }
+        let removed = (table.row_count - keep_indices.len()) as u64;
+        for column in &mut table.columns {
+            let mut new_col = Vec::with_capacity(keep_indices.len());
+            for idx in &keep_indices {
+                if let Some(value) = column.get(*idx) {
+                    new_col.push(value.clone());
+                }
+            }
+            *column = new_col;
+        }
+        table.row_count = keep_indices.len();
         Ok(removed)
     }
 
@@ -311,25 +518,32 @@ impl MemStore {
             .get(&plan.table)
             .ok_or_else(|| Error::InvalidData("table not found".to_string()))?;
         let mut schema = left.schema.clone();
-        let mut rows: Vec<&Row> = left.rows.iter().collect();
+        let left_rows: Vec<RowView> = (0..left.row_count)
+            .filter_map(|idx| RowView::new(left, idx))
+            .collect();
 
         let joined_rows = if let Some(join) = &plan.join {
-            let (joined_schema, joined_rows) = self.apply_join(join, &schema, &rows)?;
+            let (joined_schema, joined_rows) = self.apply_join(join, &schema, &left_rows)?;
             schema = joined_schema;
             Some(joined_rows)
         } else {
             None
         };
 
-        if let Some(joined_rows) = &joined_rows {
-            rows = joined_rows.iter().collect();
-        }
+        let mut rows: Vec<RowRef> = if let Some(joined_rows) = &joined_rows {
+            joined_rows.iter().map(RowRef::Joined).collect()
+        } else {
+            left_rows.iter().copied().map(RowRef::Table).collect()
+        };
 
         if let Some(filter) = &plan.filter {
-            rows.retain(|row| eval_predicate(filter, &row.values, &schema).unwrap_or(false));
+            rows.retain(|row| eval_predicate(filter, row, &schema).unwrap_or(false));
         }
 
-        let has_window = plan.select.iter().any(|item| matches!(item.expr, SelectExpr::Window(_)));
+        let has_window = plan
+            .select
+            .iter()
+            .any(|item| matches!(item.expr, SelectExpr::Window(_)));
         if has_window && !plan.group_by.is_empty() {
             return Err(Error::InvalidData(
                 "window functions cannot be used with group by".to_string(),
@@ -366,9 +580,9 @@ impl MemStore {
         for item in &plan.select {
             match &item.expr {
                 SelectExpr::Column(name) => {
-                    let idx = schema.column_index(name).ok_or_else(|| {
-                        Error::InvalidData(format!("unknown column {name}"))
-                    })?;
+                    let idx = schema
+                        .column_index(name)
+                        .ok_or_else(|| Error::InvalidData(format!("unknown column {name}")))?;
                     proj_ops.push(ProjectOp::Column(idx));
                     proj_capacity += 1;
                 }
@@ -399,10 +613,12 @@ impl MemStore {
             for op in &proj_ops {
                 match op {
                     ProjectOp::Column(idx) => {
-                        out.push(row.values.get(*idx).cloned().unwrap_or(Value::Null));
+                        out.push(row.get_value(*idx).cloned().unwrap_or(Value::Null));
                     }
                     ProjectOp::Literal(value) => out.push(value.clone()),
-                    ProjectOp::Wildcard => out.extend_from_slice(&row.values),
+                    ProjectOp::Wildcard => {
+                        rowref_push_values(&mut out, &row, schema.columns().len())
+                    }
                 }
             }
             out_rows.push(Row { values: out });
@@ -418,7 +634,7 @@ impl MemStore {
         &self,
         join: &JoinSpec,
         left_schema: &Schema,
-        left_rows: &[&Row],
+        left_rows: &[RowView<'_>],
     ) -> Result<(Schema, Vec<Row>)> {
         let right = self
             .tables
@@ -438,15 +654,30 @@ impl MemStore {
 
         let right_null = right_null_row(&right.schema);
         let mut rows = Vec::with_capacity(left_rows.len());
+        let left_width = left_schema.columns().len();
+        let right_width = right.schema.columns().len();
         for left_row in left_rows {
-            let left_row = *left_row;
             let mut matched = false;
             match join.join_type {
                 JoinType::Inner | JoinType::LeftOuter => {
-                    for right_row in &right.rows {
-                        if left_row.values[left_on] == right_row.values[right_on] {
+                    for right_idx in 0..right.row_count {
+                        let right_row = RowView {
+                            table: right,
+                            row: right_idx,
+                        };
+                        let left_key = left_row.get_value(left_on).cloned().unwrap_or(Value::Null);
+                        let right_key = right_row
+                            .get_value(right_on)
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        if left_key == right_key {
                             matched = true;
-                            rows.push(merge_rows(left_row, right_row));
+                            rows.push(merge_rows_view(
+                                left_row,
+                                &right_row,
+                                left_width,
+                                right_width,
+                            ));
                         }
                     }
                 }
@@ -467,14 +698,29 @@ impl MemStore {
                         .column_index(right_ts_name)
                         .ok_or_else(|| Error::InvalidData("right ts missing".to_string()))?;
 
-                    let mut best: Option<&Row> = None;
+                    let mut best: Option<RowView> = None;
                     let mut best_ts: Option<i64> = None;
-                    for right_row in &right.rows {
-                        if left_row.values[left_on] != right_row.values[right_on] {
+                    for right_idx in 0..right.row_count {
+                        let right_row = RowView {
+                            table: right,
+                            row: right_idx,
+                        };
+                        let left_key = left_row.get_value(left_on).cloned().unwrap_or(Value::Null);
+                        let right_key = right_row
+                            .get_value(right_on)
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        if left_key != right_key {
                             continue;
                         }
-                        let left_ts = left_row.values[left_ts_idx].as_i64().unwrap_or(0);
-                        let right_ts = right_row.values[right_ts_idx].as_i64().unwrap_or(0);
+                        let left_ts = left_row
+                            .get_value(left_ts_idx)
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0);
+                        let right_ts = right_row
+                            .get_value(right_ts_idx)
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0);
                         if right_ts <= left_ts {
                             if best_ts.map(|ts| right_ts > ts).unwrap_or(true) {
                                 best_ts = Some(right_ts);
@@ -484,16 +730,31 @@ impl MemStore {
                     }
                     if let Some(best_row) = best {
                         matched = true;
-                        rows.push(merge_rows(left_row, best_row));
+                        rows.push(merge_rows_view(
+                            left_row,
+                            &best_row,
+                            left_width,
+                            right_width,
+                        ));
                     }
                 }
             }
 
             if !matched && join.join_type == JoinType::LeftOuter {
-                rows.push(merge_rows(left_row, &right_null));
+                rows.push(merge_left_with_row(
+                    left_row,
+                    &right_null,
+                    left_width,
+                    right_width,
+                ));
             }
             if !matched && join.join_type == JoinType::Asof {
-                rows.push(merge_rows(left_row, &right_null));
+                rows.push(merge_left_with_row(
+                    left_row,
+                    &right_null,
+                    left_width,
+                    right_width,
+                ));
             }
         }
 
@@ -504,27 +765,23 @@ impl MemStore {
         &self,
         plan: &QueryPlan,
         schema: &Schema,
-        rows: &[&Row],
+        rows: &[RowRef<'_>],
     ) -> Result<ResultSet> {
-        let mut groups: HashMap<Vec<Value>, Vec<&Row>> = HashMap::new();
+        let mut groups: HashMap<KeyBuf, Vec<RowRef>> = HashMap::new();
         let mut key_indices = Vec::with_capacity(plan.group_by.len());
         for col in &plan.group_by {
-            let idx = schema.column_index(col).ok_or_else(|| {
-                Error::InvalidData(format!("group by column not found: {col}"))
-            })?;
+            let idx = schema
+                .column_index(col)
+                .ok_or_else(|| Error::InvalidData(format!("group by column not found: {col}")))?;
             key_indices.push(idx);
         }
 
         if key_indices.is_empty() {
-            groups.insert(Vec::new(), rows.iter().copied().collect());
+            groups.insert(KeyBuf::new_empty(), rows.iter().copied().collect());
         } else {
             for row in rows {
-                let row = *row;
-                let key: Vec<Value> = key_indices
-                    .iter()
-                    .map(|idx| row.values[*idx].clone())
-                    .collect();
-                groups.entry(key).or_default().push(row);
+                let key = KeyBuf::from_indices(row, &key_indices);
+                groups.entry(key).or_default().push(*row);
             }
         }
 
@@ -553,19 +810,17 @@ impl MemStore {
             for item in &plan.select {
                 let value = match &item.expr {
                     SelectExpr::Column(name) => {
-                        let idx = schema.column_index(name).ok_or_else(|| {
-                            Error::InvalidData(format!("unknown column {name}"))
-                        })?;
+                        let idx = schema
+                            .column_index(name)
+                            .ok_or_else(|| Error::InvalidData(format!("unknown column {name}")))?;
                         if key_indices.is_empty() {
                             group_rows
                                 .first()
-                                .and_then(|row| row.values.get(idx).cloned())
+                                .and_then(|row| row.get_value(idx).cloned())
                                 .unwrap_or(Value::Null)
                         } else {
-                            let key_idx = key_pos
-                                .get(idx)
-                                .and_then(|pos| *pos)
-                                .ok_or_else(|| {
+                            let key_idx =
+                                key_pos.get(idx).and_then(|pos| *pos).ok_or_else(|| {
                                     Error::InvalidData(format!(
                                         "column {name} must appear in group by"
                                     ))
@@ -601,7 +856,7 @@ impl MemStore {
         &self,
         plan: &QueryPlan,
         schema: &Schema,
-        rows: &[&Row],
+        rows: &[RowRef<'_>],
     ) -> Result<ResultSet> {
         let result_schema = Schema::new(
             infer_select_schema(&plan.select, schema)
@@ -615,7 +870,7 @@ impl MemStore {
                 .collect(),
         )?;
 
-        let mut partitions: HashMap<Vec<Value>, Vec<(usize, &Row)>> = HashMap::new();
+        let mut partitions: HashMap<KeyBuf, Vec<(usize, RowRef)>> = HashMap::new();
         let mut partition_indices = Vec::new();
         let mut order_idx = None;
 
@@ -631,29 +886,27 @@ impl MemStore {
             }
         }
 
-        let order_idx = order_idx.ok_or_else(|| Error::InvalidData("window order missing".to_string()))?;
+        let order_idx =
+            order_idx.ok_or_else(|| Error::InvalidData("window order missing".to_string()))?;
 
         if partition_indices.is_empty() {
-            let bucket = partitions.entry(Vec::new()).or_default();
+            let bucket = partitions.entry(KeyBuf::new_empty()).or_default();
             for (idx, row) in rows.iter().enumerate() {
                 bucket.push((idx, *row));
             }
         } else {
             for (idx, row) in rows.iter().enumerate() {
-                let row = *row;
-                let key: Vec<Value> = partition_indices
-                    .iter()
-                    .map(|i| row.values[*i].clone())
-                    .collect();
-                partitions.entry(key).or_default().push((idx, row));
+                let key = KeyBuf::from_indices(row, &partition_indices);
+                partitions.entry(key).or_default().push((idx, *row));
             }
         }
 
         let mut out_rows = vec![Row { values: Vec::new() }; rows.len()];
         for (_key, mut part_rows) in partitions {
             part_rows.sort_by(|a, b| {
-                a.1.values[order_idx]
-                    .cmp_for_order(&b.1.values[order_idx])
+                let left = a.1.get_value(order_idx).cloned().unwrap_or(Value::Null);
+                let right = b.1.get_value(order_idx).cloned().unwrap_or(Value::Null);
+                left.cmp_for_order(&right)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             for (pos, (orig_idx, row)) in part_rows.iter().enumerate() {
@@ -687,18 +940,61 @@ fn right_null_row(schema: &Schema) -> Row {
     }
 }
 
-fn merge_rows(left: &Row, right: &Row) -> Row {
-    let mut values = Vec::with_capacity(left.values.len() + right.values.len());
-    values.extend_from_slice(&left.values);
-    values.extend_from_slice(&right.values);
+fn merge_rows_view(
+    left: &RowView<'_>,
+    right: &RowView<'_>,
+    left_width: usize,
+    right_width: usize,
+) -> Row {
+    let mut values = Vec::with_capacity(left_width + right_width);
+    for idx in 0..left_width {
+        values.push(left.get_value(idx).cloned().unwrap_or(Value::Null));
+    }
+    for idx in 0..right_width {
+        values.push(right.get_value(idx).cloned().unwrap_or(Value::Null));
+    }
     Row { values }
 }
 
-fn aggregate_value(
-    agg: &AggregateExpr,
-    rows: &[&Row],
-    schema: &Schema,
-) -> Result<Value> {
+fn merge_left_with_row(
+    left: &RowView<'_>,
+    right: &Row,
+    left_width: usize,
+    right_width: usize,
+) -> Row {
+    let mut values = Vec::with_capacity(left_width + right_width);
+    for idx in 0..left_width {
+        values.push(left.get_value(idx).cloned().unwrap_or(Value::Null));
+    }
+    values.extend_from_slice(&right.values);
+    if right_width < right.values.len() {
+        values.truncate(left_width + right_width);
+    }
+    Row { values }
+}
+
+fn table_row(table: &Table, index: usize) -> Option<Row> {
+    if index >= table.row_count {
+        return None;
+    }
+    let mut values = Vec::with_capacity(table.columns.len());
+    for column in &table.columns {
+        values.push(column.get(index).cloned().unwrap_or(Value::Null));
+    }
+    Some(Row { values })
+}
+
+fn table_rows(table: &Table) -> Vec<Row> {
+    let mut rows = Vec::with_capacity(table.row_count);
+    for idx in 0..table.row_count {
+        if let Some(row) = table_row(table, idx) {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+fn aggregate_value(agg: &AggregateExpr, rows: &[RowRef<'_>], schema: &Schema) -> Result<Value> {
     match agg.func {
         AggFunc::Count => Ok(Value::I64(rows.len() as i64)),
         AggFunc::Sum => sum_values(agg, rows, schema).map(Value::F64),
@@ -712,10 +1008,10 @@ fn aggregate_value(
     }
 }
 
-fn sum_values(agg: &AggregateExpr, rows: &[&Row], schema: &Schema) -> Result<f64> {
+fn sum_values(agg: &AggregateExpr, rows: &[RowRef<'_>], schema: &Schema) -> Result<f64> {
     let mut sum = 0.0;
     for row in rows {
-        let value = crate::expr::eval_value(&agg.arg, &row.values, schema)?;
+        let value = crate::expr::eval_value(&agg.arg, row, schema)?;
         if let Some(v) = value.as_f64() {
             sum += v;
         }
@@ -725,13 +1021,13 @@ fn sum_values(agg: &AggregateExpr, rows: &[&Row], schema: &Schema) -> Result<f64
 
 fn min_max_value(
     agg: &AggregateExpr,
-    rows: &[&Row],
+    rows: &[RowRef<'_>],
     schema: &Schema,
     is_min: bool,
 ) -> Result<Value> {
     let mut best: Option<Value> = None;
     for row in rows {
-        let value = crate::expr::eval_value(&agg.arg, &row.values, schema)?;
+        let value = crate::expr::eval_value(&agg.arg, row, schema)?;
         if best.is_none() {
             best = Some(value);
             continue;
@@ -749,9 +1045,9 @@ fn min_max_value(
 
 fn window_frame_rows<'a>(
     pos: usize,
-    rows: &[(usize, &'a Row)],
+    rows: &[(usize, RowRef<'a>)],
     plan: &QueryPlan,
-) -> Result<Vec<&'a Row>> {
+) -> Result<Vec<RowRef<'a>>> {
     let mut spec: Option<&WindowSpec> = None;
     for item in &plan.select {
         if let SelectExpr::Window(WindowExpr { spec: s, .. }) = &item.expr {
@@ -765,7 +1061,7 @@ fn window_frame_rows<'a>(
         WindowBound::CurrentRow => pos,
         WindowBound::Preceding => pos.saturating_sub(spec.start_value.unwrap_or(0) as usize),
     };
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(pos.saturating_sub(start) + 1);
     for idx in start..=pos {
         out.push(rows[idx].1);
     }
@@ -775,17 +1071,17 @@ fn window_frame_rows<'a>(
 fn project_with_window(
     plan: &QueryPlan,
     schema: &Schema,
-    row: &Row,
-    frame: &[&Row],
+    row: &RowRef<'_>,
+    frame: &[RowRef<'_>],
 ) -> Result<Vec<Value>> {
     let mut out = Vec::with_capacity(plan.select.len());
     for item in &plan.select {
         match &item.expr {
             SelectExpr::Column(name) => {
-                let idx = schema.column_index(name).ok_or_else(|| {
-                    Error::InvalidData(format!("unknown column {name}"))
-                })?;
-                out.push(row.values.get(idx).cloned().unwrap_or(Value::Null));
+                let idx = schema
+                    .column_index(name)
+                    .ok_or_else(|| Error::InvalidData(format!("unknown column {name}")))?;
+                out.push(row.get_value(idx).cloned().unwrap_or(Value::Null));
             }
             SelectExpr::Literal(value) => out.push(value.clone()),
             SelectExpr::Window(window) => {
@@ -800,7 +1096,7 @@ fn project_with_window(
                     "aggregate not allowed with window".to_string(),
                 ));
             }
-            SelectExpr::Wildcard => out.extend_from_slice(&row.values),
+            SelectExpr::Wildcard => rowref_push_values(&mut out, row, schema.columns().len()),
         }
     }
     Ok(out)
@@ -811,8 +1107,8 @@ mod tests {
     use super::MemStore;
     use crate::expr::{BinaryOp, Expr};
     use crate::query::{
-        AggFunc, AggregateExpr, JoinSpec, JoinType, QueryPlan, SelectExpr, SelectItem,
-        WindowBound, WindowExpr, WindowFrameUnit, WindowSpec,
+        AggFunc, AggregateExpr, JoinSpec, JoinType, QueryPlan, SelectExpr, SelectItem, WindowBound,
+        WindowExpr, WindowFrameUnit, WindowSpec,
     };
     use crate::types::{ColumnSpec, ColumnType, Schema, Value};
 
@@ -964,10 +1260,7 @@ mod tests {
         };
         let result = mem.query(&plan).expect("query");
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(
-            result.rows[0].values[0],
-            Value::String("hot".to_string())
-        );
+        assert_eq!(result.rows[0].values[0], Value::String("hot".to_string()));
     }
 
     #[test]
@@ -1247,7 +1540,9 @@ mod tests {
         let aapl_ts3 = result
             .rows
             .iter()
-            .find(|row| row.values[0] == Value::String("AAPL".to_string()) && row.values[1] == Value::I64(3))
+            .find(|row| {
+                row.values[0] == Value::String("AAPL".to_string()) && row.values[1] == Value::I64(3)
+            })
             .expect("aapl ts3");
         assert_eq!(aapl_ts3.values[right_bid_idx], Value::F64(9.5));
         let msft_row = result

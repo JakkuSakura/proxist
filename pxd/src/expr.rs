@@ -1,5 +1,27 @@
 use crate::error::{Error, Result};
-use crate::types::{Schema, Value};
+use crate::types::{Row, Schema, Value};
+
+pub trait RowAccess {
+    fn get_value(&self, idx: usize) -> Option<&Value>;
+}
+
+impl RowAccess for [Value] {
+    fn get_value(&self, idx: usize) -> Option<&Value> {
+        self.get(idx)
+    }
+}
+
+impl RowAccess for Vec<Value> {
+    fn get_value(&self, idx: usize) -> Option<&Value> {
+        self.get(idx)
+    }
+}
+
+impl RowAccess for Row {
+    fn get_value(&self, idx: usize) -> Option<&Value> {
+        self.values.get(idx)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -40,7 +62,11 @@ pub enum Expr {
     Not(Box<Expr>),
 }
 
-pub fn eval_predicate(expr: &Expr, row: &[Value], schema: &Schema) -> Result<bool> {
+pub fn eval_predicate<R: RowAccess + ?Sized>(
+    expr: &Expr,
+    row: &R,
+    schema: &Schema,
+) -> Result<bool> {
     match expr {
         Expr::Binary { op, left, right } => {
             let left_val = eval_value(left, row, schema)?;
@@ -61,14 +87,18 @@ pub fn eval_predicate(expr: &Expr, row: &[Value], schema: &Schema) -> Result<boo
     }
 }
 
-pub fn eval_value(expr: &Expr, row: &[Value], schema: &Schema) -> Result<Value> {
+pub fn eval_value<R: RowAccess + ?Sized>(
+    expr: &Expr,
+    row: &R,
+    schema: &Schema,
+) -> Result<Value> {
     match expr {
         Expr::Column(name) => {
             let idx = schema
                 .column_index(name)
                 .ok_or_else(|| Error::InvalidData(format!("unknown column {name}")))?;
             Ok(row
-                .get(idx)
+                .get_value(idx)
                 .cloned()
                 .ok_or_else(|| Error::InvalidData("column out of range".to_string()))?)
         }

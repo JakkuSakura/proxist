@@ -8,6 +8,7 @@ CACHE_ROWS="${CACHE_ROWS:-1000000}"
 BATCH_SIZE="${BATCH_SIZE:-100000}"
 STAMP="$(date +%Y%m%d%H%M%S)"
 OUT_DIR="${OUT_DIR:-"${ROOT_DIR}/bench_results/pxd-kx-compare_${STAMP}"}"
+BUILD_MODE="release"
 
 mkdir -p "${OUT_DIR}"
 
@@ -29,10 +30,12 @@ fi
   if command -v cargo >/dev/null 2>&1; then
     echo "cargo=$(cargo --version)"
   fi
+  echo "pxd_build=${BUILD_MODE}"
   echo "q=$(q -version 2>/dev/null || true)"
 } > "${OUT_DIR}/meta.txt"
 
-cargo run -q -p pxd-bench --bin pxd_nano -- \
+BUILD_MODE="release"
+cargo run -q -p pxd-bench --bin pxd_nano --release -- \
   --rows "${ROWS}" \
   --random-reads "${RANDOM_READS}" \
   --cache-rows "${CACHE_ROWS}" \

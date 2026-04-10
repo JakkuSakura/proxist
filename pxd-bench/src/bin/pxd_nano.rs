@@ -1,5 +1,7 @@
+use std::alloc::{alloc, dealloc, Layout};
 use std::env;
 use std::hint::black_box;
+use std::slice;
 use std::time::Instant;
 
 use pxd::memstore::MemStore;
@@ -73,6 +75,35 @@ fn emit(test: &str, rows: usize, ops: usize, bytes: usize, elapsed_ms: f64) {
     );
 }
 
+struct RawF64Buf {
+    ptr: *mut f64,
+    len: usize,
+    layout: Layout,
+}
+
+impl RawF64Buf {
+    fn new(len: usize) -> Self {
+        let layout = Layout::array::<f64>(len.max(1)).expect("layout");
+        let ptr = unsafe { alloc(layout) as *mut f64 };
+        if ptr.is_null() {
+            panic!("alloc failed");
+        }
+        Self { ptr, len, layout }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [f64] {
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for RawF64Buf {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr as *mut u8, self.layout);
+        }
+    }
+}
+
 fn main() {
     let config = Config::from_env();
     let columns = vec!["symbol".to_string(), "ts".to_string(), "value".to_string()];
@@ -101,15 +132,15 @@ fn main() {
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     emit("write", config.rows, config.rows, config.rows * row_bytes, elapsed);
 
-    let schema = mem.table_schema("ticks").expect("schema");
-    let value_idx = schema.column_index("value").expect("value idx");
-    let rows = mem.table_rows("ticks").expect("rows");
+    let values = mem
+        .table_column("ticks", "value")
+        .expect("value column");
 
     let start = Instant::now();
     let mut sum = 0.0f64;
-    for row in rows {
-        if let Value::F64(v) = row.values[value_idx] {
-            sum += v;
+    for value in values {
+        if let Value::F64(v) = value {
+            sum += *v;
         }
     }
     black_box(sum);
@@ -119,10 +150,10 @@ fn main() {
     let start = Instant::now();
     let mut seed = LCG_SEED;
     let mut rand_sum = 0.0f64;
-    let row_len = rows.len();
+    let row_len = values.len();
     for _ in 0..config.random_reads {
         let idx = lcg_index(&mut seed, row_len);
-        if let Value::F64(v) = rows[idx].values[value_idx] {
+        if let Value::F64(v) = values[idx] {
             rand_sum += v;
         }
     }
@@ -137,9 +168,10 @@ fn main() {
     );
 
     let start = Instant::now();
-    let mut vec = Vec::with_capacity(config.rows);
-    for idx in 0..config.rows {
-        vec.push(idx as f64 * 0.1);
+    let mut buf = RawF64Buf::new(config.rows);
+    let vec = buf.as_mut_slice();
+    for (idx, slot) in vec.iter_mut().enumerate() {
+        *slot = idx as f64 * 0.1;
     }
     let mut acc = 0.0f64;
     for v in vec.iter_mut() {
@@ -155,9 +187,10 @@ fn main() {
 
     let cache_len = config.cache_rows.max(1);
     let start = Instant::now();
-    let mut cache_vec = Vec::with_capacity(cache_len);
-    for idx in 0..cache_len {
-        cache_vec.push(idx as f64 * 0.2);
+    let mut cache_buf = RawF64Buf::new(cache_len);
+    let cache_vec = cache_buf.as_mut_slice();
+    for (idx, slot) in cache_vec.iter_mut().enumerate() {
+        *slot = idx as f64 * 0.2;
     }
     let mut cache_acc = 0.0f64;
     for _ in 0..5 {
