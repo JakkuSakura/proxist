@@ -9,13 +9,411 @@ use crate::query::{
     infer_select_schema, AggFunc, AggregateExpr, JoinSpec, JoinType, QueryPlan, ResultSet,
     SelectExpr, WindowBound, WindowExpr, WindowSpec,
 };
-use crate::types::{ColumnSpec, ColumnType, Row, Schema, Value};
+use crate::types::{coerce_value, ColumnSpec, ColumnType, Row, Schema, Value, ValueRef};
 
 #[derive(Debug, Clone)]
 struct Table {
     schema: Schema,
-    columns: Vec<Vec<Value>>,
+    columns: Vec<ColumnData>,
     row_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ColumnData {
+    ty: ColumnType,
+    nulls: Vec<u8>,
+    data: ColumnStorage,
+}
+
+#[derive(Debug, Clone)]
+enum ColumnStorage {
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+    Bool(Vec<u8>),
+    String(Vec<String>),
+    Bytes(Vec<Vec<u8>>),
+    Timestamp(Vec<i64>),
+}
+
+impl ColumnData {
+    fn new(ty: ColumnType) -> Self {
+        let data = match ty {
+            ColumnType::I64 => ColumnStorage::I64(Vec::new()),
+            ColumnType::F64 => ColumnStorage::F64(Vec::new()),
+            ColumnType::Bool => ColumnStorage::Bool(Vec::new()),
+            ColumnType::String => ColumnStorage::String(Vec::new()),
+            ColumnType::Bytes => ColumnStorage::Bytes(Vec::new()),
+            ColumnType::Timestamp => ColumnStorage::Timestamp(Vec::new()),
+        };
+        Self {
+            ty,
+            nulls: Vec::new(),
+            data,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match &self.data {
+            ColumnStorage::I64(values) => values.len(),
+            ColumnStorage::F64(values) => values.len(),
+            ColumnStorage::Bool(values) => values.len(),
+            ColumnStorage::String(values) => values.len(),
+            ColumnStorage::Bytes(values) => values.len(),
+            ColumnStorage::Timestamp(values) => values.len(),
+        }
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        self.nulls.reserve(additional);
+        match &mut self.data {
+            ColumnStorage::I64(values) => values.reserve(additional),
+            ColumnStorage::F64(values) => values.reserve(additional),
+            ColumnStorage::Bool(values) => values.reserve(additional),
+            ColumnStorage::String(values) => values.reserve(additional),
+            ColumnStorage::Bytes(values) => values.reserve(additional),
+            ColumnStorage::Timestamp(values) => values.reserve(additional),
+        }
+    }
+
+    fn fill_with_default(&mut self, default_value: &Value, rows: usize) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        self.reserve(rows);
+        for _ in 0..rows {
+            let value = if default_value.is_null() {
+                Value::Null
+            } else {
+                default_value.clone()
+            };
+            let value = coerce_value(value, self.ty)?;
+            self.push_value(value)?;
+        }
+        Ok(())
+    }
+
+    fn push_value(&mut self, value: Value) -> Result<()> {
+        match (self.ty, value) {
+            (_, Value::Null) => {
+                self.nulls.push(1);
+                self.push_default_value();
+                Ok(())
+            }
+            (ColumnType::I64, Value::I64(v)) => {
+                self.nulls.push(0);
+                if let ColumnStorage::I64(values) = &mut self.data {
+                    values.push(v);
+                }
+                Ok(())
+            }
+            (ColumnType::F64, Value::F64(v)) => {
+                self.nulls.push(0);
+                if let ColumnStorage::F64(values) = &mut self.data {
+                    values.push(v);
+                }
+                Ok(())
+            }
+            (ColumnType::Bool, Value::Bool(v)) => {
+                self.nulls.push(0);
+                if let ColumnStorage::Bool(values) = &mut self.data {
+                    values.push(if v { 1 } else { 0 });
+                }
+                Ok(())
+            }
+            (ColumnType::String, Value::String(v)) => {
+                self.nulls.push(0);
+                if let ColumnStorage::String(values) = &mut self.data {
+                    values.push(v);
+                }
+                Ok(())
+            }
+            (ColumnType::Bytes, Value::Bytes(v)) => {
+                self.nulls.push(0);
+                if let ColumnStorage::Bytes(values) = &mut self.data {
+                    values.push(v);
+                }
+                Ok(())
+            }
+            (ColumnType::Timestamp, Value::Timestamp(v)) => {
+                self.nulls.push(0);
+                if let ColumnStorage::Timestamp(values) = &mut self.data {
+                    values.push(v);
+                }
+                Ok(())
+            }
+            _ => Err(Error::InvalidData("column type mismatch".to_string())),
+        }
+    }
+
+    fn set_value(&mut self, idx: usize, value: Value) -> Result<()> {
+        if idx >= self.len() {
+            return Err(Error::InvalidData("column index out of range".to_string()));
+        }
+        match (self.ty, value) {
+            (_, Value::Null) => {
+                self.nulls[idx] = 1;
+                self.set_default_value(idx);
+                Ok(())
+            }
+            (ColumnType::I64, Value::I64(v)) => {
+                self.nulls[idx] = 0;
+                if let ColumnStorage::I64(values) = &mut self.data {
+                    values[idx] = v;
+                }
+                Ok(())
+            }
+            (ColumnType::F64, Value::F64(v)) => {
+                self.nulls[idx] = 0;
+                if let ColumnStorage::F64(values) = &mut self.data {
+                    values[idx] = v;
+                }
+                Ok(())
+            }
+            (ColumnType::Bool, Value::Bool(v)) => {
+                self.nulls[idx] = 0;
+                if let ColumnStorage::Bool(values) = &mut self.data {
+                    values[idx] = if v { 1 } else { 0 };
+                }
+                Ok(())
+            }
+            (ColumnType::String, Value::String(v)) => {
+                self.nulls[idx] = 0;
+                if let ColumnStorage::String(values) = &mut self.data {
+                    values[idx] = v;
+                }
+                Ok(())
+            }
+            (ColumnType::Bytes, Value::Bytes(v)) => {
+                self.nulls[idx] = 0;
+                if let ColumnStorage::Bytes(values) = &mut self.data {
+                    values[idx] = v;
+                }
+                Ok(())
+            }
+            (ColumnType::Timestamp, Value::Timestamp(v)) => {
+                self.nulls[idx] = 0;
+                if let ColumnStorage::Timestamp(values) = &mut self.data {
+                    values[idx] = v;
+                }
+                Ok(())
+            }
+            _ => Err(Error::InvalidData("column type mismatch".to_string())),
+        }
+    }
+
+    fn push_default_value(&mut self) {
+        match &mut self.data {
+            ColumnStorage::I64(values) => values.push(0),
+            ColumnStorage::F64(values) => values.push(0.0),
+            ColumnStorage::Bool(values) => values.push(0),
+            ColumnStorage::String(values) => values.push(String::new()),
+            ColumnStorage::Bytes(values) => values.push(Vec::new()),
+            ColumnStorage::Timestamp(values) => values.push(0),
+        }
+    }
+
+    fn set_default_value(&mut self, idx: usize) {
+        match &mut self.data {
+            ColumnStorage::I64(values) => values[idx] = 0,
+            ColumnStorage::F64(values) => values[idx] = 0.0,
+            ColumnStorage::Bool(values) => values[idx] = 0,
+            ColumnStorage::String(values) => values[idx].clear(),
+            ColumnStorage::Bytes(values) => values[idx].clear(),
+            ColumnStorage::Timestamp(values) => values[idx] = 0,
+        }
+    }
+
+    fn extend_with_default(&mut self, count: usize, default: &Value) -> Result<()> {
+        for _ in 0..count {
+            self.push_value(default.clone())?;
+        }
+        Ok(())
+    }
+
+    fn get_ref(&self, idx: usize) -> Option<ValueRef<'_>> {
+        if idx >= self.len() {
+            return None;
+        }
+        if self.nulls.get(idx).copied().unwrap_or(0) == 1 {
+            return Some(ValueRef::Null);
+        }
+        match &self.data {
+            ColumnStorage::I64(values) => values.get(idx).copied().map(ValueRef::I64),
+            ColumnStorage::F64(values) => values.get(idx).copied().map(ValueRef::F64),
+            ColumnStorage::Bool(values) => values.get(idx).map(|v| ValueRef::Bool(*v != 0)),
+            ColumnStorage::String(values) => values.get(idx).map(|v| ValueRef::String(v.as_str())),
+            ColumnStorage::Bytes(values) => values.get(idx).map(|v| ValueRef::Bytes(v.as_slice())),
+            ColumnStorage::Timestamp(values) => values.get(idx).copied().map(ValueRef::Timestamp),
+        }
+    }
+
+    fn take_rows(&self, indices: &[usize]) -> Result<Self> {
+        let mut out = ColumnData::new(self.ty);
+        out.nulls = Vec::with_capacity(indices.len());
+        match &self.data {
+            ColumnStorage::I64(values) => {
+                if let ColumnStorage::I64(out_values) = &mut out.data {
+                    for idx in indices {
+                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
+                        out_values.push(*values.get(*idx).unwrap_or(&0));
+                    }
+                }
+            }
+            ColumnStorage::F64(values) => {
+                if let ColumnStorage::F64(out_values) = &mut out.data {
+                    for idx in indices {
+                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
+                        out_values.push(*values.get(*idx).unwrap_or(&0.0));
+                    }
+                }
+            }
+            ColumnStorage::Bool(values) => {
+                if let ColumnStorage::Bool(out_values) = &mut out.data {
+                    for idx in indices {
+                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
+                        out_values.push(*values.get(*idx).unwrap_or(&0));
+                    }
+                }
+            }
+            ColumnStorage::String(values) => {
+                if let ColumnStorage::String(out_values) = &mut out.data {
+                    for idx in indices {
+                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
+                        out_values.push(values.get(*idx).cloned().unwrap_or_default());
+                    }
+                }
+            }
+            ColumnStorage::Bytes(values) => {
+                if let ColumnStorage::Bytes(out_values) = &mut out.data {
+                    for idx in indices {
+                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
+                        out_values.push(values.get(*idx).cloned().unwrap_or_default());
+                    }
+                }
+            }
+            ColumnStorage::Timestamp(values) => {
+                if let ColumnStorage::Timestamp(out_values) = &mut out.data {
+                    for idx in indices {
+                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
+                        out_values.push(*values.get(*idx).unwrap_or(&0));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn view(&self) -> ColumnView<'_> {
+        match &self.data {
+            ColumnStorage::I64(values) => ColumnView::I64(values.as_slice(), self.nulls.as_slice()),
+            ColumnStorage::F64(values) => ColumnView::F64(values.as_slice(), self.nulls.as_slice()),
+            ColumnStorage::Bool(values) => {
+                ColumnView::Bool(values.as_slice(), self.nulls.as_slice())
+            }
+            ColumnStorage::String(values) => {
+                ColumnView::String(values.as_slice(), self.nulls.as_slice())
+            }
+            ColumnStorage::Bytes(values) => {
+                ColumnView::Bytes(values.as_slice(), self.nulls.as_slice())
+            }
+            ColumnStorage::Timestamp(values) => {
+                ColumnView::Timestamp(values.as_slice(), self.nulls.as_slice())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ColumnView<'a> {
+    I64(&'a [i64], &'a [u8]),
+    F64(&'a [f64], &'a [u8]),
+    Bool(&'a [u8], &'a [u8]),
+    String(&'a [String], &'a [u8]),
+    Bytes(&'a [Vec<u8>], &'a [u8]),
+    Timestamp(&'a [i64], &'a [u8]),
+}
+
+impl ColumnView<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            ColumnView::I64(values, _) => values.len(),
+            ColumnView::F64(values, _) => values.len(),
+            ColumnView::Bool(values, _) => values.len(),
+            ColumnView::String(values, _) => values.len(),
+            ColumnView::Bytes(values, _) => values.len(),
+            ColumnView::Timestamp(values, _) => values.len(),
+        }
+    }
+
+    pub fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
+        match self {
+            ColumnView::I64(values, nulls) => get_column_value(values, nulls, idx, ValueRef::I64),
+            ColumnView::F64(values, nulls) => get_column_value(values, nulls, idx, ValueRef::F64),
+            ColumnView::Bool(values, nulls) => {
+                if idx >= values.len() {
+                    return None;
+                }
+                if nulls.get(idx).copied().unwrap_or(0) == 1 {
+                    return Some(ValueRef::Null);
+                }
+                Some(ValueRef::Bool(values[idx] != 0))
+            }
+            ColumnView::String(values, nulls) => {
+                if idx >= values.len() {
+                    return None;
+                }
+                if nulls.get(idx).copied().unwrap_or(0) == 1 {
+                    return Some(ValueRef::Null);
+                }
+                Some(ValueRef::String(values[idx].as_str()))
+            }
+            ColumnView::Bytes(values, nulls) => {
+                if idx >= values.len() {
+                    return None;
+                }
+                if nulls.get(idx).copied().unwrap_or(0) == 1 {
+                    return Some(ValueRef::Null);
+                }
+                Some(ValueRef::Bytes(values[idx].as_slice()))
+            }
+            ColumnView::Timestamp(values, nulls) => {
+                get_column_value(values, nulls, idx, ValueRef::Timestamp)
+            }
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<&[f64]> {
+        match self {
+            ColumnView::F64(values, _) => Some(values),
+            _ => None,
+        }
+    }
+
+    pub fn nulls(&self) -> &[u8] {
+        match self {
+            ColumnView::I64(_, nulls) => nulls,
+            ColumnView::F64(_, nulls) => nulls,
+            ColumnView::Bool(_, nulls) => nulls,
+            ColumnView::String(_, nulls) => nulls,
+            ColumnView::Bytes(_, nulls) => nulls,
+            ColumnView::Timestamp(_, nulls) => nulls,
+        }
+    }
+}
+
+fn get_column_value<'a, T: Copy, F: FnOnce(T) -> ValueRef<'a>>(
+    values: &'a [T],
+    nulls: &'a [u8],
+    idx: usize,
+    ctor: F,
+) -> Option<ValueRef<'a>> {
+    if idx >= values.len() {
+        return None;
+    }
+    if nulls.get(idx).copied().unwrap_or(0) == 1 {
+        return Some(ValueRef::Null);
+    }
+    Some(ctor(values[idx]))
 }
 
 #[derive(Clone, Copy)]
@@ -35,11 +433,8 @@ impl<'a> RowView<'a> {
 }
 
 impl RowAccess for RowView<'_> {
-    fn get_value(&self, idx: usize) -> Option<&Value> {
-        self.table
-            .columns
-            .get(idx)
-            .and_then(|col| col.get(self.row))
+    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
+        self.table.columns.get(idx).and_then(|col| col.get_ref(self.row))
     }
 }
 
@@ -50,17 +445,18 @@ enum RowRef<'a> {
 }
 
 impl RowAccess for RowRef<'_> {
-    fn get_value(&self, idx: usize) -> Option<&Value> {
+    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
         match self {
             RowRef::Table(view) => view.get_value(idx),
-            RowRef::Joined(row) => row.values.get(idx),
+            RowRef::Joined(row) => row.values.get(idx).map(ValueRef::from),
         }
     }
 }
 
 fn rowref_push_values(out: &mut Vec<Value>, row: &RowRef<'_>, width: usize) {
     for idx in 0..width {
-        out.push(row.get_value(idx).cloned().unwrap_or(Value::Null));
+        let value = row.get_value(idx).unwrap_or(ValueRef::Null).to_value();
+        out.push(value);
     }
 }
 
@@ -90,7 +486,7 @@ impl KeyBuf {
             let mut inline: [MaybeUninit<Value>; INLINE_KEY_CAP] =
                 unsafe { MaybeUninit::uninit().assume_init() };
             for (pos, idx) in indices.iter().enumerate() {
-                let value = row.get_value(*idx).cloned().unwrap_or(Value::Null);
+                let value = row.get_value(*idx).unwrap_or(ValueRef::Null).to_value();
                 inline[pos].write(value);
             }
             Self {
@@ -101,7 +497,7 @@ impl KeyBuf {
         } else {
             let mut values = Vec::with_capacity(len);
             for idx in indices {
-                values.push(row.get_value(*idx).cloned().unwrap_or(Value::Null));
+                values.push(row.get_value(*idx).unwrap_or(ValueRef::Null).to_value());
             }
             Self {
                 len,
@@ -215,7 +611,12 @@ impl MemStore {
             },
         );
         if let Some(table) = self.tables.get_mut(name) {
-            table.columns = vec![Vec::new(); table.schema.columns().len()];
+            table.columns = table
+                .schema
+                .columns()
+                .iter()
+                .map(|col| ColumnData::new(col.col_type))
+                .collect();
         }
         Ok(())
     }
@@ -248,15 +649,12 @@ impl MemStore {
             .tables
             .get_mut(table)
             .ok_or_else(|| Error::InvalidData(format!("table not found: {table}")))?;
+        let col_type = column.col_type;
+        let default_value = column.default.clone().unwrap_or(Value::Null);
         table.schema.add_column(column)?;
-        let idx = table.schema.columns().len().saturating_sub(1);
-        let default_value = table
-            .schema
-            .columns()
-            .get(idx)
-            .and_then(|col| col.default.clone())
-            .unwrap_or(Value::Null);
-        table.columns.push(vec![default_value; table.row_count]);
+        let mut col = ColumnData::new(col_type);
+        col.fill_with_default(&default_value, table.row_count)?;
+        table.columns.push(col);
         Ok(())
     }
 
@@ -344,7 +742,9 @@ impl MemStore {
                         default: None,
                     })?;
                     let idx = table.schema.columns().len() - 1;
-                    table.columns.push(vec![Value::Null; table.row_count]);
+                    let mut column = ColumnData::new(col_type);
+                    column.extend_with_default(table.row_count, &Value::Null)?;
+                    table.columns.push(column);
                     idx
                 }
             };
@@ -368,11 +768,16 @@ impl MemStore {
                 return Err(Error::InvalidData("insert row length mismatch".to_string()));
             }
             for (col_idx, column) in table.columns.iter_mut().enumerate() {
-                let value = match value_pos.get(col_idx).and_then(|pos| *pos) {
+                let raw_value = match value_pos.get(col_idx).and_then(|pos| *pos) {
                     Some(value_idx) => values.get(value_idx).unwrap_or(&Value::Null),
                     None => defaults.get(col_idx).unwrap_or(&Value::Null),
                 };
-                column.push(value.clone());
+                let col_type = table.schema.columns()[col_idx].col_type;
+                let mut value = raw_value.clone();
+                if !value.is_null() && value.column_type() != col_type {
+                    value = coerce_value(value, col_type)?;
+                }
+                column.push_value(value)?;
             }
             table.row_count += 1;
         }
@@ -397,15 +802,15 @@ impl MemStore {
         table_row(table, index)
     }
 
-    pub fn table_column(&self, table: &str, column: &str) -> Option<&[Value]> {
+    pub fn table_column(&self, table: &str, column: &str) -> Option<ColumnView<'_>> {
         let table = self.tables.get(table)?;
         let idx = table.schema.column_index(column)?;
-        table.columns.get(idx).map(|col| col.as_slice())
+        table.columns.get(idx).map(|col| col.view())
     }
 
-    pub fn table_column_at(&self, table: &str, index: usize) -> Option<&[Value]> {
+    pub fn table_column_at(&self, table: &str, index: usize) -> Option<ColumnView<'_>> {
         let table = self.tables.get(table)?;
-        table.columns.get(index).map(|col| col.as_slice())
+        table.columns.get(index).map(|col| col.view())
     }
 
     pub fn update(
@@ -431,7 +836,9 @@ impl MemStore {
                         default: None,
                     })?;
                     let idx = table.schema.columns().len() - 1;
-                    table.columns.push(vec![Value::Null; table.row_count]);
+                    let mut column = ColumnData::new(col_type);
+                    column.extend_with_default(table.row_count, &Value::Null)?;
+                    table.columns.push(column);
                     idx
                 }
             };
@@ -442,8 +849,13 @@ impl MemStore {
             let mut updated = 0u64;
             for (idx, value) in &assign_indices {
                 if let Some(column) = table.columns.get_mut(*idx) {
-                    for cell in column.iter_mut() {
-                        *cell = value.clone();
+                    let col_type = table.schema.columns()[*idx].col_type;
+                    let mut normalized = value.clone();
+                    if !normalized.is_null() && normalized.column_type() != col_type {
+                        normalized = coerce_value(normalized, col_type)?;
+                    }
+                    for row_idx in 0..table.row_count {
+                        column.set_value(row_idx, normalized.clone())?;
                     }
                 }
             }
@@ -463,9 +875,12 @@ impl MemStore {
             }
             for (idx, value) in &assign_indices {
                 if let Some(column) = table.columns.get_mut(*idx) {
-                    if let Some(cell) = column.get_mut(row_idx) {
-                        *cell = value.clone();
+                    let col_type = table.schema.columns()[*idx].col_type;
+                    let mut normalized = value.clone();
+                    if !normalized.is_null() && normalized.column_type() != col_type {
+                        normalized = coerce_value(normalized, col_type)?;
                     }
+                    column.set_value(row_idx, normalized)?;
                 }
             }
             updated += 1;
@@ -480,7 +895,7 @@ impl MemStore {
         if filter.is_none() {
             let count = table.row_count as u64;
             for column in &mut table.columns {
-                column.clear();
+                *column = ColumnData::new(column.ty);
             }
             table.row_count = 0;
             return Ok(count);
@@ -500,13 +915,7 @@ impl MemStore {
         }
         let removed = (table.row_count - keep_indices.len()) as u64;
         for column in &mut table.columns {
-            let mut new_col = Vec::with_capacity(keep_indices.len());
-            for idx in &keep_indices {
-                if let Some(value) = column.get(*idx) {
-                    new_col.push(value.clone());
-                }
-            }
-            *column = new_col;
+            *column = column.take_rows(&keep_indices)?;
         }
         table.row_count = keep_indices.len();
         Ok(removed)
@@ -613,7 +1022,7 @@ impl MemStore {
             for op in &proj_ops {
                 match op {
                     ProjectOp::Column(idx) => {
-                        out.push(row.get_value(*idx).cloned().unwrap_or(Value::Null));
+                        out.push(row.get_value(*idx).unwrap_or(ValueRef::Null).to_value());
                     }
                     ProjectOp::Literal(value) => out.push(value.clone()),
                     ProjectOp::Wildcard => {
@@ -665,11 +1074,8 @@ impl MemStore {
                             table: right,
                             row: right_idx,
                         };
-                        let left_key = left_row.get_value(left_on).cloned().unwrap_or(Value::Null);
-                        let right_key = right_row
-                            .get_value(right_on)
-                            .cloned()
-                            .unwrap_or(Value::Null);
+                        let left_key = left_row.get_value(left_on).unwrap_or(ValueRef::Null);
+                        let right_key = right_row.get_value(right_on).unwrap_or(ValueRef::Null);
                         if left_key == right_key {
                             matched = true;
                             rows.push(merge_rows_view(
@@ -705,21 +1111,18 @@ impl MemStore {
                             table: right,
                             row: right_idx,
                         };
-                        let left_key = left_row.get_value(left_on).cloned().unwrap_or(Value::Null);
-                        let right_key = right_row
-                            .get_value(right_on)
-                            .cloned()
-                            .unwrap_or(Value::Null);
+                        let left_key = left_row.get_value(left_on).unwrap_or(ValueRef::Null);
+                        let right_key = right_row.get_value(right_on).unwrap_or(ValueRef::Null);
                         if left_key != right_key {
                             continue;
                         }
                         let left_ts = left_row
                             .get_value(left_ts_idx)
-                            .and_then(Value::as_i64)
+                            .and_then(|value| value.as_i64())
                             .unwrap_or(0);
                         let right_ts = right_row
                             .get_value(right_ts_idx)
-                            .and_then(Value::as_i64)
+                            .and_then(|value| value.as_i64())
                             .unwrap_or(0);
                         if right_ts <= left_ts {
                             if best_ts.map(|ts| right_ts > ts).unwrap_or(true) {
@@ -816,8 +1219,9 @@ impl MemStore {
                         if key_indices.is_empty() {
                             group_rows
                                 .first()
-                                .and_then(|row| row.get_value(idx).cloned())
-                                .unwrap_or(Value::Null)
+                                .and_then(|row| row.get_value(idx))
+                                .unwrap_or(ValueRef::Null)
+                                .to_value()
                         } else {
                             let key_idx =
                                 key_pos.get(idx).and_then(|pos| *pos).ok_or_else(|| {
@@ -904,8 +1308,8 @@ impl MemStore {
         let mut out_rows = vec![Row { values: Vec::new() }; rows.len()];
         for (_key, mut part_rows) in partitions {
             part_rows.sort_by(|a, b| {
-                let left = a.1.get_value(order_idx).cloned().unwrap_or(Value::Null);
-                let right = b.1.get_value(order_idx).cloned().unwrap_or(Value::Null);
+                let left = a.1.get_value(order_idx).unwrap_or(ValueRef::Null);
+                let right = b.1.get_value(order_idx).unwrap_or(ValueRef::Null);
                 left.cmp_for_order(&right)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
@@ -948,10 +1352,10 @@ fn merge_rows_view(
 ) -> Row {
     let mut values = Vec::with_capacity(left_width + right_width);
     for idx in 0..left_width {
-        values.push(left.get_value(idx).cloned().unwrap_or(Value::Null));
+        values.push(left.get_value(idx).unwrap_or(ValueRef::Null).to_value());
     }
     for idx in 0..right_width {
-        values.push(right.get_value(idx).cloned().unwrap_or(Value::Null));
+        values.push(right.get_value(idx).unwrap_or(ValueRef::Null).to_value());
     }
     Row { values }
 }
@@ -964,7 +1368,7 @@ fn merge_left_with_row(
 ) -> Row {
     let mut values = Vec::with_capacity(left_width + right_width);
     for idx in 0..left_width {
-        values.push(left.get_value(idx).cloned().unwrap_or(Value::Null));
+        values.push(left.get_value(idx).unwrap_or(ValueRef::Null).to_value());
     }
     values.extend_from_slice(&right.values);
     if right_width < right.values.len() {
@@ -979,7 +1383,7 @@ fn table_row(table: &Table, index: usize) -> Option<Row> {
     }
     let mut values = Vec::with_capacity(table.columns.len());
     for column in &table.columns {
-        values.push(column.get(index).cloned().unwrap_or(Value::Null));
+        values.push(column.get_ref(index).unwrap_or(ValueRef::Null).to_value());
     }
     Some(Row { values })
 }
@@ -1081,7 +1485,7 @@ fn project_with_window(
                 let idx = schema
                     .column_index(name)
                     .ok_or_else(|| Error::InvalidData(format!("unknown column {name}")))?;
-                out.push(row.get_value(idx).cloned().unwrap_or(Value::Null));
+                out.push(row.get_value(idx).unwrap_or(ValueRef::Null).to_value());
             }
             SelectExpr::Literal(value) => out.push(value.clone()),
             SelectExpr::Window(window) => {

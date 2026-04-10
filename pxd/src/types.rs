@@ -203,6 +203,107 @@ pub enum Value {
     Timestamp(i64),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ValueRef<'a> {
+    Null,
+    I64(i64),
+    F64(f64),
+    Bool(bool),
+    String(&'a str),
+    Bytes(&'a [u8]),
+    Timestamp(i64),
+}
+
+impl<'a> From<&'a Value> for ValueRef<'a> {
+    fn from(value: &'a Value) -> Self {
+        match value {
+            Value::Null => ValueRef::Null,
+            Value::I64(v) => ValueRef::I64(*v),
+            Value::F64(v) => ValueRef::F64(*v),
+            Value::Bool(v) => ValueRef::Bool(*v),
+            Value::String(v) => ValueRef::String(v.as_str()),
+            Value::Bytes(v) => ValueRef::Bytes(v.as_slice()),
+            Value::Timestamp(v) => ValueRef::Timestamp(*v),
+        }
+    }
+}
+
+impl PartialEq for ValueRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ValueRef::Null, ValueRef::Null) => true,
+            (ValueRef::I64(a), ValueRef::I64(b)) => a == b,
+            (ValueRef::F64(a), ValueRef::F64(b)) => a.to_bits() == b.to_bits(),
+            (ValueRef::Bool(a), ValueRef::Bool(b)) => a == b,
+            (ValueRef::String(a), ValueRef::String(b)) => a == b,
+            (ValueRef::Bytes(a), ValueRef::Bytes(b)) => a == b,
+            (ValueRef::Timestamp(a), ValueRef::Timestamp(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ValueRef<'_> {}
+
+impl ValueRef<'_> {
+    pub fn to_value(self) -> Value {
+        match self {
+            ValueRef::Null => Value::Null,
+            ValueRef::I64(v) => Value::I64(v),
+            ValueRef::F64(v) => Value::F64(v),
+            ValueRef::Bool(v) => Value::Bool(v),
+            ValueRef::String(v) => Value::String(v.to_string()),
+            ValueRef::Bytes(v) => Value::Bytes(v.to_vec()),
+            ValueRef::Timestamp(v) => Value::Timestamp(v),
+        }
+    }
+
+    pub fn column_type(&self) -> ColumnType {
+        match self {
+            ValueRef::Null => ColumnType::String,
+            ValueRef::I64(_) => ColumnType::I64,
+            ValueRef::F64(_) => ColumnType::F64,
+            ValueRef::Bool(_) => ColumnType::Bool,
+            ValueRef::String(_) => ColumnType::String,
+            ValueRef::Bytes(_) => ColumnType::Bytes,
+            ValueRef::Timestamp(_) => ColumnType::Timestamp,
+        }
+    }
+
+    pub fn cmp_for_order(&self, other: &ValueRef<'_>) -> Option<Ordering> {
+        match (self, other) {
+            (ValueRef::I64(a), ValueRef::I64(b)) => Some(a.cmp(b)),
+            (ValueRef::Timestamp(a), ValueRef::Timestamp(b)) => Some(a.cmp(b)),
+            (ValueRef::F64(a), ValueRef::F64(b)) => a.partial_cmp(b),
+            (ValueRef::String(a), ValueRef::String(b)) => Some(a.cmp(b)),
+            (ValueRef::Bytes(a), ValueRef::Bytes(b)) => Some(a.cmp(b)),
+            (ValueRef::Bool(a), ValueRef::Bool(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            ValueRef::I64(v) => Some(*v),
+            ValueRef::Timestamp(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            ValueRef::F64(v) => Some(*v),
+            ValueRef::I64(v) => Some(*v as f64),
+            ValueRef::Timestamp(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, ValueRef::Null)
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {

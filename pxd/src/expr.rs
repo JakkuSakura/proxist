@@ -1,25 +1,25 @@
 use crate::error::{Error, Result};
-use crate::types::{Row, Schema, Value};
+use crate::types::{Row, Schema, Value, ValueRef};
 
 pub trait RowAccess {
-    fn get_value(&self, idx: usize) -> Option<&Value>;
+    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>>;
 }
 
 impl RowAccess for [Value] {
-    fn get_value(&self, idx: usize) -> Option<&Value> {
-        self.get(idx)
+    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
+        self.get(idx).map(ValueRef::from)
     }
 }
 
 impl RowAccess for Vec<Value> {
-    fn get_value(&self, idx: usize) -> Option<&Value> {
-        self.get(idx)
+    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
+        self.get(idx).map(ValueRef::from)
     }
 }
 
 impl RowAccess for Row {
-    fn get_value(&self, idx: usize) -> Option<&Value> {
-        self.values.get(idx)
+    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
+        self.values.get(idx).map(ValueRef::from)
     }
 }
 
@@ -69,8 +69,8 @@ pub fn eval_predicate<R: RowAccess + ?Sized>(
 ) -> Result<bool> {
     match expr {
         Expr::Binary { op, left, right } => {
-            let left_val = eval_value(left, row, schema)?;
-            let right_val = eval_value(right, row, schema)?;
+            let left_val = eval_value_ref(left, row, schema)?;
+            let right_val = eval_value_ref(right, row, schema)?;
             Ok(compare_values(op, &left_val, &right_val)?)
         }
         Expr::And(left, right) => Ok(
@@ -87,11 +87,11 @@ pub fn eval_predicate<R: RowAccess + ?Sized>(
     }
 }
 
-pub fn eval_value<R: RowAccess + ?Sized>(
-    expr: &Expr,
-    row: &R,
+fn eval_value_ref<'a, R: RowAccess + ?Sized>(
+    expr: &'a Expr,
+    row: &'a R,
     schema: &Schema,
-) -> Result<Value> {
+) -> Result<ValueRef<'a>> {
     match expr {
         Expr::Column(name) => {
             let idx = schema
@@ -99,22 +99,29 @@ pub fn eval_value<R: RowAccess + ?Sized>(
                 .ok_or_else(|| Error::InvalidData(format!("unknown column {name}")))?;
             Ok(row
                 .get_value(idx)
-                .cloned()
                 .ok_or_else(|| Error::InvalidData("column out of range".to_string()))?)
         }
-        Expr::Literal(value) => Ok(value.clone()),
+        Expr::Literal(value) => Ok(ValueRef::from(value)),
         Expr::Binary { op, left, right } => {
-            let left_val = eval_value(left, row, schema)?;
-            let right_val = eval_value(right, row, schema)?;
-            Ok(Value::Bool(compare_values(op, &left_val, &right_val)?))
+            let left_val = eval_value_ref(left, row, schema)?;
+            let right_val = eval_value_ref(right, row, schema)?;
+            Ok(ValueRef::Bool(compare_values(op, &left_val, &right_val)?))
         }
         Expr::And(_, _) | Expr::Or(_, _) | Expr::Not(_) => {
-            Ok(Value::Bool(eval_predicate(expr, row, schema)?))
+            Ok(ValueRef::Bool(eval_predicate(expr, row, schema)?))
         }
     }
 }
 
-fn compare_values(op: &BinaryOp, left: &Value, right: &Value) -> Result<bool> {
+pub fn eval_value<R: RowAccess + ?Sized>(
+    expr: &Expr,
+    row: &R,
+    schema: &Schema,
+) -> Result<Value> {
+    Ok(eval_value_ref(expr, row, schema)?.to_value())
+}
+
+fn compare_values(op: &BinaryOp, left: &ValueRef<'_>, right: &ValueRef<'_>) -> Result<bool> {
     match op {
         BinaryOp::Eq => Ok(left == right),
         BinaryOp::NotEq => Ok(left != right),
@@ -125,7 +132,7 @@ fn compare_values(op: &BinaryOp, left: &Value, right: &Value) -> Result<bool> {
     }
 }
 
-fn compare_ordering<F>(left: &Value, right: &Value, pred: F) -> Result<bool>
+fn compare_ordering<F>(left: &ValueRef<'_>, right: &ValueRef<'_>, pred: F) -> Result<bool>
 where
     F: FnOnce(std::cmp::Ordering) -> bool,
 {

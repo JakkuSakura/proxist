@@ -138,9 +138,17 @@ fn main() {
 
     let start = Instant::now();
     let mut sum = 0.0f64;
-    for value in values {
-        if let Value::F64(v) = value {
+    if let Some(values) = values.as_f64() {
+        for v in values {
             sum += *v;
+        }
+    } else {
+        for idx in 0..values.len() {
+            if let Some(value) = values.get_value(idx) {
+                if let Value::F64(v) = value.to_value() {
+                    sum += v;
+                }
+            }
         }
     }
     black_box(sum);
@@ -151,10 +159,19 @@ fn main() {
     let mut seed = LCG_SEED;
     let mut rand_sum = 0.0f64;
     let row_len = values.len();
-    for _ in 0..config.random_reads {
-        let idx = lcg_index(&mut seed, row_len);
-        if let Value::F64(v) = values[idx] {
-            rand_sum += v;
+    if let Some(values) = values.as_f64() {
+        for _ in 0..config.random_reads {
+            let idx = lcg_index(&mut seed, row_len);
+            rand_sum += values[idx];
+        }
+    } else {
+        for _ in 0..config.random_reads {
+            let idx = lcg_index(&mut seed, row_len);
+            if let Some(value) = values.get_value(idx) {
+                if let Value::F64(v) = value.to_value() {
+                    rand_sum += v;
+                }
+            }
         }
     }
     black_box(rand_sum);
