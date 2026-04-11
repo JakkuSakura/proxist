@@ -190,10 +190,9 @@ fn main() {
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     emit("write", config.rows, config.rows, config.rows * row_bytes, elapsed);
 
-    let values = mem
-        .table_column("ticks", "value")
-        .expect("value column");
-    let values_f64 = values.as_f64().expect("value column f64");
+    let values_f64 = mem
+        .table_column_f64("ticks", "value")
+        .expect("value column f64");
 
     let start = Instant::now();
     let sum = sum_f64_unrolled(values_f64);

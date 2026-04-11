@@ -140,11 +140,6 @@ pub fn encode_error_payload(message: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-pub fn decode_error_payload(bytes: &[u8]) -> Result<String> {
-    let mut cursor = Cursor::new(bytes);
-    read_string(&mut cursor)
-}
-
 pub fn encode_schema_payload(table: &str, schema: &Schema) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     write_string(&mut out, table)?;
@@ -459,18 +454,6 @@ pub fn encode_result_payload(schema: &Schema, rows: &[Row]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-pub fn decode_result_payload(bytes: &[u8]) -> Result<(Schema, Vec<Row>)> {
-    let mut cursor = Cursor::new(bytes);
-    let schema = read_schema(&mut cursor)?;
-    let row_count = read_u32(&mut cursor)? as usize;
-    let mut rows = Vec::with_capacity(row_count);
-    for _ in 0..row_count {
-        let values = read_values(&mut cursor, schema.columns().len())?;
-        rows.push(Row { values });
-    }
-    Ok((schema, rows))
-}
-
 struct Cursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -510,18 +493,6 @@ fn write_u16(out: &mut Vec<u8>, value: u16) -> Result<()> {
 fn read_u16(cursor: &mut Cursor<'_>) -> Result<u16> {
     let bytes = cursor.take(2)?;
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-}
-
-fn write_u64(out: &mut Vec<u8>, value: u64) -> Result<()> {
-    out.extend_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-fn read_u64(cursor: &mut Cursor<'_>) -> Result<u64> {
-    let bytes = cursor.take(8)?;
-    Ok(u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ]))
 }
 
 fn write_i64(out: &mut Vec<u8>, value: i64) -> Result<()> {

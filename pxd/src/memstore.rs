@@ -1,16 +1,13 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, Write};
-use std::mem::MaybeUninit;
 use std::path::Path;
-use std::slice;
 use std::sync::{Arc, OnceLock};
 
 use crate::error::{Error, Result};
 use crate::expr::{compare_values, eval_predicate_at, ColumnAccess, Expr};
 use crate::pxl::{ColumnInstr, ColumnProjectExpr, ColumnQuery};
-use crate::storage::{MmapView, MmapWrite, SplayedStore};
+use crate::storage::{MmapWrite, SplayedStore};
 use crate::types::{coerce_value, ColumnSpec, ColumnType, Row, Schema, Value, ValueRef};
 
 #[derive(Debug)]
@@ -92,10 +89,6 @@ enum ColumnStorage {
     Bytes(Vec<Vec<u8>>),
     Timestamp(Vec<i64>),
     Symbol(Vec<u32>),
-    MmapI64(MmapView),
-    MmapF64(MmapView),
-    MmapBool(MmapView),
-    MmapTimestamp(MmapView),
     MmapI64W(MmapWrite),
     MmapF64W(MmapWrite),
     MmapBoolW(MmapWrite),
@@ -108,23 +101,13 @@ enum ColumnStorage {
 #[derive(Debug)]
 enum NullsStorage {
     Owned(Vec<u8>),
-    Mapped(MmapView),
     Writable(MmapWrite),
 }
 
 impl NullsStorage {
-    fn len(&self) -> usize {
-        match self {
-            NullsStorage::Owned(values) => values.len(),
-            NullsStorage::Mapped(view) => view.len(),
-            NullsStorage::Writable(view) => view.len(),
-        }
-    }
-
     fn get(&self, idx: usize) -> Option<u8> {
         match self {
             NullsStorage::Owned(values) => values.get(idx).copied(),
-            NullsStorage::Mapped(view) => view.as_slice().get(idx).copied(),
             NullsStorage::Writable(view) => view.as_slice().get(idx).copied(),
         }
     }
@@ -132,24 +115,7 @@ impl NullsStorage {
     fn as_slice(&self) -> &[u8] {
         match self {
             NullsStorage::Owned(values) => values.as_slice(),
-            NullsStorage::Mapped(view) => view.as_slice(),
             NullsStorage::Writable(view) => view.as_slice(),
-        }
-    }
-
-    fn ensure_owned(&mut self) {
-        match self {
-            NullsStorage::Mapped(view) => {
-                let mut values = Vec::with_capacity(view.len());
-                values.extend_from_slice(view.as_slice());
-                *self = NullsStorage::Owned(values);
-            }
-            NullsStorage::Writable(view) => {
-                let mut values = Vec::with_capacity(view.len());
-                values.extend_from_slice(view.as_slice());
-                *self = NullsStorage::Owned(values);
-            }
-            _ => {}
         }
     }
 
@@ -159,7 +125,6 @@ impl NullsStorage {
             NullsStorage::Writable(view) => {
                 let _ = view.append_bytes(&[value]);
             }
-            NullsStorage::Mapped(_) => self.ensure_owned(),
         }
     }
 
@@ -169,7 +134,6 @@ impl NullsStorage {
             NullsStorage::Writable(view) => {
                 let _ = view.ensure_capacity(additional);
             }
-            NullsStorage::Mapped(_) => self.ensure_owned(),
         }
     }
 
@@ -179,7 +143,6 @@ impl NullsStorage {
             NullsStorage::Writable(view) => {
                 let _ = view.write_at(idx, &[value]);
             }
-            NullsStorage::Mapped(_) => self.ensure_owned(),
         }
     }
 }
@@ -220,10 +183,6 @@ impl ColumnData {
             ColumnStorage::Bytes(values) => values.len(),
             ColumnStorage::Timestamp(values) => values.len(),
             ColumnStorage::Symbol(values) => values.len(),
-            ColumnStorage::MmapI64(view) => view.len() / std::mem::size_of::<i64>(),
-            ColumnStorage::MmapF64(view) => view.len() / std::mem::size_of::<f64>(),
-            ColumnStorage::MmapBool(view) => view.len(),
-            ColumnStorage::MmapTimestamp(view) => view.len() / std::mem::size_of::<i64>(),
             ColumnStorage::MmapI64W(view) => view.len() / std::mem::size_of::<i64>(),
             ColumnStorage::MmapF64W(view) => view.len() / std::mem::size_of::<f64>(),
             ColumnStorage::MmapBoolW(view) => view.len(),
@@ -244,10 +203,6 @@ impl ColumnData {
             ColumnStorage::Bytes(values) => values.reserve(additional),
             ColumnStorage::Timestamp(values) => values.reserve(additional),
             ColumnStorage::Symbol(values) => values.reserve(additional),
-            ColumnStorage::MmapI64(_) => self.materialize(),
-            ColumnStorage::MmapF64(_) => self.materialize(),
-            ColumnStorage::MmapBool(_) => self.materialize(),
-            ColumnStorage::MmapTimestamp(_) => self.materialize(),
             ColumnStorage::MmapI64W(view) => {
                 let _ = view.ensure_capacity(additional * std::mem::size_of::<i64>());
             }
@@ -290,7 +245,6 @@ impl ColumnData {
     }
 
     fn push_value(&mut self, value: Value) -> Result<()> {
-        self.ensure_owned_data();
         match (self.ty, value) {
             (_, Value::Null) => {
                 self.nulls.push(1);
@@ -383,7 +337,6 @@ impl ColumnData {
         if idx >= self.len() {
             return Err(Error::InvalidData("column index out of range".to_string()));
         }
-        self.ensure_owned_data();
         match (self.ty, value) {
             (_, Value::Null) => {
                 self.nulls.set(idx, 1);
@@ -476,7 +429,6 @@ impl ColumnData {
     }
 
     fn push_symbol_id(&mut self, id: u32) -> Result<()> {
-        self.ensure_owned_data();
         self.nulls.push(0);
         match &mut self.data {
             ColumnStorage::Symbol(values) => values.push(id),
@@ -492,7 +444,6 @@ impl ColumnData {
         if idx >= self.len() {
             return Err(Error::InvalidData("column index out of range".to_string()));
         }
-        self.ensure_owned_data();
         self.nulls.set(idx, 0);
         match &mut self.data {
             ColumnStorage::Symbol(values) => values[idx] = id,
@@ -514,10 +465,6 @@ impl ColumnData {
             ColumnStorage::Bytes(values) => values.push(Vec::new()),
             ColumnStorage::Timestamp(values) => values.push(0),
             ColumnStorage::Symbol(values) => values.push(0),
-            ColumnStorage::MmapI64(_) => self.materialize(),
-            ColumnStorage::MmapF64(_) => self.materialize(),
-            ColumnStorage::MmapBool(_) => self.materialize(),
-            ColumnStorage::MmapTimestamp(_) => self.materialize(),
             ColumnStorage::MmapI64W(view) => {
                 let _ = view.append_bytes(&0i64.to_le_bytes());
             }
@@ -555,10 +502,6 @@ impl ColumnData {
             ColumnStorage::Bytes(values) => values[idx].clear(),
             ColumnStorage::Timestamp(values) => values[idx] = 0,
             ColumnStorage::Symbol(values) => values[idx] = 0,
-            ColumnStorage::MmapI64(_) => self.materialize(),
-            ColumnStorage::MmapF64(_) => self.materialize(),
-            ColumnStorage::MmapBool(_) => self.materialize(),
-            ColumnStorage::MmapTimestamp(_) => self.materialize(),
             ColumnStorage::MmapI64W(view) => {
                 let offset = idx * std::mem::size_of::<i64>();
                 let _ = view.write_at(offset, &0i64.to_le_bytes());
@@ -591,42 +534,6 @@ impl ColumnData {
         }
     }
 
-    fn ensure_owned_data(&mut self) {
-        match self.data {
-            ColumnStorage::MmapI64(_)
-            | ColumnStorage::MmapF64(_)
-            | ColumnStorage::MmapBool(_)
-            | ColumnStorage::MmapTimestamp(_) => {
-                self.nulls.ensure_owned();
-                self.materialize();
-            }
-            _ => {}
-        }
-    }
-
-    fn materialize(&mut self) {
-        let new_data = match &self.data {
-            ColumnStorage::MmapI64(view) => {
-                let slice = mmap_as_slice::<i64>(view);
-                ColumnStorage::I64(slice.to_vec())
-            }
-            ColumnStorage::MmapF64(view) => {
-                let slice = mmap_as_slice::<f64>(view);
-                ColumnStorage::F64(slice.to_vec())
-            }
-            ColumnStorage::MmapBool(view) => {
-                let slice = view.as_slice();
-                ColumnStorage::Bool(slice.to_vec())
-            }
-            ColumnStorage::MmapTimestamp(view) => {
-                let slice = mmap_as_slice::<i64>(view);
-                ColumnStorage::Timestamp(slice.to_vec())
-            }
-            _ => return,
-        };
-        self.data = new_data;
-    }
-
     fn extend_with_default(&mut self, count: usize, default: &Value) -> Result<()> {
         for _ in 0..count {
             self.push_value(default.clone())?;
@@ -649,23 +556,6 @@ impl ColumnData {
             ColumnStorage::Bytes(values) => values.get(idx).map(|v| ValueRef::Bytes(v.as_slice())),
             ColumnStorage::Timestamp(values) => values.get(idx).copied().map(ValueRef::Timestamp),
             ColumnStorage::Symbol(_) => Some(ValueRef::Null),
-            ColumnStorage::MmapI64(view) => mmap_as_slice::<i64>(view)
-                .get(idx)
-                .copied()
-                .map(ValueRef::I64),
-            ColumnStorage::MmapF64(view) => mmap_as_slice::<f64>(view)
-                .get(idx)
-                .copied()
-                .map(ValueRef::F64),
-            ColumnStorage::MmapBool(view) => view
-                .as_slice()
-                .get(idx)
-                .copied()
-                .map(|v| ValueRef::Bool(v != 0)),
-            ColumnStorage::MmapTimestamp(view) => mmap_as_slice::<i64>(view)
-                .get(idx)
-                .copied()
-                .map(ValueRef::Timestamp),
             ColumnStorage::MmapI64W(view) => mmap_write_as_slice::<i64>(view)
                 .get(idx)
                 .copied()
@@ -791,243 +681,6 @@ impl ColumnData {
         Ok(out)
     }
 
-    fn view(&self) -> ColumnView<'_> {
-        match &self.data {
-            ColumnStorage::I64(values) => ColumnView::I64(values.as_slice(), self.nulls.as_slice()),
-            ColumnStorage::F64(values) => ColumnView::F64(values.as_slice(), self.nulls.as_slice()),
-            ColumnStorage::Bool(values) => {
-                ColumnView::Bool(values.as_slice(), self.nulls.as_slice())
-            }
-            ColumnStorage::String(values) => {
-                ColumnView::String(values.as_slice(), self.nulls.as_slice())
-            }
-            ColumnStorage::Bytes(values) => {
-                ColumnView::Bytes(values.as_slice(), self.nulls.as_slice())
-            }
-            ColumnStorage::Timestamp(values) => {
-                ColumnView::Timestamp(values.as_slice(), self.nulls.as_slice())
-            }
-            ColumnStorage::Symbol(values) => {
-                ColumnView::Symbol(values.as_slice(), self.nulls.as_slice(), None)
-            }
-            ColumnStorage::MmapI64(view) => {
-                ColumnView::I64(mmap_as_slice::<i64>(view), self.nulls.as_slice())
-            }
-            ColumnStorage::MmapF64(view) => {
-                ColumnView::F64(mmap_as_slice::<f64>(view), self.nulls.as_slice())
-            }
-            ColumnStorage::MmapBool(view) => {
-                ColumnView::Bool(view.as_slice(), self.nulls.as_slice())
-            }
-            ColumnStorage::MmapTimestamp(view) => {
-                ColumnView::Timestamp(mmap_as_slice::<i64>(view), self.nulls.as_slice())
-            }
-            ColumnStorage::MmapI64W(view) => {
-                ColumnView::I64(mmap_write_as_slice::<i64>(view), self.nulls.as_slice())
-            }
-            ColumnStorage::MmapF64W(view) => {
-                ColumnView::F64(mmap_write_as_slice::<f64>(view), self.nulls.as_slice())
-            }
-            ColumnStorage::MmapBoolW(view) => {
-                ColumnView::Bool(view.as_slice(), self.nulls.as_slice())
-            }
-            ColumnStorage::MmapTimestampW(view) => {
-                ColumnView::Timestamp(mmap_write_as_slice::<i64>(view), self.nulls.as_slice())
-            }
-            ColumnStorage::MmapSymbolW(view) => {
-                ColumnView::Symbol(mmap_write_as_slice::<u32>(view), self.nulls.as_slice(), None)
-            }
-            ColumnStorage::MmapVarStringW { offsets, data } => ColumnView::VarString(
-                mmap_write_as_slice::<u64>(offsets),
-                data.as_slice(),
-                self.nulls.as_slice(),
-            ),
-            ColumnStorage::MmapVarBytesW { offsets, data } => ColumnView::VarBytes(
-                mmap_write_as_slice::<u64>(offsets),
-                data.as_slice(),
-                self.nulls.as_slice(),
-            ),
-        }
-    }
-
-    fn view_with_symbols<'a>(
-        &'a self,
-        symbols: &'a SymbolInterner,
-    ) -> ColumnView<'a> {
-        match &self.data {
-            ColumnStorage::Symbol(values) => {
-                ColumnView::Symbol(values.as_slice(), self.nulls.as_slice(), Some(symbols))
-            }
-            ColumnStorage::MmapSymbolW(values) => {
-                ColumnView::Symbol(mmap_write_as_slice::<u32>(values), self.nulls.as_slice(), Some(symbols))
-            }
-            _ => self.view(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ColumnView<'a> {
-    I64(&'a [i64], &'a [u8]),
-    F64(&'a [f64], &'a [u8]),
-    Bool(&'a [u8], &'a [u8]),
-    String(&'a [String], &'a [u8]),
-    Symbol(&'a [u32], &'a [u8], Option<&'a SymbolInterner>),
-    Bytes(&'a [Vec<u8>], &'a [u8]),
-    Timestamp(&'a [i64], &'a [u8]),
-    VarString(&'a [u64], &'a [u8], &'a [u8]),
-    VarBytes(&'a [u64], &'a [u8], &'a [u8]),
-}
-
-impl ColumnView<'_> {
-    pub fn len(&self) -> usize {
-        match self {
-            ColumnView::I64(values, _) => values.len(),
-            ColumnView::F64(values, _) => values.len(),
-            ColumnView::Bool(values, _) => values.len(),
-            ColumnView::String(values, _) => values.len(),
-            ColumnView::Symbol(values, _, _) => values.len(),
-            ColumnView::Bytes(values, _) => values.len(),
-            ColumnView::Timestamp(values, _) => values.len(),
-            ColumnView::VarString(offsets, _, _) => offsets.len(),
-            ColumnView::VarBytes(offsets, _, _) => offsets.len(),
-        }
-    }
-
-    pub fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
-        match self {
-            ColumnView::I64(values, nulls) => get_column_value(values, nulls, idx, ValueRef::I64),
-            ColumnView::F64(values, nulls) => get_column_value(values, nulls, idx, ValueRef::F64),
-            ColumnView::Bool(values, nulls) => {
-                if idx >= values.len() {
-                    return None;
-                }
-                if nulls.get(idx).copied().unwrap_or(0) == 1 {
-                    return Some(ValueRef::Null);
-                }
-                Some(ValueRef::Bool(values[idx] != 0))
-            }
-            ColumnView::String(values, nulls) => {
-                if idx >= values.len() {
-                    return None;
-                }
-                if nulls.get(idx).copied().unwrap_or(0) == 1 {
-                    return Some(ValueRef::Null);
-                }
-                Some(ValueRef::String(values[idx].as_str()))
-            }
-            ColumnView::Symbol(values, nulls, symbols) => {
-                if idx >= values.len() {
-                    return None;
-                }
-                if nulls.get(idx).copied().unwrap_or(0) == 1 {
-                    return Some(ValueRef::Null);
-                }
-                let symbols = match symbols {
-                    Some(sym) => *sym,
-                    None => return Some(ValueRef::Null),
-                };
-                let value = symbols.resolve(values[idx]).unwrap_or("");
-                Some(ValueRef::String(value))
-            }
-            ColumnView::Bytes(values, nulls) => {
-                if idx >= values.len() {
-                    return None;
-                }
-                if nulls.get(idx).copied().unwrap_or(0) == 1 {
-                    return Some(ValueRef::Null);
-                }
-                Some(ValueRef::Bytes(values[idx].as_slice()))
-            }
-            ColumnView::Timestamp(values, nulls) => {
-                get_column_value(values, nulls, idx, ValueRef::Timestamp)
-            }
-            ColumnView::VarString(offsets, data, nulls) => {
-                if idx >= offsets.len() {
-                    return None;
-                }
-                if nulls.get(idx).copied().unwrap_or(0) == 1 {
-                    return Some(ValueRef::Null);
-                }
-                let start = offsets[idx] as usize;
-                if start + 4 > data.len() {
-                    return Some(ValueRef::Null);
-                }
-                let len = u32::from_le_bytes([
-                    data[start],
-                    data[start + 1],
-                    data[start + 2],
-                    data[start + 3],
-                ]) as usize;
-                let end = start + 4 + len;
-                if end > data.len() {
-                    return Some(ValueRef::Null);
-                }
-                let bytes = &data[start + 4..end];
-                let value = std::str::from_utf8(bytes).ok()?;
-                Some(ValueRef::String(value))
-            }
-            ColumnView::VarBytes(offsets, data, nulls) => {
-                if idx >= offsets.len() {
-                    return None;
-                }
-                if nulls.get(idx).copied().unwrap_or(0) == 1 {
-                    return Some(ValueRef::Null);
-                }
-                let start = offsets[idx] as usize;
-                if start + 4 > data.len() {
-                    return Some(ValueRef::Null);
-                }
-                let len = u32::from_le_bytes([
-                    data[start],
-                    data[start + 1],
-                    data[start + 2],
-                    data[start + 3],
-                ]) as usize;
-                let end = start + 4 + len;
-                if end > data.len() {
-                    return Some(ValueRef::Null);
-                }
-                Some(ValueRef::Bytes(&data[start + 4..end]))
-            }
-        }
-    }
-
-    pub fn as_f64(&self) -> Option<&[f64]> {
-        match self {
-            ColumnView::F64(values, _) => Some(values),
-            _ => None,
-        }
-    }
-
-    pub fn nulls(&self) -> &[u8] {
-        match self {
-            ColumnView::I64(_, nulls) => nulls,
-            ColumnView::F64(_, nulls) => nulls,
-            ColumnView::Bool(_, nulls) => nulls,
-            ColumnView::String(_, nulls) => nulls,
-            ColumnView::Symbol(_, nulls, _) => nulls,
-            ColumnView::Bytes(_, nulls) => nulls,
-            ColumnView::Timestamp(_, nulls) => nulls,
-            ColumnView::VarString(_, _, nulls) => nulls,
-            ColumnView::VarBytes(_, _, nulls) => nulls,
-        }
-    }
-}
-
-fn mmap_as_slice<T>(view: &MmapView) -> &[T] {
-    let bytes = view.as_slice();
-    if bytes.is_empty() {
-        return &[];
-    }
-    let size = std::mem::size_of::<T>();
-    let align = std::mem::align_of::<T>();
-    debug_assert!(size > 0);
-    debug_assert!(bytes.len() % size == 0);
-    let ptr = bytes.as_ptr() as usize;
-    debug_assert!(ptr % align == 0);
-    let len = bytes.len() / size;
-    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, len) }
 }
 
 fn mmap_write_as_slice<T>(view: &MmapWrite) -> &[T] {
@@ -1055,23 +708,6 @@ fn write_numeric_slice<T: Copy>(file: &mut File, values: &[T]) -> Result<()> {
     Ok(())
 }
 
-fn write_string_values(file: &mut File, values: &[String]) -> Result<()> {
-    for value in values {
-        let len = value.len() as u32;
-        file.write_all(&len.to_le_bytes())?;
-        file.write_all(value.as_bytes())?;
-    }
-    Ok(())
-}
-
-fn write_bytes_values(file: &mut File, values: &[Vec<u8>]) -> Result<()> {
-    for value in values {
-        let len = value.len() as u32;
-        file.write_all(&len.to_le_bytes())?;
-        file.write_all(value)?;
-    }
-    Ok(())
-}
 
 fn write_string_values_with_offsets(
     data_file: &mut File,
@@ -1111,21 +747,6 @@ fn write_bytes_values_with_offsets(
     Ok(())
 }
 
-fn get_column_value<'a, T: Copy, F: FnOnce(T) -> ValueRef<'a>>(
-    values: &'a [T],
-    nulls: &'a [u8],
-    idx: usize,
-    ctor: F,
-) -> Option<ValueRef<'a>> {
-    if idx >= values.len() {
-        return None;
-    }
-    if nulls.get(idx).copied().unwrap_or(0) == 1 {
-        return Some(ValueRef::Null);
-    }
-    Some(ctor(values[idx]))
-}
-
 struct TableAccess<'a> {
     table: &'a Table,
 }
@@ -1137,10 +758,6 @@ impl<'a> TableAccess<'a> {
 }
 
 impl ColumnAccess for TableAccess<'_> {
-    fn row_count(&self) -> usize {
-        self.table.row_count
-    }
-
     fn value_at(&self, col_idx: usize, row_idx: usize) -> Option<ValueRef<'_>> {
         let column = self.table.columns.get(col_idx)?;
         if column.ty == ColumnType::Symbol {
@@ -1266,137 +883,6 @@ fn eval_column_filter<A: ColumnAccess + ?Sized>(
     }
 }
 
-const INLINE_KEY_CAP: usize = 4;
-
-struct KeyBuf {
-    len: usize,
-    inline: [MaybeUninit<Value>; INLINE_KEY_CAP],
-    heap: Option<Vec<Value>>,
-}
-
-impl KeyBuf {
-    fn new_empty() -> Self {
-        Self {
-            len: 0,
-            inline: unsafe { MaybeUninit::uninit().assume_init() },
-            heap: None,
-        }
-    }
-
-    fn from_indices<A: ColumnAccess + ?Sized>(
-        access: &A,
-        row_idx: usize,
-        indices: &[usize],
-    ) -> Self {
-        if indices.is_empty() {
-            return Self::new_empty();
-        }
-        let len = indices.len();
-        if len <= INLINE_KEY_CAP {
-            let mut inline: [MaybeUninit<Value>; INLINE_KEY_CAP] =
-                unsafe { MaybeUninit::uninit().assume_init() };
-            for (pos, idx) in indices.iter().enumerate() {
-                let value = access
-                    .value_at(*idx, row_idx)
-                    .unwrap_or(ValueRef::Null)
-                    .to_value();
-                inline[pos].write(value);
-            }
-            Self {
-                len,
-                inline,
-                heap: None,
-            }
-        } else {
-            let mut values = Vec::with_capacity(len);
-            for idx in indices {
-                values.push(
-                    access
-                        .value_at(*idx, row_idx)
-                        .unwrap_or(ValueRef::Null)
-                        .to_value(),
-                );
-            }
-            Self {
-                len,
-                inline: unsafe { MaybeUninit::uninit().assume_init() },
-                heap: Some(values),
-            }
-        }
-    }
-
-    fn from_values(values: &[Value]) -> Self {
-        if values.is_empty() {
-            return Self::new_empty();
-        }
-        let len = values.len();
-        if len <= INLINE_KEY_CAP {
-            let mut inline: [MaybeUninit<Value>; INLINE_KEY_CAP] =
-                unsafe { MaybeUninit::uninit().assume_init() };
-            for (pos, value) in values.iter().enumerate() {
-                inline[pos].write(value.clone());
-            }
-            Self {
-                len,
-                inline,
-                heap: None,
-            }
-        } else {
-            Self {
-                len,
-                inline: unsafe { MaybeUninit::uninit().assume_init() },
-                heap: Some(values.to_vec()),
-            }
-        }
-    }
-
-    fn as_slice(&self) -> &[Value] {
-        match &self.heap {
-            Some(values) => values.as_slice(),
-            None => unsafe {
-                slice::from_raw_parts(self.inline.as_ptr() as *const Value, self.len)
-            },
-        }
-    }
-
-    fn get(&self, idx: usize) -> Option<&Value> {
-        self.as_slice().get(idx)
-    }
-}
-
-impl Clone for KeyBuf {
-    fn clone(&self) -> Self {
-        Self::from_values(self.as_slice())
-    }
-}
-
-impl Drop for KeyBuf {
-    fn drop(&mut self) {
-        if self.heap.is_some() {
-            return;
-        }
-        for idx in 0..self.len {
-            unsafe {
-                self.inline[idx].assume_init_drop();
-            }
-        }
-    }
-}
-
-impl PartialEq for KeyBuf {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
-    }
-}
-
-impl Eq for KeyBuf {}
-
-impl Hash for KeyBuf {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_slice().hash(state);
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct MemStore {
     tables: HashMap<String, Table>,
@@ -1516,17 +1002,11 @@ impl MemStore {
                 (ColumnStorage::I64(values), ColumnType::I64) => {
                     write_numeric_slice(&mut data_file, values)?;
                 }
-                (ColumnStorage::MmapI64(view), ColumnType::I64) => {
-                    write_numeric_slice(&mut data_file, mmap_as_slice::<i64>(view))?;
-                }
                 (ColumnStorage::MmapI64W(view), ColumnType::I64) => {
                     write_numeric_slice(&mut data_file, mmap_write_as_slice::<i64>(view))?;
                 }
                 (ColumnStorage::F64(values), ColumnType::F64) => {
                     write_numeric_slice(&mut data_file, values)?;
-                }
-                (ColumnStorage::MmapF64(view), ColumnType::F64) => {
-                    write_numeric_slice(&mut data_file, mmap_as_slice::<f64>(view))?;
                 }
                 (ColumnStorage::MmapF64W(view), ColumnType::F64) => {
                     write_numeric_slice(&mut data_file, mmap_write_as_slice::<f64>(view))?;
@@ -1534,17 +1014,11 @@ impl MemStore {
                 (ColumnStorage::Bool(values), ColumnType::Bool) => {
                     data_file.write_all(values)?;
                 }
-                (ColumnStorage::MmapBool(view), ColumnType::Bool) => {
-                    data_file.write_all(view.as_slice())?;
-                }
                 (ColumnStorage::MmapBoolW(view), ColumnType::Bool) => {
                     data_file.write_all(view.as_slice())?;
                 }
                 (ColumnStorage::Timestamp(values), ColumnType::Timestamp) => {
                     write_numeric_slice(&mut data_file, values)?;
-                }
-                (ColumnStorage::MmapTimestamp(view), ColumnType::Timestamp) => {
-                    write_numeric_slice(&mut data_file, mmap_as_slice::<i64>(view))?;
                 }
                 (ColumnStorage::MmapTimestampW(view), ColumnType::Timestamp) => {
                     write_numeric_slice(&mut data_file, mmap_write_as_slice::<i64>(view))?;
@@ -1886,6 +1360,17 @@ impl MemStore {
 
     pub fn table_row_count(&self, name: &str) -> Option<usize> {
         self.tables.get(name).map(|table| table.row_count)
+    }
+
+    pub fn table_column_f64(&self, name: &str, column: &str) -> Option<&[f64]> {
+        let table = self.tables.get(name)?;
+        let idx = table.schema.column_index(column)?;
+        let column = table.columns.get(idx)?;
+        match &column.data {
+            ColumnStorage::F64(values) => Some(values.as_slice()),
+            ColumnStorage::MmapF64W(view) => Some(mmap_write_as_slice::<f64>(view)),
+            _ => None,
+        }
     }
 
     pub fn table_row(&self, name: &str, index: usize) -> Option<Row> {

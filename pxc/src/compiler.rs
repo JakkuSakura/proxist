@@ -806,16 +806,6 @@ fn sql_value_to_pxl(value: &SqlValue) -> Result<PxlValue, String> {
     }
 }
 
-fn expr_to_u64(expr: &Expr) -> Result<u64, String> {
-    match expr {
-        Expr::Value(SqlValue::Number(value, _)) => value
-            .parse::<u64>()
-            .map_err(|_| "window frame value must be a positive integer".to_string()),
-        Expr::Nested(inner) => expr_to_u64(inner),
-        _ => Err("window frame value must be a numeric literal".to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

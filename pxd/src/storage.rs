@@ -29,10 +29,6 @@ impl SplayedStore {
         Ok(Self { cfg, sym })
     }
 
-    pub fn config(&self) -> &StoreConfig {
-        &self.cfg
-    }
-
     pub fn create_table(&mut self, table: &str, schema: &Schema) -> Result<()> {
         let table_dir = self.table_dir(table);
         fs::create_dir_all(&table_dir)?;
@@ -51,24 +47,6 @@ impl SplayedStore {
         if table_dir.exists() {
             fs::remove_dir_all(&table_dir)?;
         }
-        Ok(())
-    }
-
-    pub fn rename_table(&mut self, from: &str, to: &str) -> Result<()> {
-        let from_dir = self.table_dir(from);
-        let to_dir = self.table_dir(to);
-        if !from_dir.exists() {
-            return Err(Error::InvalidData(format!(
-                "unknown table: {from}"
-            )));
-        }
-        fs::create_dir_all(self.partition_dir())?;
-        if to_dir.exists() {
-            return Err(Error::InvalidData(format!(
-                "target table already exists: {to}"
-            )));
-        }
-        fs::rename(from_dir, to_dir)?;
         Ok(())
     }
 
@@ -201,69 +179,6 @@ impl SplayedStore {
                 }
             }
         }
-        Ok(())
-    }
-
-    pub fn alter_drop_column(&mut self, table: &str, column: &str) -> Result<()> {
-        let mut schema = self.read_schema(table)?;
-        schema.remove_column(column)?;
-        self.write_schema(table, &schema)?;
-        let table_dir = self.table_dir(table);
-        let col_path = table_dir.join(column);
-        if col_path.exists() {
-            let _ = fs::remove_file(&col_path);
-        }
-        let null_path = table_dir.join(format!("{}.n", column));
-        if null_path.exists() {
-            let _ = fs::remove_file(&null_path);
-        }
-        let offsets_path = table_dir.join(format!("{}.o", column));
-        if offsets_path.exists() {
-            let _ = fs::remove_file(&offsets_path);
-        }
-        Ok(())
-    }
-
-    pub fn alter_rename_column(
-        &mut self,
-        table: &str,
-        from: &str,
-        to: &str,
-    ) -> Result<()> {
-        let mut schema = self.read_schema(table)?;
-        schema.rename_column(from, to)?;
-        self.write_schema(table, &schema)?;
-        let table_dir = self.table_dir(table);
-        let from_path = table_dir.join(from);
-        let to_path = table_dir.join(to);
-        if from_path.exists() {
-            fs::rename(from_path, to_path)?;
-        }
-        let from_null = table_dir.join(format!("{}.n", from));
-        let to_null = table_dir.join(format!("{}.n", to));
-        if from_null.exists() {
-            fs::rename(from_null, to_null)?;
-        }
-        let from_offsets = table_dir.join(format!("{}.o", from));
-        let to_offsets = table_dir.join(format!("{}.o", to));
-        if from_offsets.exists() {
-            fs::rename(from_offsets, to_offsets)?;
-        }
-        Ok(())
-    }
-
-    pub fn alter_set_default(
-        &mut self,
-        table: &str,
-        column: &str,
-        default: Option<Value>,
-    ) -> Result<()> {
-        let mut schema = self.read_schema(table)?;
-        let idx = schema
-            .column_index(column)
-            .ok_or_else(|| Error::InvalidData(format!("unknown column name: {column}")))?;
-        schema.set_column_default(idx, default)?;
-        self.write_schema(table, &schema)?;
         Ok(())
     }
 
@@ -545,58 +460,6 @@ impl SplayedStore {
         let path = self.table_dir(table).join(".d");
         let mut file = File::create(path)?;
         file.write_all(&payload)?;
-        Ok(())
-    }
-
-    fn write_value(&mut self, file: &mut File, ty: ColumnType, value: &Value) -> Result<()> {
-        match (ty, value) {
-            (ColumnType::I64, Value::I64(v)) => {
-                file.write_all(&v.to_le_bytes())?;
-            }
-            (ColumnType::F64, Value::F64(v)) => {
-                file.write_all(&v.to_le_bytes())?;
-            }
-            (ColumnType::Bool, Value::Bool(v)) => {
-                file.write_all(&[*v as u8])?;
-            }
-            (ColumnType::String, Value::String(v)) => {
-                self.write_bytes(file, v.as_bytes())?;
-            }
-            (ColumnType::Bytes, Value::Bytes(v)) => {
-                self.write_bytes(file, v)?;
-            }
-            (ColumnType::Timestamp, Value::Timestamp(v)) => {
-                file.write_all(&v.to_le_bytes())?;
-            }
-            (ColumnType::Symbol, Value::String(v)) => {
-                let sym = self.sym.get_or_insert(v)?;
-                file.write_all(&sym.to_le_bytes())?;
-            }
-            _ => {
-                return Err(Error::InvalidData(
-                    "column type mismatch".to_string(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn write_null_value(&self, file: &mut File, ty: ColumnType) -> Result<()> {
-        match ty {
-            ColumnType::I64 => file.write_all(&0i64.to_le_bytes())?,
-            ColumnType::F64 => file.write_all(&0f64.to_le_bytes())?,
-            ColumnType::Bool => file.write_all(&[0u8])?,
-            ColumnType::String | ColumnType::Bytes => self.write_bytes(file, &[])?,
-            ColumnType::Timestamp => file.write_all(&0i64.to_le_bytes())?,
-            ColumnType::Symbol => file.write_all(&0u32.to_le_bytes())?,
-        }
-        Ok(())
-    }
-
-    fn write_bytes(&self, file: &mut File, bytes: &[u8]) -> Result<()> {
-        let len = bytes.len() as u32;
-        file.write_all(&len.to_le_bytes())?;
-        file.write_all(bytes)?;
         Ok(())
     }
 
@@ -909,10 +772,6 @@ impl MmapView {
             return &[];
         }
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
     }
 }
 

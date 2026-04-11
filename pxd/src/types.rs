@@ -129,15 +129,6 @@ impl Schema {
         Ok(())
     }
 
-    pub fn with_aliases(mut self, aliases: &[(String, usize)]) -> Self {
-        for (alias, idx) in aliases {
-            self.index
-                .entry(alias.to_ascii_lowercase())
-                .or_insert(*idx);
-        }
-        self
-    }
-
     pub fn default_row(&self) -> Vec<Value> {
         self.columns
             .iter()
@@ -154,39 +145,6 @@ impl Schema {
         }
     }
 
-    pub fn merge_with_prefix(
-        left: (&str, &Schema),
-        right: (&str, &Schema),
-    ) -> Result<Self> {
-        let mut columns = Vec::with_capacity(left.1.columns.len() + right.1.columns.len());
-        for col in &left.1.columns {
-            columns.push(ColumnSpec {
-                name: format!("{}.{}", left.0, col.name),
-                col_type: col.col_type,
-                nullable: col.nullable,
-                default: None,
-            });
-        }
-        for col in &right.1.columns {
-            columns.push(ColumnSpec {
-                name: format!("{}.{}", right.0, col.name),
-                col_type: col.col_type,
-                nullable: col.nullable,
-                default: None,
-            });
-        }
-        let mut schema = Schema::new(columns)?;
-        let mut aliases = Vec::new();
-        for (idx, col) in left.1.columns.iter().enumerate() {
-            aliases.push((col.name.clone(), idx));
-        }
-        let right_offset = left.1.columns.len();
-        for (idx, col) in right.1.columns.iter().enumerate() {
-            aliases.push((col.name.clone(), right_offset + idx));
-        }
-        schema = schema.with_aliases(&aliases);
-        Ok(schema)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -260,18 +218,6 @@ impl ValueRef<'_> {
         }
     }
 
-    pub fn column_type(&self) -> ColumnType {
-        match self {
-            ValueRef::Null => ColumnType::String,
-            ValueRef::I64(_) => ColumnType::I64,
-            ValueRef::F64(_) => ColumnType::F64,
-            ValueRef::Bool(_) => ColumnType::Bool,
-            ValueRef::String(_) => ColumnType::String,
-            ValueRef::Bytes(_) => ColumnType::Bytes,
-            ValueRef::Timestamp(_) => ColumnType::Timestamp,
-        }
-    }
-
     pub fn cmp_for_order(&self, other: &ValueRef<'_>) -> Option<Ordering> {
         match (self, other) {
             (ValueRef::I64(a), ValueRef::I64(b)) => Some(a.cmp(b)),
@@ -284,26 +230,6 @@ impl ValueRef<'_> {
         }
     }
 
-    pub fn as_i64(&self) -> Option<i64> {
-        match self {
-            ValueRef::I64(v) => Some(*v),
-            ValueRef::Timestamp(v) => Some(*v),
-            _ => None,
-        }
-    }
-
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            ValueRef::F64(v) => Some(*v),
-            ValueRef::I64(v) => Some(*v as f64),
-            ValueRef::Timestamp(v) => Some(*v as f64),
-            _ => None,
-        }
-    }
-
-    pub fn is_null(&self) -> bool {
-        matches!(self, ValueRef::Null)
-    }
 }
 
 impl PartialEq for Value {
@@ -368,35 +294,6 @@ impl Value {
         }
     }
 
-    pub fn cmp_for_order(&self, other: &Value) -> Option<Ordering> {
-        match (self, other) {
-            (Value::I64(a), Value::I64(b)) => Some(a.cmp(b)),
-            (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
-            (Value::F64(a), Value::F64(b)) => a.partial_cmp(b),
-            (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
-            (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
-            (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
-            _ => None,
-        }
-    }
-
-    pub fn as_i64(&self) -> Option<i64> {
-        match self {
-            Value::I64(v) => Some(*v),
-            Value::Timestamp(v) => Some(*v),
-            _ => None,
-        }
-    }
-
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Value::F64(v) => Some(*v),
-            Value::I64(v) => Some(*v as f64),
-            Value::Timestamp(v) => Some(*v as f64),
-            _ => None,
-        }
-    }
-
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -454,13 +351,4 @@ pub fn coerce_value(value: Value, target: ColumnType) -> Result<Value> {
             "value type mismatch: {value:?} -> {target:?}"
         ))),
     }
-}
-
-pub fn infer_column_type(values: &[Value]) -> ColumnType {
-    for value in values {
-        if !value.is_null() {
-            return value.column_type();
-        }
-    }
-    ColumnType::String
 }

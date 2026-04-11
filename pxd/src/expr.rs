@@ -2,7 +2,6 @@ use crate::error::{Error, Result};
 use crate::types::{Schema, Value, ValueRef};
 
 pub trait ColumnAccess {
-    fn row_count(&self) -> usize;
     fn value_at(&self, col_idx: usize, row_idx: usize) -> Option<ValueRef<'_>>;
 }
 
@@ -111,23 +110,6 @@ pub fn eval_value_at<A: ColumnAccess + ?Sized>(
     Ok(eval_value_ref(expr, access, schema, row_idx)?.to_value())
 }
 
-pub fn fill_predicate_mask<A: ColumnAccess + ?Sized>(
-    expr: &Expr,
-    access: &A,
-    schema: &Schema,
-    mask: &mut [u8],
-) -> Result<()> {
-    let row_count = access.row_count();
-    if mask.len() < row_count {
-        return Err(Error::InvalidData("mask length too small".to_string()));
-    }
-    for row_idx in 0..row_count {
-        let passed = eval_predicate_at(expr, access, schema, row_idx)?;
-        mask[row_idx] = if passed { 1 } else { 0 };
-    }
-    Ok(())
-}
-
 pub fn compare_values(op: &BinaryOp, left: &ValueRef<'_>, right: &ValueRef<'_>) -> Result<bool> {
     match op {
         BinaryOp::Eq => Ok(left == right),
@@ -159,10 +141,6 @@ mod tests {
     }
 
     impl<'a> ColumnAccess for SingleRow<'a> {
-        fn row_count(&self) -> usize {
-            1
-        }
-
         fn value_at(&self, col_idx: usize, row_idx: usize) -> Option<ValueRef<'_>> {
             if row_idx != 0 {
                 return None;
