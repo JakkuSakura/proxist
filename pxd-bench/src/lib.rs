@@ -17,9 +17,15 @@ pub fn lcg_index(seed: &mut u64, len: usize) -> usize {
     ((next >> LCG_SHIFT) as usize) % len
 }
 
+#[inline]
+pub fn lcg_index_at(step: u64, len: usize) -> usize {
+    let next = LCG_SEED.wrapping_add(LCG_MULT.wrapping_mul(step));
+    ((next >> LCG_SHIFT) as usize) % len
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{lcg_next, LCG_SEED};
+    use super::{lcg_index_at, lcg_next, LCG_MULT, LCG_SEED, LCG_SHIFT};
 
     #[test]
     fn lcg_sequence_matches_reference() {
@@ -34,6 +40,16 @@ mod tests {
         for (idx, value) in expected.iter().enumerate() {
             let next = lcg_next(&mut seed);
             assert_eq!(next, *value, "mismatch at step {}", idx);
+        }
+    }
+
+    #[test]
+    fn lcg_index_at_matches_formula() {
+        let len = 1_000_000usize;
+        for step in [0u64, 1, 2, 10, 12345, 987654].iter().copied() {
+            let next = LCG_SEED.wrapping_add(LCG_MULT.wrapping_mul(step));
+            let expected = ((next >> LCG_SHIFT) as usize) % len;
+            assert_eq!(lcg_index_at(step, len), expected);
         }
     }
 }

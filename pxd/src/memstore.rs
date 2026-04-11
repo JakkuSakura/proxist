@@ -1,31 +1,89 @@
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, Write};
 use std::mem::MaybeUninit;
+use std::path::Path;
 use std::slice;
+use std::sync::{Arc, OnceLock};
 
 use crate::error::{Error, Result};
-use crate::expr::{eval_predicate, Expr, RowAccess};
-use crate::query::{
-    infer_select_schema, AggFunc, AggregateExpr, JoinSpec, JoinType, QueryPlan, ResultSet,
-    SelectExpr, WindowBound, WindowExpr, WindowSpec,
-};
+use crate::expr::{compare_values, eval_predicate_at, ColumnAccess, Expr};
+use crate::pxl::{ColumnInstr, ColumnProjectExpr, ColumnQuery};
+use crate::storage::{MmapView, MmapWrite, SplayedStore};
 use crate::types::{coerce_value, ColumnSpec, ColumnType, Row, Schema, Value, ValueRef};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Table {
     schema: Schema,
     columns: Vec<ColumnData>,
     row_count: usize,
+    symbols: SymbolInterner,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
+pub struct SymbolInterner {
+    index: HashMap<String, u32>,
+    values: Vec<Arc<str>>,
+}
+
+impl SymbolInterner {
+    fn new() -> Self {
+        Self {
+            index: HashMap::new(),
+            values: Vec::new(),
+        }
+    }
+
+    fn from_values(values: Vec<String>) -> Self {
+        let mut index = HashMap::with_capacity(values.len().saturating_mul(2));
+        let mut out = Vec::with_capacity(values.len());
+        for value in values {
+            let arc: Arc<str> = Arc::from(value.as_str());
+            let id = out.len() as u32;
+            index.insert(value, id);
+            out.push(arc);
+        }
+        Self { index, values: out }
+    }
+
+    fn resolve(&self, id: u32) -> Option<&str> {
+        self.values.get(id as usize).map(|value| value.as_ref())
+    }
+
+    fn intern(&mut self, value: &str) -> u32 {
+        if let Some(id) = self.index.get(value) {
+            return *id;
+        }
+        let arc: Arc<str> = Arc::from(value);
+        let id = self.values.len() as u32;
+        self.values.push(arc);
+        self.index.insert(value.to_string(), id);
+        id
+    }
+
+    fn intern_with_id(&mut self, value: &str, id: u32) -> u32 {
+        if let Some(existing) = self.index.get(value) {
+            return *existing;
+        }
+        let arc: Arc<str> = Arc::from(value);
+        if self.values.len() <= id as usize {
+            self.values.resize_with(id as usize + 1, empty_symbol);
+        }
+        self.values[id as usize] = arc;
+        self.index.insert(value.to_string(), id);
+        id
+    }
+}
+
+#[derive(Debug)]
 struct ColumnData {
     ty: ColumnType,
-    nulls: Vec<u8>,
+    nulls: NullsStorage,
     data: ColumnStorage,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum ColumnStorage {
     I64(Vec<i64>),
     F64(Vec<f64>),
@@ -33,6 +91,102 @@ enum ColumnStorage {
     String(Vec<String>),
     Bytes(Vec<Vec<u8>>),
     Timestamp(Vec<i64>),
+    Symbol(Vec<u32>),
+    MmapI64(MmapView),
+    MmapF64(MmapView),
+    MmapBool(MmapView),
+    MmapTimestamp(MmapView),
+    MmapI64W(MmapWrite),
+    MmapF64W(MmapWrite),
+    MmapBoolW(MmapWrite),
+    MmapTimestampW(MmapWrite),
+    MmapSymbolW(MmapWrite),
+    MmapVarStringW { offsets: MmapWrite, data: MmapWrite },
+    MmapVarBytesW { offsets: MmapWrite, data: MmapWrite },
+}
+
+#[derive(Debug)]
+enum NullsStorage {
+    Owned(Vec<u8>),
+    Mapped(MmapView),
+    Writable(MmapWrite),
+}
+
+impl NullsStorage {
+    fn len(&self) -> usize {
+        match self {
+            NullsStorage::Owned(values) => values.len(),
+            NullsStorage::Mapped(view) => view.len(),
+            NullsStorage::Writable(view) => view.len(),
+        }
+    }
+
+    fn get(&self, idx: usize) -> Option<u8> {
+        match self {
+            NullsStorage::Owned(values) => values.get(idx).copied(),
+            NullsStorage::Mapped(view) => view.as_slice().get(idx).copied(),
+            NullsStorage::Writable(view) => view.as_slice().get(idx).copied(),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            NullsStorage::Owned(values) => values.as_slice(),
+            NullsStorage::Mapped(view) => view.as_slice(),
+            NullsStorage::Writable(view) => view.as_slice(),
+        }
+    }
+
+    fn ensure_owned(&mut self) {
+        match self {
+            NullsStorage::Mapped(view) => {
+                let mut values = Vec::with_capacity(view.len());
+                values.extend_from_slice(view.as_slice());
+                *self = NullsStorage::Owned(values);
+            }
+            NullsStorage::Writable(view) => {
+                let mut values = Vec::with_capacity(view.len());
+                values.extend_from_slice(view.as_slice());
+                *self = NullsStorage::Owned(values);
+            }
+            _ => {}
+        }
+    }
+
+    fn push(&mut self, value: u8) {
+        match self {
+            NullsStorage::Owned(values) => values.push(value),
+            NullsStorage::Writable(view) => {
+                let _ = view.append_bytes(&[value]);
+            }
+            NullsStorage::Mapped(_) => self.ensure_owned(),
+        }
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        match self {
+            NullsStorage::Owned(values) => values.reserve(additional),
+            NullsStorage::Writable(view) => {
+                let _ = view.ensure_capacity(additional);
+            }
+            NullsStorage::Mapped(_) => self.ensure_owned(),
+        }
+    }
+
+    fn set(&mut self, idx: usize, value: u8) {
+        match self {
+            NullsStorage::Owned(values) => values[idx] = value,
+            NullsStorage::Writable(view) => {
+                let _ = view.write_at(idx, &[value]);
+            }
+            NullsStorage::Mapped(_) => self.ensure_owned(),
+        }
+    }
+}
+
+fn empty_symbol() -> Arc<str> {
+    static EMPTY: OnceLock<Arc<str>> = OnceLock::new();
+    EMPTY.get_or_init(|| Arc::from("")).clone()
 }
 
 impl ColumnData {
@@ -44,12 +198,17 @@ impl ColumnData {
             ColumnType::String => ColumnStorage::String(Vec::new()),
             ColumnType::Bytes => ColumnStorage::Bytes(Vec::new()),
             ColumnType::Timestamp => ColumnStorage::Timestamp(Vec::new()),
+            ColumnType::Symbol => ColumnStorage::Symbol(Vec::new()),
         };
         Self {
             ty,
-            nulls: Vec::new(),
+            nulls: NullsStorage::Owned(Vec::new()),
             data,
         }
+    }
+
+    fn new_mmap(ty: ColumnType, data: ColumnStorage, nulls: NullsStorage) -> Self {
+        Self { ty, nulls, data }
     }
 
     fn len(&self) -> usize {
@@ -60,6 +219,18 @@ impl ColumnData {
             ColumnStorage::String(values) => values.len(),
             ColumnStorage::Bytes(values) => values.len(),
             ColumnStorage::Timestamp(values) => values.len(),
+            ColumnStorage::Symbol(values) => values.len(),
+            ColumnStorage::MmapI64(view) => view.len() / std::mem::size_of::<i64>(),
+            ColumnStorage::MmapF64(view) => view.len() / std::mem::size_of::<f64>(),
+            ColumnStorage::MmapBool(view) => view.len(),
+            ColumnStorage::MmapTimestamp(view) => view.len() / std::mem::size_of::<i64>(),
+            ColumnStorage::MmapI64W(view) => view.len() / std::mem::size_of::<i64>(),
+            ColumnStorage::MmapF64W(view) => view.len() / std::mem::size_of::<f64>(),
+            ColumnStorage::MmapBoolW(view) => view.len(),
+            ColumnStorage::MmapTimestampW(view) => view.len() / std::mem::size_of::<i64>(),
+            ColumnStorage::MmapSymbolW(view) => view.len() / std::mem::size_of::<u32>(),
+            ColumnStorage::MmapVarStringW { offsets, .. } => offsets.len() / 8,
+            ColumnStorage::MmapVarBytesW { offsets, .. } => offsets.len() / 8,
         }
     }
 
@@ -72,6 +243,32 @@ impl ColumnData {
             ColumnStorage::String(values) => values.reserve(additional),
             ColumnStorage::Bytes(values) => values.reserve(additional),
             ColumnStorage::Timestamp(values) => values.reserve(additional),
+            ColumnStorage::Symbol(values) => values.reserve(additional),
+            ColumnStorage::MmapI64(_) => self.materialize(),
+            ColumnStorage::MmapF64(_) => self.materialize(),
+            ColumnStorage::MmapBool(_) => self.materialize(),
+            ColumnStorage::MmapTimestamp(_) => self.materialize(),
+            ColumnStorage::MmapI64W(view) => {
+                let _ = view.ensure_capacity(additional * std::mem::size_of::<i64>());
+            }
+            ColumnStorage::MmapF64W(view) => {
+                let _ = view.ensure_capacity(additional * std::mem::size_of::<f64>());
+            }
+            ColumnStorage::MmapBoolW(view) => {
+                let _ = view.ensure_capacity(additional);
+            }
+            ColumnStorage::MmapTimestampW(view) => {
+                let _ = view.ensure_capacity(additional * std::mem::size_of::<i64>());
+            }
+            ColumnStorage::MmapSymbolW(view) => {
+                let _ = view.ensure_capacity(additional * std::mem::size_of::<u32>());
+            }
+            ColumnStorage::MmapVarStringW { offsets, .. } => {
+                let _ = offsets.ensure_capacity(additional * 8);
+            }
+            ColumnStorage::MmapVarBytesW { offsets, .. } => {
+                let _ = offsets.ensure_capacity(additional * 8);
+            }
         }
     }
 
@@ -93,6 +290,7 @@ impl ColumnData {
     }
 
     fn push_value(&mut self, value: Value) -> Result<()> {
+        self.ensure_owned_data();
         match (self.ty, value) {
             (_, Value::Null) => {
                 self.nulls.push(1);
@@ -101,43 +299,79 @@ impl ColumnData {
             }
             (ColumnType::I64, Value::I64(v)) => {
                 self.nulls.push(0);
-                if let ColumnStorage::I64(values) = &mut self.data {
-                    values.push(v);
+                match &mut self.data {
+                    ColumnStorage::I64(values) => values.push(v),
+                    ColumnStorage::MmapI64W(view) => {
+                        view.append_bytes(&v.to_le_bytes())?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
             (ColumnType::F64, Value::F64(v)) => {
                 self.nulls.push(0);
-                if let ColumnStorage::F64(values) = &mut self.data {
-                    values.push(v);
+                match &mut self.data {
+                    ColumnStorage::F64(values) => values.push(v),
+                    ColumnStorage::MmapF64W(view) => {
+                        view.append_bytes(&v.to_le_bytes())?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
             (ColumnType::Bool, Value::Bool(v)) => {
                 self.nulls.push(0);
-                if let ColumnStorage::Bool(values) = &mut self.data {
-                    values.push(if v { 1 } else { 0 });
+                let byte = if v { 1 } else { 0 };
+                match &mut self.data {
+                    ColumnStorage::Bool(values) => values.push(byte),
+                    ColumnStorage::MmapBoolW(view) => {
+                        view.append_bytes(&[byte])?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
             (ColumnType::String, Value::String(v)) => {
                 self.nulls.push(0);
-                if let ColumnStorage::String(values) = &mut self.data {
-                    values.push(v);
+                match &mut self.data {
+                    ColumnStorage::String(values) => values.push(v),
+                    ColumnStorage::MmapVarStringW { offsets, data } => {
+                        let offset = data.len() as u64;
+                        offsets.append_bytes(&offset.to_le_bytes())?;
+                        let len = v.len() as u32;
+                        data.append_bytes(&len.to_le_bytes())?;
+                        data.append_bytes(v.as_bytes())?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
+            (ColumnType::Symbol, Value::String(_)) => Err(Error::InvalidData(
+                "symbol requires interner".to_string(),
+            )),
             (ColumnType::Bytes, Value::Bytes(v)) => {
                 self.nulls.push(0);
-                if let ColumnStorage::Bytes(values) = &mut self.data {
-                    values.push(v);
+                match &mut self.data {
+                    ColumnStorage::Bytes(values) => values.push(v),
+                    ColumnStorage::MmapVarBytesW { offsets, data } => {
+                        let offset = data.len() as u64;
+                        offsets.append_bytes(&offset.to_le_bytes())?;
+                        let len = v.len() as u32;
+                        data.append_bytes(&len.to_le_bytes())?;
+                        data.append_bytes(&v)?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
             (ColumnType::Timestamp, Value::Timestamp(v)) => {
                 self.nulls.push(0);
-                if let ColumnStorage::Timestamp(values) = &mut self.data {
-                    values.push(v);
+                match &mut self.data {
+                    ColumnStorage::Timestamp(values) => values.push(v),
+                    ColumnStorage::MmapTimestampW(view) => {
+                        view.append_bytes(&v.to_le_bytes())?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
@@ -149,56 +383,126 @@ impl ColumnData {
         if idx >= self.len() {
             return Err(Error::InvalidData("column index out of range".to_string()));
         }
+        self.ensure_owned_data();
         match (self.ty, value) {
             (_, Value::Null) => {
-                self.nulls[idx] = 1;
+                self.nulls.set(idx, 1);
                 self.set_default_value(idx);
                 Ok(())
             }
             (ColumnType::I64, Value::I64(v)) => {
-                self.nulls[idx] = 0;
-                if let ColumnStorage::I64(values) = &mut self.data {
-                    values[idx] = v;
+                self.nulls.set(idx, 0);
+                match &mut self.data {
+                    ColumnStorage::I64(values) => values[idx] = v,
+                    ColumnStorage::MmapI64W(view) => {
+                        let offset = idx * std::mem::size_of::<i64>();
+                        view.write_at(offset, &v.to_le_bytes())?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
             (ColumnType::F64, Value::F64(v)) => {
-                self.nulls[idx] = 0;
-                if let ColumnStorage::F64(values) = &mut self.data {
-                    values[idx] = v;
+                self.nulls.set(idx, 0);
+                match &mut self.data {
+                    ColumnStorage::F64(values) => values[idx] = v,
+                    ColumnStorage::MmapF64W(view) => {
+                        let offset = idx * std::mem::size_of::<f64>();
+                        view.write_at(offset, &v.to_le_bytes())?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
             (ColumnType::Bool, Value::Bool(v)) => {
-                self.nulls[idx] = 0;
-                if let ColumnStorage::Bool(values) = &mut self.data {
-                    values[idx] = if v { 1 } else { 0 };
+                self.nulls.set(idx, 0);
+                let byte = if v { 1 } else { 0 };
+                match &mut self.data {
+                    ColumnStorage::Bool(values) => values[idx] = byte,
+                    ColumnStorage::MmapBoolW(view) => {
+                        view.write_at(idx, &[byte])?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
             (ColumnType::String, Value::String(v)) => {
-                self.nulls[idx] = 0;
-                if let ColumnStorage::String(values) = &mut self.data {
-                    values[idx] = v;
+                self.nulls.set(idx, 0);
+                match &mut self.data {
+                    ColumnStorage::String(values) => values[idx] = v,
+                    ColumnStorage::MmapVarStringW { offsets, data } => {
+                        let offset = data.len() as u64;
+                        offsets.write_at(idx * 8, &offset.to_le_bytes())?;
+                        let len = v.len() as u32;
+                        data.append_bytes(&len.to_le_bytes())?;
+                        data.append_bytes(v.as_bytes())?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
+            (ColumnType::Symbol, Value::String(_)) => Err(Error::InvalidData(
+                "symbol requires interner".to_string(),
+            )),
             (ColumnType::Bytes, Value::Bytes(v)) => {
-                self.nulls[idx] = 0;
-                if let ColumnStorage::Bytes(values) = &mut self.data {
-                    values[idx] = v;
+                self.nulls.set(idx, 0);
+                match &mut self.data {
+                    ColumnStorage::Bytes(values) => values[idx] = v,
+                    ColumnStorage::MmapVarBytesW { offsets, data } => {
+                        let offset = data.len() as u64;
+                        offsets.write_at(idx * 8, &offset.to_le_bytes())?;
+                        let len = v.len() as u32;
+                        data.append_bytes(&len.to_le_bytes())?;
+                        data.append_bytes(&v)?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
             (ColumnType::Timestamp, Value::Timestamp(v)) => {
-                self.nulls[idx] = 0;
-                if let ColumnStorage::Timestamp(values) = &mut self.data {
-                    values[idx] = v;
+                self.nulls.set(idx, 0);
+                match &mut self.data {
+                    ColumnStorage::Timestamp(values) => values[idx] = v,
+                    ColumnStorage::MmapTimestampW(view) => {
+                        let offset = idx * std::mem::size_of::<i64>();
+                        view.write_at(offset, &v.to_le_bytes())?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
             _ => Err(Error::InvalidData("column type mismatch".to_string())),
         }
+    }
+
+    fn push_symbol_id(&mut self, id: u32) -> Result<()> {
+        self.ensure_owned_data();
+        self.nulls.push(0);
+        match &mut self.data {
+            ColumnStorage::Symbol(values) => values.push(id),
+            ColumnStorage::MmapSymbolW(view) => {
+                view.append_bytes(&id.to_le_bytes())?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn set_symbol_id(&mut self, idx: usize, id: u32) -> Result<()> {
+        if idx >= self.len() {
+            return Err(Error::InvalidData("column index out of range".to_string()));
+        }
+        self.ensure_owned_data();
+        self.nulls.set(idx, 0);
+        match &mut self.data {
+            ColumnStorage::Symbol(values) => values[idx] = id,
+            ColumnStorage::MmapSymbolW(view) => {
+                let offset = idx * std::mem::size_of::<u32>();
+                view.write_at(offset, &id.to_le_bytes())?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn push_default_value(&mut self) {
@@ -209,6 +513,36 @@ impl ColumnData {
             ColumnStorage::String(values) => values.push(String::new()),
             ColumnStorage::Bytes(values) => values.push(Vec::new()),
             ColumnStorage::Timestamp(values) => values.push(0),
+            ColumnStorage::Symbol(values) => values.push(0),
+            ColumnStorage::MmapI64(_) => self.materialize(),
+            ColumnStorage::MmapF64(_) => self.materialize(),
+            ColumnStorage::MmapBool(_) => self.materialize(),
+            ColumnStorage::MmapTimestamp(_) => self.materialize(),
+            ColumnStorage::MmapI64W(view) => {
+                let _ = view.append_bytes(&0i64.to_le_bytes());
+            }
+            ColumnStorage::MmapF64W(view) => {
+                let _ = view.append_bytes(&0f64.to_le_bytes());
+            }
+            ColumnStorage::MmapBoolW(view) => {
+                let _ = view.append_bytes(&[0u8]);
+            }
+            ColumnStorage::MmapTimestampW(view) => {
+                let _ = view.append_bytes(&0i64.to_le_bytes());
+            }
+            ColumnStorage::MmapSymbolW(view) => {
+                let _ = view.append_bytes(&0u32.to_le_bytes());
+            }
+            ColumnStorage::MmapVarStringW { offsets, data } => {
+                let offset = data.len() as u64;
+                let _ = offsets.append_bytes(&offset.to_le_bytes());
+                let _ = data.append_bytes(&0u32.to_le_bytes());
+            }
+            ColumnStorage::MmapVarBytesW { offsets, data } => {
+                let offset = data.len() as u64;
+                let _ = offsets.append_bytes(&offset.to_le_bytes());
+                let _ = data.append_bytes(&0u32.to_le_bytes());
+            }
         }
     }
 
@@ -220,7 +554,77 @@ impl ColumnData {
             ColumnStorage::String(values) => values[idx].clear(),
             ColumnStorage::Bytes(values) => values[idx].clear(),
             ColumnStorage::Timestamp(values) => values[idx] = 0,
+            ColumnStorage::Symbol(values) => values[idx] = 0,
+            ColumnStorage::MmapI64(_) => self.materialize(),
+            ColumnStorage::MmapF64(_) => self.materialize(),
+            ColumnStorage::MmapBool(_) => self.materialize(),
+            ColumnStorage::MmapTimestamp(_) => self.materialize(),
+            ColumnStorage::MmapI64W(view) => {
+                let offset = idx * std::mem::size_of::<i64>();
+                let _ = view.write_at(offset, &0i64.to_le_bytes());
+            }
+            ColumnStorage::MmapF64W(view) => {
+                let offset = idx * std::mem::size_of::<f64>();
+                let _ = view.write_at(offset, &0f64.to_le_bytes());
+            }
+            ColumnStorage::MmapBoolW(view) => {
+                let _ = view.write_at(idx, &[0u8]);
+            }
+            ColumnStorage::MmapTimestampW(view) => {
+                let offset = idx * std::mem::size_of::<i64>();
+                let _ = view.write_at(offset, &0i64.to_le_bytes());
+            }
+            ColumnStorage::MmapSymbolW(view) => {
+                let offset = idx * std::mem::size_of::<u32>();
+                let _ = view.write_at(offset, &0u32.to_le_bytes());
+            }
+            ColumnStorage::MmapVarStringW { offsets, data } => {
+                let offset = data.len() as u64;
+                let _ = offsets.write_at(idx * 8, &offset.to_le_bytes());
+                let _ = data.append_bytes(&0u32.to_le_bytes());
+            }
+            ColumnStorage::MmapVarBytesW { offsets, data } => {
+                let offset = data.len() as u64;
+                let _ = offsets.write_at(idx * 8, &offset.to_le_bytes());
+                let _ = data.append_bytes(&0u32.to_le_bytes());
+            }
         }
+    }
+
+    fn ensure_owned_data(&mut self) {
+        match self.data {
+            ColumnStorage::MmapI64(_)
+            | ColumnStorage::MmapF64(_)
+            | ColumnStorage::MmapBool(_)
+            | ColumnStorage::MmapTimestamp(_) => {
+                self.nulls.ensure_owned();
+                self.materialize();
+            }
+            _ => {}
+        }
+    }
+
+    fn materialize(&mut self) {
+        let new_data = match &self.data {
+            ColumnStorage::MmapI64(view) => {
+                let slice = mmap_as_slice::<i64>(view);
+                ColumnStorage::I64(slice.to_vec())
+            }
+            ColumnStorage::MmapF64(view) => {
+                let slice = mmap_as_slice::<f64>(view);
+                ColumnStorage::F64(slice.to_vec())
+            }
+            ColumnStorage::MmapBool(view) => {
+                let slice = view.as_slice();
+                ColumnStorage::Bool(slice.to_vec())
+            }
+            ColumnStorage::MmapTimestamp(view) => {
+                let slice = mmap_as_slice::<i64>(view);
+                ColumnStorage::Timestamp(slice.to_vec())
+            }
+            _ => return,
+        };
+        self.data = new_data;
     }
 
     fn extend_with_default(&mut self, count: usize, default: &Value) -> Result<()> {
@@ -234,7 +638,7 @@ impl ColumnData {
         if idx >= self.len() {
             return None;
         }
-        if self.nulls.get(idx).copied().unwrap_or(0) == 1 {
+        if self.nulls.get(idx).unwrap_or(0) == 1 {
             return Some(ValueRef::Null);
         }
         match &self.data {
@@ -244,61 +648,145 @@ impl ColumnData {
             ColumnStorage::String(values) => values.get(idx).map(|v| ValueRef::String(v.as_str())),
             ColumnStorage::Bytes(values) => values.get(idx).map(|v| ValueRef::Bytes(v.as_slice())),
             ColumnStorage::Timestamp(values) => values.get(idx).copied().map(ValueRef::Timestamp),
+            ColumnStorage::Symbol(_) => Some(ValueRef::Null),
+            ColumnStorage::MmapI64(view) => mmap_as_slice::<i64>(view)
+                .get(idx)
+                .copied()
+                .map(ValueRef::I64),
+            ColumnStorage::MmapF64(view) => mmap_as_slice::<f64>(view)
+                .get(idx)
+                .copied()
+                .map(ValueRef::F64),
+            ColumnStorage::MmapBool(view) => view
+                .as_slice()
+                .get(idx)
+                .copied()
+                .map(|v| ValueRef::Bool(v != 0)),
+            ColumnStorage::MmapTimestamp(view) => mmap_as_slice::<i64>(view)
+                .get(idx)
+                .copied()
+                .map(ValueRef::Timestamp),
+            ColumnStorage::MmapI64W(view) => mmap_write_as_slice::<i64>(view)
+                .get(idx)
+                .copied()
+                .map(ValueRef::I64),
+            ColumnStorage::MmapF64W(view) => mmap_write_as_slice::<f64>(view)
+                .get(idx)
+                .copied()
+                .map(ValueRef::F64),
+            ColumnStorage::MmapBoolW(view) => view
+                .as_slice()
+                .get(idx)
+                .copied()
+                .map(|v| ValueRef::Bool(v != 0)),
+            ColumnStorage::MmapTimestampW(view) => mmap_write_as_slice::<i64>(view)
+                .get(idx)
+                .copied()
+                .map(ValueRef::Timestamp),
+            ColumnStorage::MmapSymbolW(_) => Some(ValueRef::Null),
+            ColumnStorage::MmapVarStringW { offsets, data } => {
+                let offsets = mmap_write_as_slice::<u64>(offsets);
+                let data = data.as_slice();
+                if idx >= offsets.len() {
+                    return None;
+                }
+                let start = offsets[idx] as usize;
+                if start + 4 > data.len() {
+                    return Some(ValueRef::Null);
+                }
+                let len = u32::from_le_bytes([
+                    data[start],
+                    data[start + 1],
+                    data[start + 2],
+                    data[start + 3],
+                ]) as usize;
+                let end = start + 4 + len;
+                if end > data.len() {
+                    return Some(ValueRef::Null);
+                }
+                let bytes = &data[start + 4..end];
+                let value = std::str::from_utf8(bytes).ok()?;
+                Some(ValueRef::String(value))
+            }
+            ColumnStorage::MmapVarBytesW { offsets, data } => {
+                let offsets = mmap_write_as_slice::<u64>(offsets);
+                let data = data.as_slice();
+                if idx >= offsets.len() {
+                    return None;
+                }
+                let start = offsets[idx] as usize;
+                if start + 4 > data.len() {
+                    return Some(ValueRef::Null);
+                }
+                let len = u32::from_le_bytes([
+                    data[start],
+                    data[start + 1],
+                    data[start + 2],
+                    data[start + 3],
+                ]) as usize;
+                let end = start + 4 + len;
+                if end > data.len() {
+                    return Some(ValueRef::Null);
+                }
+                Some(ValueRef::Bytes(&data[start + 4..end]))
+            }
         }
     }
 
-    fn take_rows(&self, indices: &[usize]) -> Result<Self> {
-        let mut out = ColumnData::new(self.ty);
-        out.nulls = Vec::with_capacity(indices.len());
+    fn get_ref_with_symbols<'a>(
+        &'a self,
+        idx: usize,
+        symbols: &'a SymbolInterner,
+    ) -> Option<ValueRef<'a>> {
+        if idx >= self.len() {
+            return None;
+        }
+        if self.nulls.get(idx).unwrap_or(0) == 1 {
+            return Some(ValueRef::Null);
+        }
         match &self.data {
-            ColumnStorage::I64(values) => {
-                if let ColumnStorage::I64(out_values) = &mut out.data {
-                    for idx in indices {
-                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
-                        out_values.push(*values.get(*idx).unwrap_or(&0));
+            ColumnStorage::Symbol(values) => {
+                let id = *values.get(idx)?;
+                let value = symbols.resolve(id).unwrap_or("");
+                Some(ValueRef::String(value))
+            }
+            ColumnStorage::MmapSymbolW(values) => {
+                let ids = mmap_write_as_slice::<u32>(values);
+                let id = *ids.get(idx)?;
+                let value = symbols.resolve(id).unwrap_or("");
+                Some(ValueRef::String(value))
+            }
+            _ => self.get_ref(idx),
+        }
+    }
+
+    fn take_rows(&self, indices: &[usize], symbols: &SymbolInterner) -> Result<Self> {
+        let mut out = ColumnData::new(self.ty);
+        out.reserve(indices.len());
+        if self.ty == ColumnType::Symbol {
+            if let ColumnStorage::Symbol(values) = &self.data {
+                for idx in indices {
+                    let is_null = self.nulls.get(*idx).unwrap_or(0) == 1;
+                    if is_null {
+                        out.nulls.push(1);
+                        out.push_default_value();
+                    } else {
+                        let id = values.get(*idx).copied().unwrap_or(0);
+                        out.push_symbol_id(id)?;
                     }
                 }
+                return Ok(out);
             }
-            ColumnStorage::F64(values) => {
-                if let ColumnStorage::F64(out_values) = &mut out.data {
-                    for idx in indices {
-                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
-                        out_values.push(*values.get(*idx).unwrap_or(&0.0));
-                    }
-                }
-            }
-            ColumnStorage::Bool(values) => {
-                if let ColumnStorage::Bool(out_values) = &mut out.data {
-                    for idx in indices {
-                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
-                        out_values.push(*values.get(*idx).unwrap_or(&0));
-                    }
-                }
-            }
-            ColumnStorage::String(values) => {
-                if let ColumnStorage::String(out_values) = &mut out.data {
-                    for idx in indices {
-                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
-                        out_values.push(values.get(*idx).cloned().unwrap_or_default());
-                    }
-                }
-            }
-            ColumnStorage::Bytes(values) => {
-                if let ColumnStorage::Bytes(out_values) = &mut out.data {
-                    for idx in indices {
-                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
-                        out_values.push(values.get(*idx).cloned().unwrap_or_default());
-                    }
-                }
-            }
-            ColumnStorage::Timestamp(values) => {
-                if let ColumnStorage::Timestamp(out_values) = &mut out.data {
-                    for idx in indices {
-                        out.nulls.push(*self.nulls.get(*idx).unwrap_or(&1));
-                        out_values.push(*values.get(*idx).unwrap_or(&0));
-                    }
-                }
-            }
+        }
+        for idx in indices {
+            let value = if self.ty == ColumnType::Symbol {
+                self.get_ref_with_symbols(*idx, symbols)
+                    .unwrap_or(ValueRef::Null)
+                    .to_value()
+            } else {
+                self.get_ref(*idx).unwrap_or(ValueRef::Null).to_value()
+            };
+            out.push_value(value)?;
         }
         Ok(out)
     }
@@ -319,6 +807,61 @@ impl ColumnData {
             ColumnStorage::Timestamp(values) => {
                 ColumnView::Timestamp(values.as_slice(), self.nulls.as_slice())
             }
+            ColumnStorage::Symbol(values) => {
+                ColumnView::Symbol(values.as_slice(), self.nulls.as_slice(), None)
+            }
+            ColumnStorage::MmapI64(view) => {
+                ColumnView::I64(mmap_as_slice::<i64>(view), self.nulls.as_slice())
+            }
+            ColumnStorage::MmapF64(view) => {
+                ColumnView::F64(mmap_as_slice::<f64>(view), self.nulls.as_slice())
+            }
+            ColumnStorage::MmapBool(view) => {
+                ColumnView::Bool(view.as_slice(), self.nulls.as_slice())
+            }
+            ColumnStorage::MmapTimestamp(view) => {
+                ColumnView::Timestamp(mmap_as_slice::<i64>(view), self.nulls.as_slice())
+            }
+            ColumnStorage::MmapI64W(view) => {
+                ColumnView::I64(mmap_write_as_slice::<i64>(view), self.nulls.as_slice())
+            }
+            ColumnStorage::MmapF64W(view) => {
+                ColumnView::F64(mmap_write_as_slice::<f64>(view), self.nulls.as_slice())
+            }
+            ColumnStorage::MmapBoolW(view) => {
+                ColumnView::Bool(view.as_slice(), self.nulls.as_slice())
+            }
+            ColumnStorage::MmapTimestampW(view) => {
+                ColumnView::Timestamp(mmap_write_as_slice::<i64>(view), self.nulls.as_slice())
+            }
+            ColumnStorage::MmapSymbolW(view) => {
+                ColumnView::Symbol(mmap_write_as_slice::<u32>(view), self.nulls.as_slice(), None)
+            }
+            ColumnStorage::MmapVarStringW { offsets, data } => ColumnView::VarString(
+                mmap_write_as_slice::<u64>(offsets),
+                data.as_slice(),
+                self.nulls.as_slice(),
+            ),
+            ColumnStorage::MmapVarBytesW { offsets, data } => ColumnView::VarBytes(
+                mmap_write_as_slice::<u64>(offsets),
+                data.as_slice(),
+                self.nulls.as_slice(),
+            ),
+        }
+    }
+
+    fn view_with_symbols<'a>(
+        &'a self,
+        symbols: &'a SymbolInterner,
+    ) -> ColumnView<'a> {
+        match &self.data {
+            ColumnStorage::Symbol(values) => {
+                ColumnView::Symbol(values.as_slice(), self.nulls.as_slice(), Some(symbols))
+            }
+            ColumnStorage::MmapSymbolW(values) => {
+                ColumnView::Symbol(mmap_write_as_slice::<u32>(values), self.nulls.as_slice(), Some(symbols))
+            }
+            _ => self.view(),
         }
     }
 }
@@ -329,8 +872,11 @@ pub enum ColumnView<'a> {
     F64(&'a [f64], &'a [u8]),
     Bool(&'a [u8], &'a [u8]),
     String(&'a [String], &'a [u8]),
+    Symbol(&'a [u32], &'a [u8], Option<&'a SymbolInterner>),
     Bytes(&'a [Vec<u8>], &'a [u8]),
     Timestamp(&'a [i64], &'a [u8]),
+    VarString(&'a [u64], &'a [u8], &'a [u8]),
+    VarBytes(&'a [u64], &'a [u8], &'a [u8]),
 }
 
 impl ColumnView<'_> {
@@ -340,8 +886,11 @@ impl ColumnView<'_> {
             ColumnView::F64(values, _) => values.len(),
             ColumnView::Bool(values, _) => values.len(),
             ColumnView::String(values, _) => values.len(),
+            ColumnView::Symbol(values, _, _) => values.len(),
             ColumnView::Bytes(values, _) => values.len(),
             ColumnView::Timestamp(values, _) => values.len(),
+            ColumnView::VarString(offsets, _, _) => offsets.len(),
+            ColumnView::VarBytes(offsets, _, _) => offsets.len(),
         }
     }
 
@@ -367,6 +916,20 @@ impl ColumnView<'_> {
                 }
                 Some(ValueRef::String(values[idx].as_str()))
             }
+            ColumnView::Symbol(values, nulls, symbols) => {
+                if idx >= values.len() {
+                    return None;
+                }
+                if nulls.get(idx).copied().unwrap_or(0) == 1 {
+                    return Some(ValueRef::Null);
+                }
+                let symbols = match symbols {
+                    Some(sym) => *sym,
+                    None => return Some(ValueRef::Null),
+                };
+                let value = symbols.resolve(values[idx]).unwrap_or("");
+                Some(ValueRef::String(value))
+            }
             ColumnView::Bytes(values, nulls) => {
                 if idx >= values.len() {
                     return None;
@@ -378,6 +941,54 @@ impl ColumnView<'_> {
             }
             ColumnView::Timestamp(values, nulls) => {
                 get_column_value(values, nulls, idx, ValueRef::Timestamp)
+            }
+            ColumnView::VarString(offsets, data, nulls) => {
+                if idx >= offsets.len() {
+                    return None;
+                }
+                if nulls.get(idx).copied().unwrap_or(0) == 1 {
+                    return Some(ValueRef::Null);
+                }
+                let start = offsets[idx] as usize;
+                if start + 4 > data.len() {
+                    return Some(ValueRef::Null);
+                }
+                let len = u32::from_le_bytes([
+                    data[start],
+                    data[start + 1],
+                    data[start + 2],
+                    data[start + 3],
+                ]) as usize;
+                let end = start + 4 + len;
+                if end > data.len() {
+                    return Some(ValueRef::Null);
+                }
+                let bytes = &data[start + 4..end];
+                let value = std::str::from_utf8(bytes).ok()?;
+                Some(ValueRef::String(value))
+            }
+            ColumnView::VarBytes(offsets, data, nulls) => {
+                if idx >= offsets.len() {
+                    return None;
+                }
+                if nulls.get(idx).copied().unwrap_or(0) == 1 {
+                    return Some(ValueRef::Null);
+                }
+                let start = offsets[idx] as usize;
+                if start + 4 > data.len() {
+                    return Some(ValueRef::Null);
+                }
+                let len = u32::from_le_bytes([
+                    data[start],
+                    data[start + 1],
+                    data[start + 2],
+                    data[start + 3],
+                ]) as usize;
+                let end = start + 4 + len;
+                if end > data.len() {
+                    return Some(ValueRef::Null);
+                }
+                Some(ValueRef::Bytes(&data[start + 4..end]))
             }
         }
     }
@@ -395,10 +1006,109 @@ impl ColumnView<'_> {
             ColumnView::F64(_, nulls) => nulls,
             ColumnView::Bool(_, nulls) => nulls,
             ColumnView::String(_, nulls) => nulls,
+            ColumnView::Symbol(_, nulls, _) => nulls,
             ColumnView::Bytes(_, nulls) => nulls,
             ColumnView::Timestamp(_, nulls) => nulls,
+            ColumnView::VarString(_, _, nulls) => nulls,
+            ColumnView::VarBytes(_, _, nulls) => nulls,
         }
     }
+}
+
+fn mmap_as_slice<T>(view: &MmapView) -> &[T] {
+    let bytes = view.as_slice();
+    if bytes.is_empty() {
+        return &[];
+    }
+    let size = std::mem::size_of::<T>();
+    let align = std::mem::align_of::<T>();
+    debug_assert!(size > 0);
+    debug_assert!(bytes.len() % size == 0);
+    let ptr = bytes.as_ptr() as usize;
+    debug_assert!(ptr % align == 0);
+    let len = bytes.len() / size;
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, len) }
+}
+
+fn mmap_write_as_slice<T>(view: &MmapWrite) -> &[T] {
+    let bytes = view.as_slice();
+    if bytes.is_empty() {
+        return &[];
+    }
+    let size = std::mem::size_of::<T>();
+    let align = std::mem::align_of::<T>();
+    debug_assert!(size > 0);
+    debug_assert!(bytes.len() % size == 0);
+    let ptr = bytes.as_ptr() as usize;
+    debug_assert!(ptr % align == 0);
+    let len = bytes.len() / size;
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, len) }
+}
+
+fn write_numeric_slice<T: Copy>(file: &mut File, values: &[T]) -> Result<()> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    let byte_len = values.len() * std::mem::size_of::<T>();
+    let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+fn write_string_values(file: &mut File, values: &[String]) -> Result<()> {
+    for value in values {
+        let len = value.len() as u32;
+        file.write_all(&len.to_le_bytes())?;
+        file.write_all(value.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_bytes_values(file: &mut File, values: &[Vec<u8>]) -> Result<()> {
+    for value in values {
+        let len = value.len() as u32;
+        file.write_all(&len.to_le_bytes())?;
+        file.write_all(value)?;
+    }
+    Ok(())
+}
+
+fn write_string_values_with_offsets(
+    data_file: &mut File,
+    offsets_file: &mut File,
+    values: &[String],
+) -> Result<()> {
+    let mut offset = 0u64;
+    for value in values {
+        offsets_file.write_all(&offset.to_le_bytes())?;
+        let len = value.len() as u32;
+        data_file.write_all(&len.to_le_bytes())?;
+        data_file.write_all(value.as_bytes())?;
+        offset = offset
+            .checked_add(4)
+            .and_then(|v| v.checked_add(value.len() as u64))
+            .ok_or_else(|| Error::InvalidData("bytes length overflow".to_string()))?;
+    }
+    Ok(())
+}
+
+fn write_bytes_values_with_offsets(
+    data_file: &mut File,
+    offsets_file: &mut File,
+    values: &[Vec<u8>],
+) -> Result<()> {
+    let mut offset = 0u64;
+    for value in values {
+        offsets_file.write_all(&offset.to_le_bytes())?;
+        let len = value.len() as u32;
+        data_file.write_all(&len.to_le_bytes())?;
+        data_file.write_all(value)?;
+        offset = offset
+            .checked_add(4)
+            .and_then(|v| v.checked_add(value.len() as u64))
+            .ok_or_else(|| Error::InvalidData("bytes length overflow".to_string()))?;
+    }
+    Ok(())
 }
 
 fn get_column_value<'a, T: Copy, F: FnOnce(T) -> ValueRef<'a>>(
@@ -416,47 +1126,143 @@ fn get_column_value<'a, T: Copy, F: FnOnce(T) -> ValueRef<'a>>(
     Some(ctor(values[idx]))
 }
 
-#[derive(Clone, Copy)]
-struct RowView<'a> {
+struct TableAccess<'a> {
     table: &'a Table,
-    row: usize,
 }
 
-impl<'a> RowView<'a> {
-    fn new(table: &'a Table, row: usize) -> Option<Self> {
-        if row < table.row_count {
-            Some(Self { table, row })
+impl<'a> TableAccess<'a> {
+    fn new(table: &'a Table) -> Self {
+        Self { table }
+    }
+}
+
+impl ColumnAccess for TableAccess<'_> {
+    fn row_count(&self) -> usize {
+        self.table.row_count
+    }
+
+    fn value_at(&self, col_idx: usize, row_idx: usize) -> Option<ValueRef<'_>> {
+        let column = self.table.columns.get(col_idx)?;
+        if column.ty == ColumnType::Symbol {
+            column.get_ref_with_symbols(row_idx, &self.table.symbols)
         } else {
-            None
+            column.get_ref(row_idx)
         }
     }
 }
 
-impl RowAccess for RowView<'_> {
-    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
-        self.table.columns.get(idx).and_then(|col| col.get_ref(self.row))
+
+fn resolve_column_map(schema: &Schema, columns: &[String]) -> Result<Vec<usize>> {
+    let mut map = Vec::with_capacity(columns.len());
+    for name in columns {
+        let idx = schema
+            .column_index(name)
+            .ok_or_else(|| Error::InvalidData(format!("unknown column {name}")))?;
+        map.push(idx);
     }
+    Ok(map)
 }
 
-#[derive(Clone, Copy)]
-enum RowRef<'a> {
-    Table(RowView<'a>),
-    Joined(&'a Row),
+enum ColStackValue<'a> {
+    Value(ValueRef<'a>),
+    Bool(bool),
 }
 
-impl RowAccess for RowRef<'_> {
-    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
-        match self {
-            RowRef::Table(view) => view.get_value(idx),
-            RowRef::Joined(row) => row.values.get(idx).map(ValueRef::from),
+fn eval_column_filter<A: ColumnAccess + ?Sized>(
+    instrs: &[ColumnInstr],
+    access: &A,
+    col_map: &[usize],
+    row_idx: usize,
+) -> Result<bool> {
+    let mut stack: Vec<ColStackValue<'_>> = Vec::with_capacity(instrs.len());
+    for instr in instrs {
+        match instr {
+            ColumnInstr::PushCol(idx) => {
+                let idx = *idx as usize;
+                if idx >= col_map.len() {
+                    return Err(Error::InvalidData("filter column out of range".to_string()));
+                }
+                let schema_idx = col_map[idx];
+                let value = access.value_at(schema_idx, row_idx).unwrap_or(ValueRef::Null);
+                stack.push(ColStackValue::Value(value));
+            }
+            ColumnInstr::PushLit(value) => {
+                stack.push(ColStackValue::Value(ValueRef::from(value)));
+            }
+            ColumnInstr::Cmp(op) => {
+                let right = match stack.pop() {
+                    Some(ColStackValue::Value(v)) => v,
+                    _ => {
+                        return Err(Error::InvalidData(
+                            "filter expects value on stack".to_string(),
+                        ))
+                    }
+                };
+                let left = match stack.pop() {
+                    Some(ColStackValue::Value(v)) => v,
+                    _ => {
+                        return Err(Error::InvalidData(
+                            "filter expects value on stack".to_string(),
+                        ))
+                    }
+                };
+                let passed = compare_values(op, &left, &right)?;
+                stack.push(ColStackValue::Bool(passed));
+            }
+            ColumnInstr::And => {
+                let right = match stack.pop() {
+                    Some(ColStackValue::Bool(v)) => v,
+                    _ => {
+                        return Err(Error::InvalidData(
+                            "filter expects bool on stack".to_string(),
+                        ))
+                    }
+                };
+                let left = match stack.pop() {
+                    Some(ColStackValue::Bool(v)) => v,
+                    _ => {
+                        return Err(Error::InvalidData(
+                            "filter expects bool on stack".to_string(),
+                        ))
+                    }
+                };
+                stack.push(ColStackValue::Bool(left && right));
+            }
+            ColumnInstr::Or => {
+                let right = match stack.pop() {
+                    Some(ColStackValue::Bool(v)) => v,
+                    _ => {
+                        return Err(Error::InvalidData(
+                            "filter expects bool on stack".to_string(),
+                        ))
+                    }
+                };
+                let left = match stack.pop() {
+                    Some(ColStackValue::Bool(v)) => v,
+                    _ => {
+                        return Err(Error::InvalidData(
+                            "filter expects bool on stack".to_string(),
+                        ))
+                    }
+                };
+                stack.push(ColStackValue::Bool(left || right));
+            }
+            ColumnInstr::Not => {
+                let value = match stack.pop() {
+                    Some(ColStackValue::Bool(v)) => v,
+                    _ => {
+                        return Err(Error::InvalidData(
+                            "filter expects bool on stack".to_string(),
+                        ))
+                    }
+                };
+                stack.push(ColStackValue::Bool(!value));
+            }
         }
     }
-}
-
-fn rowref_push_values(out: &mut Vec<Value>, row: &RowRef<'_>, width: usize) {
-    for idx in 0..width {
-        let value = row.get_value(idx).unwrap_or(ValueRef::Null).to_value();
-        out.push(value);
+    match stack.pop() {
+        Some(ColStackValue::Bool(v)) => Ok(v),
+        _ => Err(Error::InvalidData("filter did not resolve to bool".to_string())),
     }
 }
 
@@ -477,7 +1283,11 @@ impl KeyBuf {
         }
     }
 
-    fn from_indices(row: &RowRef<'_>, indices: &[usize]) -> Self {
+    fn from_indices<A: ColumnAccess + ?Sized>(
+        access: &A,
+        row_idx: usize,
+        indices: &[usize],
+    ) -> Self {
         if indices.is_empty() {
             return Self::new_empty();
         }
@@ -486,7 +1296,10 @@ impl KeyBuf {
             let mut inline: [MaybeUninit<Value>; INLINE_KEY_CAP] =
                 unsafe { MaybeUninit::uninit().assume_init() };
             for (pos, idx) in indices.iter().enumerate() {
-                let value = row.get_value(*idx).unwrap_or(ValueRef::Null).to_value();
+                let value = access
+                    .value_at(*idx, row_idx)
+                    .unwrap_or(ValueRef::Null)
+                    .to_value();
                 inline[pos].write(value);
             }
             Self {
@@ -497,7 +1310,12 @@ impl KeyBuf {
         } else {
             let mut values = Vec::with_capacity(len);
             for idx in indices {
-                values.push(row.get_value(*idx).unwrap_or(ValueRef::Null).to_value());
+                values.push(
+                    access
+                        .value_at(*idx, row_idx)
+                        .unwrap_or(ValueRef::Null)
+                        .to_value(),
+                );
             }
             Self {
                 len,
@@ -582,25 +1400,222 @@ impl Hash for KeyBuf {
 #[derive(Debug, Default)]
 pub struct MemStore {
     tables: HashMap<String, Table>,
+    store: Option<SplayedStore>,
+    scratch_col_indices: Vec<usize>,
+    scratch_value_pos: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
-enum ProjectOp {
-    Column(usize),
-    Literal(Value),
-    Wildcard,
+pub struct ResultSet {
+    pub schema: Schema,
+    pub rows: Vec<Row>,
 }
 
 impl MemStore {
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
+            store: None,
+            scratch_col_indices: Vec::new(),
+            scratch_value_pos: Vec::new(),
         }
+    }
+
+    pub fn with_store(store: SplayedStore) -> Self {
+        Self {
+            tables: HashMap::new(),
+            store: Some(store),
+            scratch_col_indices: Vec::new(),
+            scratch_value_pos: Vec::new(),
+        }
+    }
+
+    pub fn load_from_store(&mut self) -> Result<()> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(());
+        };
+        let tables = store.list_tables()?;
+        for table_name in tables {
+            let schema = store.read_schema(&table_name)?;
+            let mut columns = Vec::with_capacity(schema.columns().len());
+            let symbols = SymbolInterner::from_values(store.symbol_values());
+            let mut row_count: Option<usize> = None;
+            for column in schema.columns() {
+                let (col_data, col_rows) =
+                    load_column_from_store(store, &table_name, column)?;
+                if let Some(existing) = row_count {
+                    if existing != col_rows {
+                        return Err(Error::InvalidData(format!(
+                            "row count mismatch in {table_name}.{name}: {existing} vs {col_rows}",
+                            name = column.name
+                        )));
+                    }
+                } else {
+                    row_count = Some(col_rows);
+                }
+                columns.push(col_data);
+            }
+            self.tables.insert(
+                table_name,
+                Table {
+                    schema,
+                    columns,
+                    row_count: row_count.unwrap_or(0),
+                    symbols,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub fn flush_to_store(&mut self) -> Result<()> {
+        if self.store.is_none() {
+            return Ok(());
+        };
+        let table_names: Vec<String> = self.tables.keys().cloned().collect();
+        for table_name in table_names {
+            self.flush_table_to_store(&table_name)?;
+        }
+        Ok(())
+    }
+
+    fn flush_table_to_store(&mut self, table_name: &str) -> Result<()> {
+        let Some(store) = self.store.as_mut() else {
+            return Ok(());
+        };
+        let Some(table) = self.tables.get(table_name) else {
+            return Ok(());
+        };
+        store.drop_table(table_name)?;
+        store.create_table(table_name, &table.schema)?;
+        if table.row_count == 0 {
+            return Ok(());
+        }
+        let table_dir = store.table_dir(table_name);
+        for (idx, spec) in table.schema.columns().iter().enumerate() {
+            let column = table
+                .columns
+                .get(idx)
+                .ok_or_else(|| Error::InvalidData("column data mismatch".to_string()))?;
+            let data_path = table_dir.join(&spec.name);
+            let null_path = table_dir.join(format!("{}.n", spec.name));
+            let offsets_path = table_dir.join(format!("{}.o", spec.name));
+            let mut data_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&data_path)?;
+            let mut null_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&null_path)?;
+            let nulls = column.nulls.as_slice();
+            null_file.write_all(nulls)?;
+            match (&column.data, spec.col_type) {
+                (ColumnStorage::I64(values), ColumnType::I64) => {
+                    write_numeric_slice(&mut data_file, values)?;
+                }
+                (ColumnStorage::MmapI64(view), ColumnType::I64) => {
+                    write_numeric_slice(&mut data_file, mmap_as_slice::<i64>(view))?;
+                }
+                (ColumnStorage::MmapI64W(view), ColumnType::I64) => {
+                    write_numeric_slice(&mut data_file, mmap_write_as_slice::<i64>(view))?;
+                }
+                (ColumnStorage::F64(values), ColumnType::F64) => {
+                    write_numeric_slice(&mut data_file, values)?;
+                }
+                (ColumnStorage::MmapF64(view), ColumnType::F64) => {
+                    write_numeric_slice(&mut data_file, mmap_as_slice::<f64>(view))?;
+                }
+                (ColumnStorage::MmapF64W(view), ColumnType::F64) => {
+                    write_numeric_slice(&mut data_file, mmap_write_as_slice::<f64>(view))?;
+                }
+                (ColumnStorage::Bool(values), ColumnType::Bool) => {
+                    data_file.write_all(values)?;
+                }
+                (ColumnStorage::MmapBool(view), ColumnType::Bool) => {
+                    data_file.write_all(view.as_slice())?;
+                }
+                (ColumnStorage::MmapBoolW(view), ColumnType::Bool) => {
+                    data_file.write_all(view.as_slice())?;
+                }
+                (ColumnStorage::Timestamp(values), ColumnType::Timestamp) => {
+                    write_numeric_slice(&mut data_file, values)?;
+                }
+                (ColumnStorage::MmapTimestamp(view), ColumnType::Timestamp) => {
+                    write_numeric_slice(&mut data_file, mmap_as_slice::<i64>(view))?;
+                }
+                (ColumnStorage::MmapTimestampW(view), ColumnType::Timestamp) => {
+                    write_numeric_slice(&mut data_file, mmap_write_as_slice::<i64>(view))?;
+                }
+                (ColumnStorage::String(values), ColumnType::String) => {
+                    let mut offsets_file = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&offsets_path)?;
+                    write_string_values_with_offsets(&mut data_file, &mut offsets_file, values)?;
+                }
+                (ColumnStorage::Bytes(values), ColumnType::Bytes) => {
+                    let mut offsets_file = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&offsets_path)?;
+                    write_bytes_values_with_offsets(&mut data_file, &mut offsets_file, values)?;
+                }
+                (ColumnStorage::MmapVarStringW { offsets, data }, ColumnType::String) => {
+                    data_file.write_all(data.as_slice())?;
+                    let mut offsets_file = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&offsets_path)?;
+                    offsets_file.write_all(offsets.as_slice())?;
+                }
+                (ColumnStorage::MmapVarBytesW { offsets, data }, ColumnType::Bytes) => {
+                    data_file.write_all(data.as_slice())?;
+                    let mut offsets_file = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&offsets_path)?;
+                    offsets_file.write_all(offsets.as_slice())?;
+                }
+                (ColumnStorage::Symbol(values), ColumnType::Symbol) => {
+                    for (row_idx, value) in values.iter().enumerate() {
+                        if nulls.get(row_idx).copied().unwrap_or(0) == 1 {
+                            data_file.write_all(&0u32.to_le_bytes())?;
+                        } else {
+                            data_file.write_all(&value.to_le_bytes())?;
+                        }
+                    }
+                }
+                (ColumnStorage::MmapSymbolW(values), ColumnType::Symbol) => {
+                    let ids = mmap_write_as_slice::<u32>(values);
+                    for (row_idx, value) in ids.iter().enumerate() {
+                        if nulls.get(row_idx).copied().unwrap_or(0) == 1 {
+                            data_file.write_all(&0u32.to_le_bytes())?;
+                        } else {
+                            data_file.write_all(&value.to_le_bytes())?;
+                        }
+                    }
+                }
+                _ => {
+                    return Err(Error::InvalidData("column type mismatch".to_string()));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn create_table(&mut self, name: &str, schema: Schema) -> Result<()> {
         if self.tables.contains_key(name) {
             return Err(Error::InvalidData(format!("table already exists: {name}")));
+        }
+        if let Some(store) = self.store.as_mut() {
+            store.create_table(name, &schema)?;
         }
         self.tables.insert(
             name.to_string(),
@@ -608,38 +1623,24 @@ impl MemStore {
                 schema,
                 columns: Vec::new(),
                 row_count: 0,
+                symbols: SymbolInterner::new(),
             },
         );
         if let Some(table) = self.tables.get_mut(name) {
-            table.columns = table
-                .schema
-                .columns()
-                .iter()
-                .map(|col| ColumnData::new(col.col_type))
-                .collect();
-        }
-        Ok(())
-    }
-
-    pub fn create_table_as(&mut self, name: &str, plan: &QueryPlan) -> Result<()> {
-        if self.tables.contains_key(name) {
-            return Err(Error::InvalidData(format!("table already exists: {name}")));
-        }
-        let result = {
-            let mem_ref: &MemStore = &*self;
-            mem_ref.query(plan)?
-        };
-        let schema = result.schema.clone();
-        self.create_table(name, schema)?;
-        if !result.rows.is_empty() {
-            let columns: Vec<String> = result
-                .schema
-                .columns()
-                .iter()
-                .map(|col| col.name.clone())
-                .collect();
-            let rows: Vec<Vec<Value>> = result.rows.into_iter().map(|row| row.values).collect();
-            self.insert(name, &columns, &rows)?;
+            if let Some(store) = self.store.as_ref() {
+                let mut columns = Vec::with_capacity(table.schema.columns().len());
+                for col in table.schema.columns() {
+                    columns.push(init_mmap_column_data(store, name, col)?);
+                }
+                table.columns = columns;
+            } else {
+                table.columns = table
+                    .schema
+                    .columns()
+                    .iter()
+                    .map(|col| ColumnData::new(col.col_type))
+                    .collect();
+            }
         }
         Ok(())
     }
@@ -720,42 +1721,91 @@ impl MemStore {
     }
 
     pub fn insert(&mut self, table: &str, columns: &[String], rows: &[Vec<Value>]) -> Result<()> {
+        let table_name = table;
+        if columns.is_empty() {
+            return Err(Error::InvalidData("insert requires column list".to_string()));
+        }
+        if !self.tables.contains_key(table_name) {
+            if let Some(store) = self.store.as_mut() {
+                let mut specs = Vec::with_capacity(columns.len());
+                for (col_pos, name) in columns.iter().enumerate() {
+                    let col_type = infer_column_type_from_rows(rows, col_pos);
+                    specs.push(ColumnSpec {
+                        name: name.clone(),
+                        col_type,
+                        nullable: true,
+                        default: None,
+                    });
+                }
+                let schema = Schema::new(specs)?;
+                store.create_table(table_name, &schema)?;
+                let mut columns_data = Vec::with_capacity(schema.columns().len());
+                for col in schema.columns() {
+                    columns_data.push(init_mmap_column_data(store, table_name, col)?);
+                }
+                let symbols = SymbolInterner::from_values(store.symbol_values());
+                self.tables.insert(
+                    table_name.to_string(),
+                    Table {
+                        schema,
+                        columns: columns_data,
+                        row_count: 0,
+                        symbols,
+                    },
+                );
+            } else {
+                self.tables.insert(
+                    table_name.to_string(),
+                    Table {
+                        schema: Schema::new(Vec::new()).expect("empty schema"),
+                        columns: Vec::new(),
+                        row_count: 0,
+                        symbols: SymbolInterner::new(),
+                    },
+                );
+            }
+        }
         let table = self
             .tables
-            .entry(table.to_string())
-            .or_insert_with(|| Table {
-                schema: Schema::new(Vec::new()).expect("empty schema"),
-                columns: Vec::new(),
-                row_count: 0,
-            });
+            .get_mut(table_name)
+            .ok_or_else(|| Error::InvalidData("table not found".to_string()))?;
 
-        let mut col_indices = Vec::with_capacity(columns.len());
+        self.scratch_col_indices.clear();
+        self.scratch_col_indices.reserve(columns.len());
         for (col_pos, name) in columns.iter().enumerate() {
             let idx = match table.schema.column_index(name) {
                 Some(idx) => idx,
                 None => {
                     let col_type = infer_column_type_from_rows(rows, col_pos);
-                    table.schema.add_column(ColumnSpec {
+                    let spec = ColumnSpec {
                         name: name.clone(),
                         col_type,
                         nullable: true,
                         default: None,
-                    })?;
+                    };
+                    table.schema.add_column(spec.clone())?;
                     let idx = table.schema.columns().len() - 1;
-                    let mut column = ColumnData::new(col_type);
-                    column.extend_with_default(table.row_count, &Value::Null)?;
-                    table.columns.push(column);
+                    if let Some(store) = self.store.as_mut() {
+                        store.alter_add_column(table_name, &spec)?;
+                        let column = init_mmap_column_data(store, table_name, &spec)?;
+                        table.columns.push(column);
+                    } else {
+                        let mut column = ColumnData::new(col_type);
+                        column.extend_with_default(table.row_count, &Value::Null)?;
+                        table.columns.push(column);
+                    }
                     idx
                 }
             };
-            col_indices.push(idx);
+            self.scratch_col_indices.push(idx);
         }
 
         let schema_len = table.schema.columns().len();
-        let mut value_pos = vec![None; schema_len];
-        for (value_idx, col_idx) in col_indices.iter().enumerate() {
-            if let Some(pos) = value_pos.get_mut(*col_idx) {
-                *pos = Some(value_idx);
+        self.scratch_value_pos.clear();
+        self.scratch_value_pos.resize(schema_len, usize::MAX);
+        for (value_idx, col_idx) in self.scratch_col_indices.iter().enumerate() {
+            if let Some(pos) = self.scratch_value_pos.get_mut(*col_idx) {
+                *pos = value_idx;
             }
         }
         let defaults = table.schema.default_row();
@@ -772,56 +1822,78 @@ impl MemStore {
         for (col_idx, column) in table.columns.iter_mut().enumerate() {
             let col_type = schema_columns[col_idx].col_type;
             let default_value = defaults.get(col_idx).unwrap_or(&Value::Null);
-            match value_pos.get(col_idx).and_then(|pos| *pos) {
-                Some(value_idx) => {
-                    for values in rows {
-                        let raw_value = values.get(value_idx).unwrap_or(&Value::Null);
-                        let value = if raw_value.is_null() {
-                            Value::Null
-                        } else if raw_value.column_type() == col_type {
-                            raw_value.clone()
+            let value_pos = self.scratch_value_pos.get(col_idx).copied().unwrap_or(usize::MAX);
+            if value_pos != usize::MAX {
+                for values in rows {
+                    let raw_value = values.get(value_pos).unwrap_or(&Value::Null);
+                    let value = if raw_value.is_null() {
+                        Value::Null
+                    } else if raw_value.column_type() == col_type {
+                        raw_value.clone()
+                    } else {
+                        coerce_value(raw_value.clone(), col_type)?
+                    };
+                    if col_type == ColumnType::Symbol {
+                        if value.is_null() {
+                            column.push_value(Value::Null)?;
+                        } else if let Value::String(symbol) = value {
+                            let id = if let Some(store) = self.store.as_mut() {
+                                let id = store.symbol_id(&symbol)?;
+                                table.symbols.intern_with_id(&symbol, id)
+                            } else {
+                                table.symbols.intern(&symbol)
+                            };
+                            column.push_symbol_id(id)?;
                         } else {
-                            coerce_value(raw_value.clone(), col_type)?
-                        };
+                            return Err(Error::InvalidData("symbol expects string".to_string()));
+                        }
+                    } else {
                         column.push_value(value)?;
                     }
                 }
-                None => {
-                    column.fill_with_default(default_value, rows.len())?;
+            } else if col_type == ColumnType::Symbol {
+                for _ in 0..rows.len() {
+                    let value = if default_value.is_null() {
+                        Value::Null
+                    } else {
+                        coerce_value(default_value.clone(), col_type)?
+                    };
+                    if value.is_null() {
+                        column.push_value(Value::Null)?;
+                    } else if let Value::String(symbol) = value {
+                        let id = if let Some(store) = self.store.as_mut() {
+                            let id = store.symbol_id(&symbol)?;
+                            table.symbols.intern_with_id(&symbol, id)
+                        } else {
+                            table.symbols.intern(&symbol)
+                        };
+                        column.push_symbol_id(id)?;
+                    } else {
+                        return Err(Error::InvalidData("symbol expects string".to_string()));
+                    }
                 }
+            } else {
+                column.fill_with_default(default_value, rows.len())?;
             }
         }
         table.row_count += rows.len();
         Ok(())
     }
 
-    pub fn table_schema(&self, table: &str) -> Option<&Schema> {
-        self.tables.get(table).map(|table| &table.schema)
+    pub fn table_schema(&self, name: &str) -> Option<Schema> {
+        self.tables.get(name).map(|table| table.schema.clone())
     }
 
-    pub fn table_row_count(&self, table: &str) -> Option<usize> {
-        self.tables.get(table).map(|table| table.row_count)
+    pub fn table_row_count(&self, name: &str) -> Option<usize> {
+        self.tables.get(name).map(|table| table.row_count)
     }
 
-    pub fn table_rows(&self, table: &str) -> Option<Vec<Row>> {
-        let table = self.tables.get(table)?;
-        Some(table_rows(table))
+    pub fn table_row(&self, name: &str, index: usize) -> Option<Row> {
+        self.tables.get(name).and_then(|table| table_row(table, index))
     }
 
-    pub fn table_row(&self, table: &str, index: usize) -> Option<Row> {
-        let table = self.tables.get(table)?;
-        table_row(table, index)
-    }
-
-    pub fn table_column(&self, table: &str, column: &str) -> Option<ColumnView<'_>> {
-        let table = self.tables.get(table)?;
-        let idx = table.schema.column_index(column)?;
-        table.columns.get(idx).map(|col| col.view())
-    }
-
-    pub fn table_column_at(&self, table: &str, index: usize) -> Option<ColumnView<'_>> {
-        let table = self.tables.get(table)?;
-        table.columns.get(index).map(|col| col.view())
+    pub fn table_rows(&self, name: &str) -> Option<Vec<Row>> {
+        self.tables.get(name).map(table_rows)
     }
 
     pub fn update(
@@ -856,42 +1928,40 @@ impl MemStore {
             assign_indices.push((idx, value.clone()));
         }
 
-        if filter.is_none() {
-            let mut updated = 0u64;
-            for (idx, value) in &assign_indices {
-                if let Some(column) = table.columns.get_mut(*idx) {
-                    let col_type = table.schema.columns()[*idx].col_type;
-                    let mut normalized = value.clone();
-                    if !normalized.is_null() && normalized.column_type() != col_type {
-                        normalized = coerce_value(normalized, col_type)?;
-                    }
-                    for row_idx in 0..table.row_count {
-                        column.set_value(row_idx, normalized.clone())?;
-                    }
+        let mut updated = 0u64;
+        let schema = table.schema.clone();
+        for row_idx in 0..table.row_count {
+            if let Some(expr) = filter {
+                let access = TableAccess::new(&*table);
+                if !eval_predicate_at(expr, &access, &schema, row_idx)? {
+                    continue;
                 }
             }
-            updated += table.row_count as u64;
-            return Ok(updated);
-        }
-
-        let expr = filter.expect("filter checked");
-        let mut updated = 0u64;
-        for row_idx in 0..table.row_count {
-            let view = RowView {
-                table,
-                row: row_idx,
-            };
-            if !eval_predicate(expr, &view, &table.schema)? {
-                continue;
-            }
+            let (columns, symbols) = (&mut table.columns, &mut table.symbols);
             for (idx, value) in &assign_indices {
-                if let Some(column) = table.columns.get_mut(*idx) {
-                    let col_type = table.schema.columns()[*idx].col_type;
+                if let Some(column) = columns.get_mut(*idx) {
+                    let col_type = schema.columns()[*idx].col_type;
                     let mut normalized = value.clone();
                     if !normalized.is_null() && normalized.column_type() != col_type {
                         normalized = coerce_value(normalized, col_type)?;
                     }
-                    column.set_value(row_idx, normalized)?;
+                    if col_type == ColumnType::Symbol {
+                        if normalized.is_null() {
+                            column.set_value(row_idx, Value::Null)?;
+                        } else if let Value::String(symbol) = normalized {
+                            let id = if let Some(store) = self.store.as_mut() {
+                                let id = store.symbol_id(&symbol)?;
+                                symbols.intern_with_id(&symbol, id)
+                            } else {
+                                symbols.intern(&symbol)
+                            };
+                            column.set_symbol_id(row_idx, id)?;
+                        } else {
+                            return Err(Error::InvalidData("symbol expects string".to_string()));
+                        }
+                    } else {
+                        column.set_value(row_idx, normalized)?;
+                    }
                 }
             }
             updated += 1;
@@ -912,13 +1982,10 @@ impl MemStore {
             return Ok(count);
         }
         let expr = filter.expect("filter checked");
+        let access = TableAccess::new(table);
         let mut keep_indices = Vec::with_capacity(table.row_count);
         for row_idx in 0..table.row_count {
-            let view = RowView {
-                table,
-                row: row_idx,
-            };
-            match eval_predicate(expr, &view, &table.schema) {
+            match eval_predicate_at(expr, &access, &table.schema, row_idx) {
                 Ok(true) => {}
                 Ok(false) => keep_indices.push(row_idx),
                 Err(_) => keep_indices.push(row_idx),
@@ -926,416 +1993,233 @@ impl MemStore {
         }
         let removed = (table.row_count - keep_indices.len()) as u64;
         for column in &mut table.columns {
-            *column = column.take_rows(&keep_indices)?;
+            *column = column.take_rows(&keep_indices, &table.symbols)?;
         }
         table.row_count = keep_indices.len();
         Ok(removed)
     }
 
-    pub fn query(&self, plan: &QueryPlan) -> Result<ResultSet> {
-        let left = self
+
+    pub fn query_col(&self, query: &ColumnQuery) -> Result<ResultSet> {
+        let table = self
             .tables
-            .get(&plan.table)
+            .get(&query.table)
             .ok_or_else(|| Error::InvalidData("table not found".to_string()))?;
-        let mut schema = left.schema.clone();
-        let left_rows: Vec<RowView> = (0..left.row_count)
-            .filter_map(|idx| RowView::new(left, idx))
-            .collect();
-
-        let joined_rows = if let Some(join) = &plan.join {
-            let (joined_schema, joined_rows) = self.apply_join(join, &schema, &left_rows)?;
-            schema = joined_schema;
-            Some(joined_rows)
+        let schema = &table.schema;
+        let col_map = resolve_column_map(schema, &query.columns)?;
+        let access = TableAccess::new(table);
+        let mut row_indices = Vec::new();
+        if query.filter.is_empty() {
+            row_indices.extend(0..table.row_count);
         } else {
-            None
-        };
-
-        let mut rows: Vec<RowRef> = if let Some(joined_rows) = &joined_rows {
-            joined_rows.iter().map(RowRef::Joined).collect()
-        } else {
-            left_rows.iter().copied().map(RowRef::Table).collect()
-        };
-
-        if let Some(filter) = &plan.filter {
-            rows.retain(|row| eval_predicate(filter, row, &schema).unwrap_or(false));
-        }
-
-        let has_window = plan
-            .select
-            .iter()
-            .any(|item| matches!(item.expr, SelectExpr::Window(_)));
-        if has_window && !plan.group_by.is_empty() {
-            return Err(Error::InvalidData(
-                "window functions cannot be used with group by".to_string(),
-            ));
-        }
-
-        if has_window {
-            return self.apply_window(plan, &schema, &rows);
-        }
-
-        let has_aggregate = plan
-            .select
-            .iter()
-            .any(|item| matches!(item.expr, SelectExpr::Aggregate(_)));
-
-        if !plan.group_by.is_empty() || has_aggregate {
-            return self.apply_group_by(plan, &schema, &rows);
-        }
-
-        let result_schema = Schema::new(
-            infer_select_schema(&plan.select, &schema)
-                .into_iter()
-                .map(|(name, col_type)| ColumnSpec {
-                    name,
-                    col_type,
-                    nullable: true,
-                    default: None,
-                })
-                .collect(),
-        )?;
-
-        let mut proj_ops = Vec::with_capacity(plan.select.len());
-        let mut proj_capacity = 0usize;
-        for item in &plan.select {
-            match &item.expr {
-                SelectExpr::Column(name) => {
-                    let idx = schema
-                        .column_index(name)
-                        .ok_or_else(|| Error::InvalidData(format!("unknown column {name}")))?;
-                    proj_ops.push(ProjectOp::Column(idx));
-                    proj_capacity += 1;
-                }
-                SelectExpr::Literal(value) => {
-                    proj_ops.push(ProjectOp::Literal(value.clone()));
-                    proj_capacity += 1;
-                }
-                SelectExpr::Wildcard => {
-                    proj_ops.push(ProjectOp::Wildcard);
-                    proj_capacity += schema.columns().len();
-                }
-                SelectExpr::Aggregate(_) => {
-                    return Err(Error::InvalidData(
-                        "aggregate not allowed without group by".to_string(),
-                    ));
-                }
-                SelectExpr::Window(_) => {
-                    return Err(Error::InvalidData(
-                        "window not allowed without window context".to_string(),
-                    ));
+            for row_idx in 0..table.row_count {
+                if eval_column_filter(&query.filter, &access, &col_map, row_idx)? {
+                    row_indices.push(row_idx);
                 }
             }
         }
 
-        let mut out_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut out = Vec::with_capacity(proj_capacity);
-            for op in &proj_ops {
-                match op {
-                    ProjectOp::Column(idx) => {
-                        out.push(row.get_value(*idx).unwrap_or(ValueRef::Null).to_value());
+        let mut out_schema = Vec::with_capacity(query.project.len());
+        for item in &query.project {
+            let (name, col_type) = match &item.expr {
+                ColumnProjectExpr::Column(idx) => {
+                    let idx = *idx as usize;
+                    if idx >= col_map.len() {
+                        return Err(Error::InvalidData("project column out of range".to_string()));
                     }
-                    ProjectOp::Literal(value) => out.push(value.clone()),
-                    ProjectOp::Wildcard => {
-                        rowref_push_values(&mut out, &row, schema.columns().len())
-                    }
+                    let schema_idx = col_map[idx];
+                    let col_type = schema.columns()[schema_idx].col_type;
+                    (item.name.clone(), col_type)
                 }
-            }
-            out_rows.push(Row { values: out });
-        }
-
-        Ok(ResultSet {
-            schema: result_schema,
-            rows: out_rows,
-        })
-    }
-
-    fn apply_join(
-        &self,
-        join: &JoinSpec,
-        left_schema: &Schema,
-        left_rows: &[RowView<'_>],
-    ) -> Result<(Schema, Vec<Row>)> {
-        let right = self
-            .tables
-            .get(&join.right_table)
-            .ok_or_else(|| Error::InvalidData("join table not found".to_string()))?;
-
-        let schema =
-            Schema::merge_with_prefix(("left", left_schema), (&join.right_table, &right.schema))?;
-
-        let left_on = left_schema
-            .column_index(&join.left_on)
-            .ok_or_else(|| Error::InvalidData("join left key not found".to_string()))?;
-        let right_on = right
-            .schema
-            .column_index(&join.right_on)
-            .ok_or_else(|| Error::InvalidData("join right key not found".to_string()))?;
-
-        let right_null = right_null_row(&right.schema);
-        let mut rows = Vec::with_capacity(left_rows.len());
-        let left_width = left_schema.columns().len();
-        let right_width = right.schema.columns().len();
-        for left_row in left_rows {
-            let mut matched = false;
-            match join.join_type {
-                JoinType::Inner | JoinType::LeftOuter => {
-                    for right_idx in 0..right.row_count {
-                        let right_row = RowView {
-                            table: right,
-                            row: right_idx,
-                        };
-                        let left_key = left_row.get_value(left_on).unwrap_or(ValueRef::Null);
-                        let right_key = right_row.get_value(right_on).unwrap_or(ValueRef::Null);
-                        if left_key == right_key {
-                            matched = true;
-                            rows.push(merge_rows_view(
-                                left_row,
-                                &right_row,
-                                left_width,
-                                right_width,
-                            ));
-                        }
-                    }
-                }
-                JoinType::Asof => {
-                    let left_ts_name = join
-                        .left_ts
-                        .as_ref()
-                        .ok_or_else(|| Error::InvalidData("asof left_ts required".to_string()))?;
-                    let right_ts_name = join
-                        .right_ts
-                        .as_ref()
-                        .ok_or_else(|| Error::InvalidData("asof right_ts required".to_string()))?;
-                    let left_ts_idx = left_schema
-                        .column_index(left_ts_name)
-                        .ok_or_else(|| Error::InvalidData("left ts missing".to_string()))?;
-                    let right_ts_idx = right
-                        .schema
-                        .column_index(right_ts_name)
-                        .ok_or_else(|| Error::InvalidData("right ts missing".to_string()))?;
-
-                    let mut best: Option<RowView> = None;
-                    let mut best_ts: Option<i64> = None;
-                    for right_idx in 0..right.row_count {
-                        let right_row = RowView {
-                            table: right,
-                            row: right_idx,
-                        };
-                        let left_key = left_row.get_value(left_on).unwrap_or(ValueRef::Null);
-                        let right_key = right_row.get_value(right_on).unwrap_or(ValueRef::Null);
-                        if left_key != right_key {
-                            continue;
-                        }
-                        let left_ts = left_row
-                            .get_value(left_ts_idx)
-                            .and_then(|value| value.as_i64())
-                            .unwrap_or(0);
-                        let right_ts = right_row
-                            .get_value(right_ts_idx)
-                            .and_then(|value| value.as_i64())
-                            .unwrap_or(0);
-                        if right_ts <= left_ts {
-                            if best_ts.map(|ts| right_ts > ts).unwrap_or(true) {
-                                best_ts = Some(right_ts);
-                                best = Some(right_row);
-                            }
-                        }
-                    }
-                    if let Some(best_row) = best {
-                        matched = true;
-                        rows.push(merge_rows_view(
-                            left_row,
-                            &best_row,
-                            left_width,
-                            right_width,
-                        ));
-                    }
-                }
-            }
-
-            if !matched && join.join_type == JoinType::LeftOuter {
-                rows.push(merge_left_with_row(
-                    left_row,
-                    &right_null,
-                    left_width,
-                    right_width,
-                ));
-            }
-            if !matched && join.join_type == JoinType::Asof {
-                rows.push(merge_left_with_row(
-                    left_row,
-                    &right_null,
-                    left_width,
-                    right_width,
-                ));
-            }
-        }
-
-        Ok((schema, rows))
-    }
-
-    fn apply_group_by(
-        &self,
-        plan: &QueryPlan,
-        schema: &Schema,
-        rows: &[RowRef<'_>],
-    ) -> Result<ResultSet> {
-        let mut groups: HashMap<KeyBuf, Vec<RowRef>> = HashMap::new();
-        let mut key_indices = Vec::with_capacity(plan.group_by.len());
-        for col in &plan.group_by {
-            let idx = schema
-                .column_index(col)
-                .ok_or_else(|| Error::InvalidData(format!("group by column not found: {col}")))?;
-            key_indices.push(idx);
-        }
-
-        if key_indices.is_empty() {
-            groups.insert(KeyBuf::new_empty(), rows.iter().copied().collect());
-        } else {
-            for row in rows {
-                let key = KeyBuf::from_indices(row, &key_indices);
-                groups.entry(key).or_default().push(*row);
-            }
-        }
-
-        let result_schema = Schema::new(
-            infer_select_schema(&plan.select, schema)
-                .into_iter()
-                .map(|(name, col_type)| ColumnSpec {
-                    name,
-                    col_type,
-                    nullable: true,
-                    default: None,
-                })
-                .collect(),
-        )?;
-
-        let mut key_pos = vec![None; schema.columns().len()];
-        for (pos, idx) in key_indices.iter().enumerate() {
-            if let Some(slot) = key_pos.get_mut(*idx) {
-                *slot = Some(pos);
-            }
-        }
-
-        let mut out_rows = Vec::with_capacity(groups.len());
-        for (key, group_rows) in groups {
-            let mut out = Vec::with_capacity(plan.select.len());
-            for item in &plan.select {
-                let value = match &item.expr {
-                    SelectExpr::Column(name) => {
-                        let idx = schema
-                            .column_index(name)
-                            .ok_or_else(|| Error::InvalidData(format!("unknown column {name}")))?;
-                        if key_indices.is_empty() {
-                            group_rows
-                                .first()
-                                .and_then(|row| row.get_value(idx))
-                                .unwrap_or(ValueRef::Null)
-                                .to_value()
-                        } else {
-                            let key_idx =
-                                key_pos.get(idx).and_then(|pos| *pos).ok_or_else(|| {
-                                    Error::InvalidData(format!(
-                                        "column {name} must appear in group by"
-                                    ))
-                                })?;
-                            key.get(key_idx).cloned().unwrap_or(Value::Null)
-                        }
-                    }
-                    SelectExpr::Aggregate(agg) => aggregate_value(agg, &group_rows, schema)?,
-                    SelectExpr::Literal(value) => value.clone(),
-                    SelectExpr::Wildcard => {
-                        return Err(Error::InvalidData(
-                            "wildcard not allowed with group by".to_string(),
-                        ));
-                    }
-                    SelectExpr::Window(_) => {
-                        return Err(Error::InvalidData(
-                            "window not allowed with group by".to_string(),
-                        ));
-                    }
-                };
-                out.push(value);
-            }
-            out_rows.push(Row { values: out });
-        }
-
-        Ok(ResultSet {
-            schema: result_schema,
-            rows: out_rows,
-        })
-    }
-
-    fn apply_window(
-        &self,
-        plan: &QueryPlan,
-        schema: &Schema,
-        rows: &[RowRef<'_>],
-    ) -> Result<ResultSet> {
-        let result_schema = Schema::new(
-            infer_select_schema(&plan.select, schema)
-                .into_iter()
-                .map(|(name, col_type)| ColumnSpec {
-                    name,
-                    col_type,
-                    nullable: true,
-                    default: None,
-                })
-                .collect(),
-        )?;
-
-        let mut partitions: HashMap<KeyBuf, Vec<(usize, RowRef)>> = HashMap::new();
-        let mut partition_indices = Vec::new();
-        let mut order_idx = None;
-
-        for item in &plan.select {
-            if let SelectExpr::Window(WindowExpr { spec, .. }) = &item.expr {
-                partition_indices = spec
-                    .partition_by
-                    .iter()
-                    .filter_map(|col| schema.column_index(col))
-                    .collect();
-                order_idx = schema.column_index(&spec.order_by);
-                break;
-            }
-        }
-
-        let order_idx =
-            order_idx.ok_or_else(|| Error::InvalidData("window order missing".to_string()))?;
-
-        if partition_indices.is_empty() {
-            let bucket = partitions.entry(KeyBuf::new_empty()).or_default();
-            for (idx, row) in rows.iter().enumerate() {
-                bucket.push((idx, *row));
-            }
-        } else {
-            for (idx, row) in rows.iter().enumerate() {
-                let key = KeyBuf::from_indices(row, &partition_indices);
-                partitions.entry(key).or_default().push((idx, *row));
-            }
-        }
-
-        let mut out_rows = vec![Row { values: Vec::new() }; rows.len()];
-        for (_key, mut part_rows) in partitions {
-            part_rows.sort_by(|a, b| {
-                let left = a.1.get_value(order_idx).unwrap_or(ValueRef::Null);
-                let right = b.1.get_value(order_idx).unwrap_or(ValueRef::Null);
-                left.cmp_for_order(&right)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                ColumnProjectExpr::Literal(value) => (item.name.clone(), value.column_type()),
+            };
+            out_schema.push(ColumnSpec {
+                name,
+                col_type,
+                nullable: true,
+                default: None,
             });
-            for (pos, (orig_idx, row)) in part_rows.iter().enumerate() {
-                let frame_rows = window_frame_rows(pos, &part_rows, plan)?;
-                let values = project_with_window(plan, schema, row, &frame_rows)?;
-                out_rows[*orig_idx] = Row { values };
-            }
         }
-
+        let result_schema = Schema::new(out_schema)?;
+        let mut rows = Vec::with_capacity(row_indices.len());
+        for row_idx in row_indices {
+            let mut values = Vec::with_capacity(query.project.len());
+            for item in &query.project {
+                let value = match &item.expr {
+                    ColumnProjectExpr::Column(idx) => {
+                        let idx = *idx as usize;
+                        if idx >= col_map.len() {
+                            return Err(Error::InvalidData("project column out of range".to_string()));
+                        }
+                        let schema_idx = col_map[idx];
+                        access
+                            .value_at(schema_idx, row_idx)
+                            .unwrap_or(ValueRef::Null)
+                            .to_value()
+                    }
+                    ColumnProjectExpr::Literal(value) => value.clone(),
+                };
+                values.push(value);
+            }
+            rows.push(Row { values });
+        }
         Ok(ResultSet {
             schema: result_schema,
-            rows: out_rows,
+            rows,
         })
     }
+
+}
+
+fn load_column_from_store(
+    store: &SplayedStore,
+    table: &str,
+    column: &ColumnSpec,
+) -> Result<(ColumnData, usize)> {
+    let table_dir = store.table_dir(table);
+    let data_path = table_dir.join(&column.name);
+    let nulls_path = table_dir.join(format!("{}.n", column.name));
+    let nulls_len = std::fs::metadata(&nulls_path)?.len() as usize;
+    let row_count = nulls_len;
+    let nulls = NullsStorage::Writable(MmapWrite::open(&nulls_path, nulls_len, 4096)?);
+
+    let data = match column.col_type {
+        ColumnType::I64 => {
+            let used = row_count * std::mem::size_of::<i64>();
+            ColumnStorage::MmapI64W(MmapWrite::open(&data_path, used, 4096)?)
+        }
+        ColumnType::F64 => {
+            let used = row_count * std::mem::size_of::<f64>();
+            ColumnStorage::MmapF64W(MmapWrite::open(&data_path, used, 4096)?)
+        }
+        ColumnType::Bool => {
+            let used = row_count;
+            ColumnStorage::MmapBoolW(MmapWrite::open(&data_path, used, 4096)?)
+        }
+        ColumnType::Timestamp => {
+            let used = row_count * std::mem::size_of::<i64>();
+            ColumnStorage::MmapTimestampW(MmapWrite::open(&data_path, used, 4096)?)
+        }
+        ColumnType::Symbol => {
+            let used = row_count * std::mem::size_of::<u32>();
+            ColumnStorage::MmapSymbolW(MmapWrite::open(&data_path, used, 4096)?)
+        }
+        ColumnType::String => {
+            let offsets_path = table_dir.join(format!("{}.o", column.name));
+            let (offsets_len, data_used) =
+                load_varlen_offsets(&data_path, &offsets_path, row_count)?;
+            let offsets = MmapWrite::open(&offsets_path, offsets_len, 4096)?;
+            let data = MmapWrite::open(&data_path, data_used, 4096)?;
+            ColumnStorage::MmapVarStringW { offsets, data }
+        }
+        ColumnType::Bytes => {
+            let offsets_path = table_dir.join(format!("{}.o", column.name));
+            let (offsets_len, data_used) =
+                load_varlen_offsets(&data_path, &offsets_path, row_count)?;
+            let offsets = MmapWrite::open(&offsets_path, offsets_len, 4096)?;
+            let data = MmapWrite::open(&data_path, data_used, 4096)?;
+            ColumnStorage::MmapVarBytesW { offsets, data }
+        }
+    };
+    Ok((ColumnData::new_mmap(column.col_type, data, nulls), row_count))
+}
+
+fn init_mmap_column_data(
+    store: &SplayedStore,
+    table: &str,
+    column: &ColumnSpec,
+) -> Result<ColumnData> {
+    let table_dir = store.table_dir(table);
+    let data_path = table_dir.join(&column.name);
+    let nulls_path = table_dir.join(format!("{}.n", column.name));
+    let nulls = NullsStorage::Writable(MmapWrite::open(&nulls_path, 0, 4096)?);
+    let data = match column.col_type {
+        ColumnType::I64 => ColumnStorage::MmapI64W(MmapWrite::open(&data_path, 0, 4096)?),
+        ColumnType::F64 => ColumnStorage::MmapF64W(MmapWrite::open(&data_path, 0, 4096)?),
+        ColumnType::Bool => ColumnStorage::MmapBoolW(MmapWrite::open(&data_path, 0, 4096)?),
+        ColumnType::Timestamp => {
+            ColumnStorage::MmapTimestampW(MmapWrite::open(&data_path, 0, 4096)?)
+        }
+        ColumnType::Symbol => ColumnStorage::MmapSymbolW(MmapWrite::open(&data_path, 0, 4096)?),
+        ColumnType::String => {
+            let offsets_path = table_dir.join(format!("{}.o", column.name));
+            let offsets = MmapWrite::open(&offsets_path, 0, 4096)?;
+            let data = MmapWrite::open(&data_path, 0, 4096)?;
+            ColumnStorage::MmapVarStringW { offsets, data }
+        }
+        ColumnType::Bytes => {
+            let offsets_path = table_dir.join(format!("{}.o", column.name));
+            let offsets = MmapWrite::open(&offsets_path, 0, 4096)?;
+            let data = MmapWrite::open(&data_path, 0, 4096)?;
+            ColumnStorage::MmapVarBytesW { offsets, data }
+        }
+    };
+    Ok(ColumnData::new_mmap(column.col_type, data, nulls))
+}
+
+fn load_varlen_offsets(
+    data_path: &Path,
+    offsets_path: &Path,
+    row_count: usize,
+) -> Result<(usize, usize)> {
+    if offsets_path.exists() {
+        let file_len = std::fs::metadata(offsets_path)?.len() as usize;
+        let offsets_len = row_count * 8;
+        if file_len < offsets_len {
+            return Err(Error::InvalidData("offsets truncated".to_string()));
+        }
+        if row_count == 0 {
+            return Ok((offsets_len, 0));
+        }
+        let mut offsets_file = File::open(offsets_path)?;
+        offsets_file.seek(std::io::SeekFrom::Start((row_count as u64 - 1) * 8))?;
+        let mut last_buf = [0u8; 8];
+        offsets_file.read_exact(&mut last_buf)?;
+        let last_offset = u64::from_le_bytes(last_buf) as usize;
+        let mut data_file = File::open(data_path)?;
+        let data_len = data_file.metadata()?.len() as usize;
+        data_file.seek(std::io::SeekFrom::Start(last_offset as u64))?;
+        let mut len_buf = [0u8; 4];
+        data_file.read_exact(&mut len_buf)?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let data_used = last_offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(len))
+            .ok_or_else(|| Error::InvalidData("bytes length overflow".to_string()))?;
+        if data_used > data_len {
+            return Err(Error::InvalidData("data truncated".to_string()));
+        }
+        return Ok((offsets_len, data_used));
+    }
+
+    let mut data_file = File::open(data_path)?;
+    let data_len = data_file.metadata()?.len() as usize;
+    let mut offsets_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(offsets_path)?;
+    let mut offset = 0usize;
+    for _ in 0..row_count {
+        offsets_file.write_all(&(offset as u64).to_le_bytes())?;
+        if offset + 4 > data_len {
+            return Err(Error::InvalidData("bytes column truncated".to_string()));
+        }
+        let mut len_buf = [0u8; 4];
+        data_file.read_exact(&mut len_buf)?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        offset = offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(len))
+            .ok_or_else(|| Error::InvalidData("bytes length overflow".to_string()))?;
+        if offset > data_len {
+            return Err(Error::InvalidData("bytes column truncated".to_string()));
+        }
+        if len > 0 {
+            data_file.seek(std::io::SeekFrom::Current(len as i64))?;
+        }
+    }
+    Ok((row_count * 8, offset))
 }
 
 fn infer_column_type_from_rows(rows: &[Vec<Value>], col_pos: usize) -> ColumnType {
@@ -1349,52 +2233,21 @@ fn infer_column_type_from_rows(rows: &[Vec<Value>], col_pos: usize) -> ColumnTyp
     ColumnType::String
 }
 
-fn right_null_row(schema: &Schema) -> Row {
-    Row {
-        values: vec![Value::Null; schema.columns().len()],
-    }
-}
-
-fn merge_rows_view(
-    left: &RowView<'_>,
-    right: &RowView<'_>,
-    left_width: usize,
-    right_width: usize,
-) -> Row {
-    let mut values = Vec::with_capacity(left_width + right_width);
-    for idx in 0..left_width {
-        values.push(left.get_value(idx).unwrap_or(ValueRef::Null).to_value());
-    }
-    for idx in 0..right_width {
-        values.push(right.get_value(idx).unwrap_or(ValueRef::Null).to_value());
-    }
-    Row { values }
-}
-
-fn merge_left_with_row(
-    left: &RowView<'_>,
-    right: &Row,
-    left_width: usize,
-    right_width: usize,
-) -> Row {
-    let mut values = Vec::with_capacity(left_width + right_width);
-    for idx in 0..left_width {
-        values.push(left.get_value(idx).unwrap_or(ValueRef::Null).to_value());
-    }
-    values.extend_from_slice(&right.values);
-    if right_width < right.values.len() {
-        values.truncate(left_width + right_width);
-    }
-    Row { values }
-}
-
 fn table_row(table: &Table, index: usize) -> Option<Row> {
     if index >= table.row_count {
         return None;
     }
     let mut values = Vec::with_capacity(table.columns.len());
     for column in &table.columns {
-        values.push(column.get_ref(index).unwrap_or(ValueRef::Null).to_value());
+        let value = if column.ty == ColumnType::Symbol {
+            column
+                .get_ref_with_symbols(index, &table.symbols)
+                .unwrap_or(ValueRef::Null)
+                .to_value()
+        } else {
+            column.get_ref(index).unwrap_or(ValueRef::Null).to_value()
+        };
+        values.push(value);
     }
     Some(Row { values })
 }
@@ -1409,123 +2262,26 @@ fn table_rows(table: &Table) -> Vec<Row> {
     rows
 }
 
-fn aggregate_value(agg: &AggregateExpr, rows: &[RowRef<'_>], schema: &Schema) -> Result<Value> {
-    match agg.func {
-        AggFunc::Count => Ok(Value::I64(rows.len() as i64)),
-        AggFunc::Sum => sum_values(agg, rows, schema).map(Value::F64),
-        AggFunc::Avg => {
-            let sum = sum_values(agg, rows, schema)?;
-            let count = rows.len() as f64;
-            Ok(Value::F64(if count == 0.0 { 0.0 } else { sum / count }))
-        }
-        AggFunc::Min => min_max_value(agg, rows, schema, true),
-        AggFunc::Max => min_max_value(agg, rows, schema, false),
-    }
-}
-
-fn sum_values(agg: &AggregateExpr, rows: &[RowRef<'_>], schema: &Schema) -> Result<f64> {
-    let mut sum = 0.0;
-    for row in rows {
-        let value = crate::expr::eval_value(&agg.arg, row, schema)?;
-        if let Some(v) = value.as_f64() {
-            sum += v;
-        }
-    }
-    Ok(sum)
-}
-
-fn min_max_value(
-    agg: &AggregateExpr,
-    rows: &[RowRef<'_>],
-    schema: &Schema,
-    is_min: bool,
-) -> Result<Value> {
-    let mut best: Option<Value> = None;
-    for row in rows {
-        let value = crate::expr::eval_value(&agg.arg, row, schema)?;
-        if best.is_none() {
-            best = Some(value);
-            continue;
-        }
-        let current = best.as_ref().unwrap();
-        let ord = value.cmp_for_order(current);
-        if let Some(ord) = ord {
-            if (is_min && ord.is_lt()) || (!is_min && ord.is_gt()) {
-                best = Some(value);
-            }
-        }
-    }
-    Ok(best.unwrap_or(Value::Null))
-}
-
-fn window_frame_rows<'a>(
-    pos: usize,
-    rows: &[(usize, RowRef<'a>)],
-    plan: &QueryPlan,
-) -> Result<Vec<RowRef<'a>>> {
-    let mut spec: Option<&WindowSpec> = None;
-    for item in &plan.select {
-        if let SelectExpr::Window(WindowExpr { spec: s, .. }) = &item.expr {
-            spec = Some(s);
-            break;
-        }
-    }
-    let spec = spec.ok_or_else(|| Error::InvalidData("window spec missing".to_string()))?;
-    let start = match spec.start {
-        WindowBound::UnboundedPreceding => 0,
-        WindowBound::CurrentRow => pos,
-        WindowBound::Preceding => pos.saturating_sub(spec.start_value.unwrap_or(0) as usize),
-    };
-    let mut out = Vec::with_capacity(pos.saturating_sub(start) + 1);
-    for idx in start..=pos {
-        out.push(rows[idx].1);
-    }
-    Ok(out)
-}
-
-fn project_with_window(
-    plan: &QueryPlan,
-    schema: &Schema,
-    row: &RowRef<'_>,
-    frame: &[RowRef<'_>],
-) -> Result<Vec<Value>> {
-    let mut out = Vec::with_capacity(plan.select.len());
-    for item in &plan.select {
-        match &item.expr {
-            SelectExpr::Column(name) => {
-                let idx = schema
-                    .column_index(name)
-                    .ok_or_else(|| Error::InvalidData(format!("unknown column {name}")))?;
-                out.push(row.get_value(idx).unwrap_or(ValueRef::Null).to_value());
-            }
-            SelectExpr::Literal(value) => out.push(value.clone()),
-            SelectExpr::Window(window) => {
-                let agg = AggregateExpr {
-                    func: window.func,
-                    arg: window.arg.clone(),
-                };
-                out.push(aggregate_value(&agg, frame, schema)?);
-            }
-            SelectExpr::Aggregate(_) => {
-                return Err(Error::InvalidData(
-                    "aggregate not allowed with window".to_string(),
-                ));
-            }
-            SelectExpr::Wildcard => rowref_push_values(&mut out, row, schema.columns().len()),
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::MemStore;
+    use super::{load_varlen_offsets, MemStore};
     use crate::expr::{BinaryOp, Expr};
-    use crate::query::{
-        AggFunc, AggregateExpr, JoinSpec, JoinType, QueryPlan, SelectExpr, SelectItem, WindowBound,
-        WindowExpr, WindowFrameUnit, WindowSpec,
-    };
+    use crate::pxl::{ColumnInstr, ColumnProjectExpr, ColumnProjectItem, ColumnQuery};
+    use crate::storage::{SplayedStore, StoreConfig};
     use crate::types::{ColumnSpec, ColumnType, Schema, Value};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        path.push(format!("pxd_{name}_{nanos}"));
+        path
+    }
 
     #[test]
     fn insert_and_select_roundtrip() {
@@ -1553,22 +2309,67 @@ mod tests {
         )
         .expect("insert");
 
-        let plan = QueryPlan {
+        let query = ColumnQuery {
             table: "ticks".to_string(),
-            join: None,
-            filter: Some(Expr::Binary {
-                op: BinaryOp::Eq,
-                left: Box::new(Expr::Column("symbol".to_string())),
-                right: Box::new(Expr::Literal(Value::String("AAPL".to_string()))),
-            }),
-            group_by: Vec::new(),
-            select: vec![SelectItem {
-                expr: SelectExpr::Column("price".to_string()),
-                alias: None,
+            columns: vec!["symbol".to_string(), "price".to_string()],
+            filter: vec![
+                ColumnInstr::PushCol(0),
+                ColumnInstr::PushLit(Value::String("AAPL".to_string())),
+                ColumnInstr::Cmp(BinaryOp::Eq),
+            ],
+            project: vec![ColumnProjectItem {
+                name: "price".to_string(),
+                expr: ColumnProjectExpr::Column(1),
             }],
         };
+        let result = mem.query_col(&query).expect("query_col");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], Value::F64(10.0));
+    }
 
-        let result = mem.query(&plan).expect("query");
+    #[test]
+    fn query_col_executes_filter_and_project() {
+        let mut mem = MemStore::new();
+        let schema = Schema::new(vec![
+            ColumnSpec {
+                name: "symbol".to_string(),
+                col_type: ColumnType::String,
+                nullable: false,
+                default: None,
+            },
+            ColumnSpec {
+                name: "price".to_string(),
+                col_type: ColumnType::F64,
+                nullable: false,
+                default: None,
+            },
+        ])
+        .expect("schema");
+        mem.create_table("ticks", schema).expect("create");
+        mem.insert(
+            "ticks",
+            &["symbol".to_string(), "price".to_string()],
+            &[
+                vec![Value::String("AAPL".to_string()), Value::F64(10.0)],
+                vec![Value::String("MSFT".to_string()), Value::F64(12.0)],
+            ],
+        )
+        .expect("insert");
+
+        let query = ColumnQuery {
+            table: "ticks".to_string(),
+            columns: vec!["symbol".to_string(), "price".to_string()],
+            filter: vec![
+                ColumnInstr::PushCol(0),
+                ColumnInstr::PushLit(Value::String("AAPL".to_string())),
+                ColumnInstr::Cmp(BinaryOp::Eq),
+            ],
+            project: vec![ColumnProjectItem {
+                name: "price".to_string(),
+                expr: ColumnProjectExpr::Column(1),
+            }],
+        };
+        let result = mem.query_col(&query).expect("query_col");
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values[0], Value::F64(10.0));
     }
@@ -1599,44 +2400,6 @@ mod tests {
     }
 
     #[test]
-    fn group_by_aggregate() {
-        let mut mem = MemStore::new();
-        mem.insert(
-            "ticks",
-            &["symbol".to_string(), "price".to_string()],
-            &[
-                vec![Value::String("AAPL".to_string()), Value::F64(10.0)],
-                vec![Value::String("AAPL".to_string()), Value::F64(12.0)],
-                vec![Value::String("MSFT".to_string()), Value::F64(5.0)],
-            ],
-        )
-        .expect("insert");
-
-        let plan = QueryPlan {
-            table: "ticks".to_string(),
-            join: None,
-            filter: None,
-            group_by: vec!["symbol".to_string()],
-            select: vec![
-                SelectItem {
-                    expr: SelectExpr::Column("symbol".to_string()),
-                    alias: None,
-                },
-                SelectItem {
-                    expr: SelectExpr::Aggregate(AggregateExpr {
-                        func: AggFunc::Avg,
-                        arg: Expr::Column("price".to_string()),
-                    }),
-                    alias: None,
-                },
-            ],
-        };
-
-        let result = mem.query(&plan).expect("query");
-        assert_eq!(result.rows.len(), 2);
-    }
-
-    #[test]
     fn update_adds_column_and_filters() {
         let mut mem = MemStore::new();
         mem.insert(
@@ -1662,20 +2425,14 @@ mod tests {
             )
             .expect("update");
         assert_eq!(updated, 1);
-
-        let plan = QueryPlan {
-            table: "ticks".to_string(),
-            join: None,
-            filter: Some(filter),
-            group_by: Vec::new(),
-            select: vec![SelectItem {
-                expr: SelectExpr::Column("notes".to_string()),
-                alias: None,
-            }],
-        };
-        let result = mem.query(&plan).expect("query");
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].values[0], Value::String("hot".to_string()));
+        let rows = mem.table_rows("ticks").expect("rows");
+        let notes_idx = mem
+            .table_schema("ticks")
+            .expect("schema")
+            .column_index("notes")
+            .expect("notes idx");
+        let notes: Vec<Value> = rows.into_iter().map(|row| row.values[notes_idx].clone()).collect();
+        assert_eq!(notes.iter().filter(|v| **v == Value::String("hot".to_string())).count(), 1);
     }
 
     #[test]
@@ -1699,19 +2456,7 @@ mod tests {
         };
         let removed = mem.delete("ticks", Some(&filter)).expect("delete");
         assert_eq!(removed, 1);
-
-        let plan = QueryPlan {
-            table: "ticks".to_string(),
-            join: None,
-            filter: None,
-            group_by: Vec::new(),
-            select: vec![SelectItem {
-                expr: SelectExpr::Column("symbol".to_string()),
-                alias: None,
-            }],
-        };
-        let result = mem.query(&plan).expect("query");
-        assert_eq!(result.rows.len(), 2);
+        assert_eq!(mem.table_row_count("ticks"), Some(2));
     }
 
     #[test]
@@ -1803,232 +2548,127 @@ mod tests {
     }
 
     #[test]
-    fn create_table_as_select() {
-        let mut mem = MemStore::new();
+    fn update_flushes_to_store() {
+        let root = temp_root("update_flush");
+        let cfg = StoreConfig {
+            root: root.clone(),
+            partition: "2026.04.11".to_string(),
+        };
+        let store = SplayedStore::open(cfg.clone()).expect("open store");
+        let mut mem = MemStore::with_store(store);
+
+        let columns = vec!["sym".to_string(), "price".to_string()];
+        let rows = vec![
+            vec![Value::String("A".to_string()), Value::I64(1)],
+            vec![Value::Null, Value::I64(2)],
+        ];
+        mem.insert("ticks", &columns, &rows).expect("insert");
+        mem.update(
+            "ticks",
+            &[("price".to_string(), Value::I64(3))],
+            None,
+        )
+        .expect("update");
+
+        drop(mem);
+        let store = SplayedStore::open(cfg).expect("reopen store");
+        let mut reloaded = MemStore::with_store(store);
+        reloaded.load_from_store().expect("load");
+
+        let row0 = reloaded.table_row("ticks", 0).expect("row0");
+        let row1 = reloaded.table_row("ticks", 1).expect("row1");
+        assert_eq!(row0.values[0], Value::String("A".to_string()));
+        assert_eq!(row1.values[0], Value::Null);
+        assert_eq!(row0.values[1], Value::I64(3));
+        assert_eq!(row1.values[1], Value::I64(3));
+    }
+
+    #[test]
+    fn symbol_column_flushes_to_store() {
+        let root = temp_root("symbol_flush");
+        let cfg = StoreConfig {
+            root: root.clone(),
+            partition: "2026.04.11".to_string(),
+        };
+        let store = SplayedStore::open(cfg.clone()).expect("open store");
+        let mut mem = MemStore::with_store(store);
+        let schema = Schema::new(vec![
+            ColumnSpec {
+                name: "sym".to_string(),
+                col_type: ColumnType::Symbol,
+                nullable: false,
+                default: None,
+            },
+            ColumnSpec {
+                name: "price".to_string(),
+                col_type: ColumnType::I64,
+                nullable: false,
+                default: None,
+            },
+        ])
+        .expect("schema");
+        mem.create_table("ticks", schema).expect("create");
         mem.insert(
             "ticks",
-            &["symbol".to_string(), "price".to_string()],
+            &["sym".to_string(), "price".to_string()],
             &[
-                vec![Value::String("AAPL".to_string()), Value::F64(10.0)],
-                vec![Value::String("MSFT".to_string()), Value::F64(12.0)],
+                vec![Value::String("AAPL".to_string()), Value::I64(1)],
+                vec![Value::String("MSFT".to_string()), Value::I64(2)],
             ],
         )
         .expect("insert");
-        let plan = QueryPlan {
-            table: "ticks".to_string(),
-            join: None,
-            filter: None,
-            group_by: Vec::new(),
-            select: vec![
-                SelectItem {
-                    expr: SelectExpr::Column("symbol".to_string()),
-                    alias: None,
-                },
-                SelectItem {
-                    expr: SelectExpr::Column("price".to_string()),
-                    alias: None,
-                },
-            ],
-        };
-        mem.create_table_as("snap", &plan).expect("ctas");
-        assert!(mem.table_schema("snap").is_some());
-        assert_eq!(mem.table_row_count("snap"), Some(2));
+        mem.flush_to_store().expect("flush");
+
+        let store = SplayedStore::open(cfg).expect("reopen store");
+        let mut reloaded = MemStore::with_store(store);
+        reloaded.load_from_store().expect("load");
+        let row0 = reloaded.table_row("ticks", 0).expect("row0");
+        let row1 = reloaded.table_row("ticks", 1).expect("row1");
+        assert_eq!(row0.values[0], Value::String("AAPL".to_string()));
+        assert_eq!(row1.values[0], Value::String("MSFT".to_string()));
     }
 
     #[test]
-    fn left_outer_join_keeps_unmatched_rows() {
-        let mut mem = MemStore::new();
-        mem.insert(
-            "trades",
-            &["symbol".to_string(), "price".to_string()],
-            &[
-                vec![Value::String("AAPL".to_string()), Value::F64(10.0)],
-                vec![Value::String("MSFT".to_string()), Value::F64(5.0)],
-            ],
-        )
-        .expect("insert left");
-        mem.insert(
-            "quotes",
-            &["symbol".to_string(), "bid".to_string()],
-            &[vec![Value::String("AAPL".to_string()), Value::F64(9.5)]],
-        )
-        .expect("insert right");
+    fn load_varlen_offsets_rebuilds_file() {
+        let root = temp_root("offsets");
+        fs::create_dir_all(&root).expect("mkdir");
+        let data_path = root.join("data");
+        let offsets_path = root.join("data.o");
+        let mut data = Vec::new();
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(b"abc");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(b"z");
+        fs::write(&data_path, &data).expect("write");
 
-        let plan = QueryPlan {
-            table: "trades".to_string(),
-            join: Some(JoinSpec {
-                join_type: JoinType::LeftOuter,
-                right_table: "quotes".to_string(),
-                left_on: "symbol".to_string(),
-                right_on: "symbol".to_string(),
-                left_ts: None,
-                right_ts: None,
-            }),
-            filter: None,
-            group_by: Vec::new(),
-            select: vec![SelectItem {
-                expr: SelectExpr::Wildcard,
-                alias: None,
-            }],
-        };
-
-        let result = mem.query(&plan).expect("join");
-        assert_eq!(result.rows.len(), 2);
-        let right_bid_idx = 3;
-        let msft_row = result
-            .rows
-            .iter()
-            .find(|row| row.values[0] == Value::String("MSFT".to_string()))
-            .expect("msft row");
-        assert_eq!(msft_row.values[right_bid_idx], Value::Null);
-    }
-
-    #[test]
-    fn asof_join_picks_latest_prior_row() {
-        let mut mem = MemStore::new();
-        mem.insert(
-            "trades",
-            &["symbol".to_string(), "ts".to_string(), "price".to_string()],
-            &[
-                vec![
-                    Value::String("AAPL".to_string()),
-                    Value::I64(3),
-                    Value::F64(10.0),
-                ],
-                vec![
-                    Value::String("AAPL".to_string()),
-                    Value::I64(6),
-                    Value::F64(12.0),
-                ],
-                vec![
-                    Value::String("MSFT".to_string()),
-                    Value::I64(3),
-                    Value::F64(5.0),
-                ],
-            ],
-        )
-        .expect("insert left");
-        mem.insert(
-            "quotes",
-            &["symbol".to_string(), "ts".to_string(), "bid".to_string()],
-            &[
-                vec![
-                    Value::String("AAPL".to_string()),
-                    Value::I64(1),
-                    Value::F64(9.5),
-                ],
-                vec![
-                    Value::String("AAPL".to_string()),
-                    Value::I64(4),
-                    Value::F64(10.5),
-                ],
-                vec![
-                    Value::String("MSFT".to_string()),
-                    Value::I64(5),
-                    Value::F64(4.5),
-                ],
-            ],
-        )
-        .expect("insert right");
-
-        let plan = QueryPlan {
-            table: "trades".to_string(),
-            join: Some(JoinSpec {
-                join_type: JoinType::Asof,
-                right_table: "quotes".to_string(),
-                left_on: "symbol".to_string(),
-                right_on: "symbol".to_string(),
-                left_ts: Some("ts".to_string()),
-                right_ts: Some("ts".to_string()),
-            }),
-            filter: None,
-            group_by: Vec::new(),
-            select: vec![SelectItem {
-                expr: SelectExpr::Wildcard,
-                alias: None,
-            }],
-        };
-
-        let result = mem.query(&plan).expect("asof join");
-        assert_eq!(result.rows.len(), 3);
-        let right_bid_idx = 5;
-        let aapl_ts3 = result
-            .rows
-            .iter()
-            .find(|row| {
-                row.values[0] == Value::String("AAPL".to_string()) && row.values[1] == Value::I64(3)
-            })
-            .expect("aapl ts3");
-        assert_eq!(aapl_ts3.values[right_bid_idx], Value::F64(9.5));
-        let msft_row = result
-            .rows
-            .iter()
-            .find(|row| row.values[0] == Value::String("MSFT".to_string()))
-            .expect("msft row");
-        assert_eq!(msft_row.values[right_bid_idx], Value::Null);
-    }
-
-    #[test]
-    fn window_preceding_frame_computes_avg() {
-        let mut mem = MemStore::new();
-        mem.insert(
-            "ticks",
-            &["symbol".to_string(), "ts".to_string(), "price".to_string()],
-            &[
-                vec![
-                    Value::String("AAPL".to_string()),
-                    Value::I64(1),
-                    Value::F64(10.0),
-                ],
-                vec![
-                    Value::String("AAPL".to_string()),
-                    Value::I64(2),
-                    Value::F64(30.0),
-                ],
-                vec![
-                    Value::String("AAPL".to_string()),
-                    Value::I64(3),
-                    Value::F64(20.0),
-                ],
-            ],
-        )
-        .expect("insert");
-
-        let plan = QueryPlan {
-            table: "ticks".to_string(),
-            join: None,
-            filter: None,
-            group_by: Vec::new(),
-            select: vec![
-                SelectItem {
-                    expr: SelectExpr::Column("symbol".to_string()),
-                    alias: None,
-                },
-                SelectItem {
-                    expr: SelectExpr::Column("ts".to_string()),
-                    alias: None,
-                },
-                SelectItem {
-                    expr: SelectExpr::Window(WindowExpr {
-                        func: AggFunc::Avg,
-                        arg: Expr::Column("price".to_string()),
-                        spec: WindowSpec {
-                            partition_by: vec!["symbol".to_string()],
-                            order_by: "ts".to_string(),
-                            unit: WindowFrameUnit::Rows,
-                            start: WindowBound::Preceding,
-                            start_value: Some(1),
-                        },
-                    }),
-                    alias: None,
-                },
-            ],
-        };
-
-        let result = mem.query(&plan).expect("window query");
-        assert_eq!(result.rows.len(), 3);
-        assert_eq!(result.rows[0].values[2], Value::F64(10.0));
-        assert_eq!(result.rows[1].values[2], Value::F64(20.0));
-        assert_eq!(result.rows[2].values[2], Value::F64(25.0));
+        let (offsets_len, data_used) =
+            load_varlen_offsets(&data_path, &offsets_path, 2).expect("offsets");
+        assert_eq!(offsets_len, 16);
+        assert_eq!(data_used, data.len());
+        let offsets = fs::read(&offsets_path).expect("read offsets");
+        assert_eq!(offsets.len(), 16);
+        let first = u64::from_le_bytes([
+            offsets[0],
+            offsets[1],
+            offsets[2],
+            offsets[3],
+            offsets[4],
+            offsets[5],
+            offsets[6],
+            offsets[7],
+        ]);
+        let second = u64::from_le_bytes([
+            offsets[8],
+            offsets[9],
+            offsets[10],
+            offsets[11],
+            offsets[12],
+            offsets[13],
+            offsets[14],
+            offsets[15],
+        ]);
+        assert_eq!(first, 0);
+        assert_eq!(second, 7);
+        let _ = fs::remove_dir_all(root);
     }
 }

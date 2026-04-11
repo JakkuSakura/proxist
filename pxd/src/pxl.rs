@@ -2,10 +2,6 @@ use std::io::{Read, Write};
 
 use crate::error::{Error, Result};
 use crate::expr::{BinaryOp, Expr};
-use crate::query::{
-    AggFunc, JoinSpec, JoinType, QueryPlan, SelectExpr, SelectItem, WindowBound,
-    WindowExpr, WindowFrameUnit, WindowSpec,
-};
 use crate::types::{ColumnSpec, ColumnType, Row, Schema, Value};
 
 const MAGIC: [u8; 2] = *b"PX";
@@ -22,7 +18,6 @@ pub enum Op {
     Insert = 11,
     Update = 12,
     Delete = 13,
-    Query = 14,
     Result = 15,
     Schema = 16,
     AlterAddColumn = 17,
@@ -31,7 +26,7 @@ pub enum Op {
     AlterSetDefault = 20,
     DropTable = 21,
     RenameTable = 22,
-    CreateAs = 23,
+    QueryCol = 24,
 }
 
 impl Op {
@@ -44,7 +39,6 @@ impl Op {
             11 => Ok(Op::Insert),
             12 => Ok(Op::Update),
             13 => Ok(Op::Delete),
-            14 => Ok(Op::Query),
             15 => Ok(Op::Result),
             16 => Ok(Op::Schema),
             17 => Ok(Op::AlterAddColumn),
@@ -53,10 +47,40 @@ impl Op {
             20 => Ok(Op::AlterSetDefault),
             21 => Ok(Op::DropTable),
             22 => Ok(Op::RenameTable),
-            23 => Ok(Op::CreateAs),
+            24 => Ok(Op::QueryCol),
             _ => Err(Error::Protocol("unknown op")),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnQuery {
+    pub table: String,
+    pub columns: Vec<String>,
+    pub filter: Vec<ColumnInstr>,
+    pub project: Vec<ColumnProjectItem>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ColumnInstr {
+    PushCol(u16),
+    PushLit(Value),
+    Cmp(BinaryOp),
+    And,
+    Or,
+    Not,
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnProjectItem {
+    pub name: String,
+    pub expr: ColumnProjectExpr,
+}
+
+#[derive(Debug, Clone)]
+pub enum ColumnProjectExpr {
+    Column(u16),
+    Literal(Value),
 }
 
 #[derive(Debug, Clone)]
@@ -228,20 +252,6 @@ pub fn decode_rename_table_payload(bytes: &[u8]) -> Result<(String, String)> {
     Ok((from, to))
 }
 
-pub fn encode_create_as_payload(table: &str, plan: &QueryPlan) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    write_string(&mut out, table)?;
-    write_query_payload(&mut out, plan)?;
-    Ok(out)
-}
-
-pub fn decode_create_as_payload(bytes: &[u8]) -> Result<(String, QueryPlan)> {
-    let mut cursor = Cursor::new(bytes);
-    let table = read_string(&mut cursor)?;
-    let plan = read_query_payload(&mut cursor)?;
-    Ok((table, plan))
-}
-
 pub fn encode_insert_payload(
     table: &str,
     columns: &[String],
@@ -318,45 +328,124 @@ pub fn decode_delete_payload(bytes: &[u8]) -> Result<(String, Option<Expr>)> {
     Ok((table, filter))
 }
 
-pub fn encode_query_payload(plan: &QueryPlan) -> Result<Vec<u8>> {
+pub fn encode_query_col_payload(query: &ColumnQuery) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    write_query_payload(&mut out, plan)?;
+    write_column_query_payload(&mut out, query)?;
     Ok(out)
 }
 
-pub fn decode_query_payload(bytes: &[u8]) -> Result<QueryPlan> {
+pub fn decode_query_col_payload(bytes: &[u8]) -> Result<ColumnQuery> {
     let mut cursor = Cursor::new(bytes);
-    read_query_payload(&mut cursor)
+    read_column_query_payload(&mut cursor)
 }
 
-fn write_query_payload(out: &mut Vec<u8>, plan: &QueryPlan) -> Result<()> {
-    write_string(out, &plan.table)?;
-    write_join_option(out, plan.join.as_ref())?;
-    write_expr_option(out, plan.filter.as_ref())?;
-    write_string_list(out, &plan.group_by)?;
-    write_u32(out, plan.select.len() as u32)?;
-    for item in &plan.select {
-        write_select_item(out, item)?;
+fn write_column_instr(out: &mut Vec<u8>, instr: &ColumnInstr) -> Result<()> {
+    match instr {
+        ColumnInstr::PushCol(idx) => {
+            out.push(1);
+            write_u16(out, *idx)
+        }
+        ColumnInstr::PushLit(value) => {
+            out.push(2);
+            write_value(out, value)
+        }
+        ColumnInstr::Cmp(op) => {
+            out.push(3);
+            out.push(*op as u8);
+            Ok(())
+        }
+        ColumnInstr::And => {
+            out.push(4);
+            Ok(())
+        }
+        ColumnInstr::Or => {
+            out.push(5);
+            Ok(())
+        }
+        ColumnInstr::Not => {
+            out.push(6);
+            Ok(())
+        }
+    }
+}
+
+fn read_column_instr(cursor: &mut Cursor<'_>) -> Result<ColumnInstr> {
+    let tag = read_byte(cursor)?;
+    match tag {
+        1 => Ok(ColumnInstr::PushCol(read_u16(cursor)?)),
+        2 => Ok(ColumnInstr::PushLit(read_value(cursor)?)),
+        3 => Ok(ColumnInstr::Cmp(BinaryOp::from_u8(read_byte(cursor)?)?)),
+        4 => Ok(ColumnInstr::And),
+        5 => Ok(ColumnInstr::Or),
+        6 => Ok(ColumnInstr::Not),
+        _ => Err(Error::Protocol("unknown column instr tag")),
+    }
+}
+
+fn write_project_expr(out: &mut Vec<u8>, expr: &ColumnProjectExpr) -> Result<()> {
+    match expr {
+        ColumnProjectExpr::Column(idx) => {
+            out.push(1);
+            write_u16(out, *idx)
+        }
+        ColumnProjectExpr::Literal(value) => {
+            out.push(2);
+            write_value(out, value)
+        }
+    }
+}
+
+fn read_project_expr(cursor: &mut Cursor<'_>) -> Result<ColumnProjectExpr> {
+    let tag = read_byte(cursor)?;
+    match tag {
+        1 => Ok(ColumnProjectExpr::Column(read_u16(cursor)?)),
+        2 => Ok(ColumnProjectExpr::Literal(read_value(cursor)?)),
+        _ => Err(Error::Protocol("unknown project expr tag")),
+    }
+}
+
+fn write_column_query_payload(out: &mut Vec<u8>, query: &ColumnQuery) -> Result<()> {
+    write_string(out, &query.table)?;
+    write_u32(out, query.columns.len() as u32)?;
+    for name in &query.columns {
+        write_string(out, name)?;
+    }
+    write_u32(out, query.filter.len() as u32)?;
+    for instr in &query.filter {
+        write_column_instr(out, instr)?;
+    }
+    write_u32(out, query.project.len() as u32)?;
+    for item in &query.project {
+        write_string(out, &item.name)?;
+        write_project_expr(out, &item.expr)?;
     }
     Ok(())
 }
 
-fn read_query_payload(cursor: &mut Cursor<'_>) -> Result<QueryPlan> {
+fn read_column_query_payload(cursor: &mut Cursor<'_>) -> Result<ColumnQuery> {
     let table = read_string(cursor)?;
-    let join = read_join_option(cursor)?;
-    let filter = read_expr_option(cursor)?;
-    let group_by = read_string_list(cursor)?;
-    let select_count = read_u32(cursor)? as usize;
-    let mut select = Vec::with_capacity(select_count);
-    for _ in 0..select_count {
-        select.push(read_select_item(cursor)?);
+    let col_count = read_u32(cursor)? as usize;
+    let mut columns = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        columns.push(read_string(cursor)?);
     }
-    Ok(QueryPlan {
+    let filter_count = read_u32(cursor)? as usize;
+    let mut filter = Vec::with_capacity(filter_count);
+    for _ in 0..filter_count {
+        filter.push(read_column_instr(cursor)?);
+    }
+    let proj_count = read_u32(cursor)? as usize;
+    let mut project = Vec::with_capacity(proj_count);
+    for _ in 0..proj_count {
+        let name = read_string(cursor)?;
+        let expr = read_project_expr(cursor)?;
+        project.push(ColumnProjectItem { name, expr });
+    }
+    Ok(ColumnQuery {
         table,
-        join,
+        columns,
         filter,
-        group_by,
-        select,
+        project,
     })
 }
 
@@ -411,6 +500,16 @@ fn write_u32(out: &mut Vec<u8>, value: u32) -> Result<()> {
 fn read_u32(cursor: &mut Cursor<'_>) -> Result<u32> {
     let bytes = cursor.take(4)?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn write_u16(out: &mut Vec<u8>, value: u16) -> Result<()> {
+    out.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn read_u16(cursor: &mut Cursor<'_>) -> Result<u16> {
+    let bytes = cursor.take(2)?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn write_u64(out: &mut Vec<u8>, value: u64) -> Result<()> {
@@ -663,19 +762,16 @@ mod tests {
     use super::{
         decode_alter_add_column_payload, decode_alter_drop_column_payload,
         decode_alter_rename_column_payload, decode_alter_set_default_payload,
-        decode_create_as_payload, decode_delete_payload, decode_insert_payload,
-        decode_query_payload, decode_schema_payload, decode_update_payload,
+        decode_delete_payload, decode_insert_payload, decode_query_col_payload,
+        decode_schema_payload, decode_update_payload,
         encode_alter_add_column_payload, encode_alter_drop_column_payload,
         encode_alter_rename_column_payload, encode_alter_set_default_payload,
-        encode_create_as_payload, encode_delete_payload, encode_insert_payload,
-        encode_query_payload, encode_schema_payload, encode_update_payload, read_frame, write_frame,
-        Frame, Op,
+        encode_delete_payload, encode_insert_payload, encode_query_col_payload,
+        encode_schema_payload, encode_update_payload,
+        ColumnInstr, ColumnProjectExpr, ColumnProjectItem, ColumnQuery, Frame, Op, read_frame,
+        write_frame,
     };
     use crate::expr::{BinaryOp, Expr};
-    use crate::query::{
-        AggFunc, AggregateExpr, JoinSpec, JoinType, QueryPlan, SelectExpr, SelectItem, WindowBound,
-        WindowExpr, WindowFrameUnit, WindowSpec,
-    };
     use crate::types::{ColumnSpec, ColumnType, Schema, Value};
 
     #[test]
@@ -782,58 +878,32 @@ mod tests {
     }
 
     #[test]
-    fn query_payload_roundtrip() {
-        let plan = QueryPlan {
+    fn query_col_payload_roundtrip() {
+        let query = ColumnQuery {
             table: "ticks".to_string(),
-            join: Some(JoinSpec {
-                join_type: JoinType::Inner,
-                right_table: "quotes".to_string(),
-                left_on: "symbol".to_string(),
-                right_on: "symbol".to_string(),
-                left_ts: None,
-                right_ts: None,
-            }),
-            filter: Some(Expr::Binary {
-                op: BinaryOp::GtEq,
-                left: Box::new(Expr::Column("ts".to_string())),
-                right: Box::new(Expr::Literal(Value::I64(10))),
-            }),
-            group_by: vec!["symbol".to_string()],
-            select: vec![
-                SelectItem {
-                    expr: SelectExpr::Column("symbol".to_string()),
-                    alias: None,
+            columns: vec!["symbol".to_string(), "price".to_string()],
+            filter: vec![
+                ColumnInstr::PushCol(0),
+                ColumnInstr::PushLit(Value::String("AAPL".to_string())),
+                ColumnInstr::Cmp(BinaryOp::Eq),
+            ],
+            project: vec![
+                ColumnProjectItem {
+                    name: "symbol".to_string(),
+                    expr: ColumnProjectExpr::Column(0),
                 },
-                SelectItem {
-                    expr: SelectExpr::Aggregate(AggregateExpr {
-                        func: AggFunc::Avg,
-                        arg: Expr::Column("price".to_string()),
-                    }),
-                    alias: Some("avg_price".to_string()),
-                },
-                SelectItem {
-                    expr: SelectExpr::Window(WindowExpr {
-                        func: AggFunc::Count,
-                        arg: Expr::Column("price".to_string()),
-                        spec: WindowSpec {
-                            partition_by: vec!["symbol".to_string()],
-                            order_by: "ts".to_string(),
-                            unit: WindowFrameUnit::Rows,
-                            start: WindowBound::Preceding,
-                            start_value: Some(2),
-                        },
-                    }),
-                    alias: Some("win_cnt".to_string()),
+                ColumnProjectItem {
+                    name: "price".to_string(),
+                    expr: ColumnProjectExpr::Column(1),
                 },
             ],
         };
-
-        let payload = encode_query_payload(&plan).expect("encode");
-        let decoded = decode_query_payload(&payload).expect("decode");
+        let payload = encode_query_col_payload(&query).expect("encode");
+        let decoded = decode_query_col_payload(&payload).expect("decode");
         assert_eq!(decoded.table, "ticks");
-        assert_eq!(decoded.join.as_ref().unwrap().right_table, "quotes");
-        assert_eq!(decoded.group_by, vec!["symbol"]);
-        assert_eq!(decoded.select.len(), 3);
+        assert_eq!(decoded.columns.len(), 2);
+        assert_eq!(decoded.project.len(), 2);
+        assert_eq!(decoded.filter.len(), 3);
     }
 
     #[test]
@@ -877,23 +947,6 @@ mod tests {
         assert_eq!(default, Some(Value::I64(9)));
     }
 
-    #[test]
-    fn create_as_payload_roundtrip() {
-        let plan = QueryPlan {
-            table: "ticks".to_string(),
-            join: None,
-            filter: None,
-            group_by: Vec::new(),
-            select: vec![SelectItem {
-                expr: SelectExpr::Column("symbol".to_string()),
-                alias: None,
-            }],
-        };
-        let payload = encode_create_as_payload("snap", &plan).expect("encode");
-        let (table, decoded) = decode_create_as_payload(&payload).expect("decode");
-        assert_eq!(table, "snap");
-        assert_eq!(decoded.table, "ticks");
-    }
 }
 
 fn read_byte(cursor: &mut Cursor<'_>) -> Result<u8> {
@@ -977,175 +1030,4 @@ fn read_expr(cursor: &mut Cursor<'_>) -> Result<Expr> {
         6 => Ok(Expr::Not(Box::new(read_expr(cursor)?))),
         _ => Err(Error::Protocol("unknown expr tag")),
     }
-}
-
-fn write_select_item(out: &mut Vec<u8>, item: &SelectItem) -> Result<()> {
-    write_select_expr(out, &item.expr)?;
-    match &item.alias {
-        Some(alias) => {
-            out.push(1);
-            write_string(out, alias)
-        }
-        None => {
-            out.push(0);
-            Ok(())
-        }
-    }
-}
-
-fn read_select_item(cursor: &mut Cursor<'_>) -> Result<SelectItem> {
-    let expr = read_select_expr(cursor)?;
-    let alias = if read_byte(cursor)? != 0 {
-        Some(read_string(cursor)?)
-    } else {
-        None
-    };
-    Ok(SelectItem { expr, alias })
-}
-
-fn write_select_expr(out: &mut Vec<u8>, expr: &SelectExpr) -> Result<()> {
-    match expr {
-        SelectExpr::Column(name) => {
-            out.push(1);
-            write_string(out, name)
-        }
-        SelectExpr::Literal(value) => {
-            out.push(2);
-            write_value(out, value)
-        }
-        SelectExpr::Aggregate(agg) => {
-            out.push(3);
-            out.push(agg.func as u8);
-            write_expr(out, &agg.arg)
-        }
-        SelectExpr::Window(window) => {
-            out.push(4);
-            out.push(window.func as u8);
-            write_expr(out, &window.arg)?;
-            write_window_spec(out, &window.spec)
-        }
-        SelectExpr::Wildcard => {
-            out.push(5);
-            Ok(())
-        }
-    }
-}
-
-fn read_select_expr(cursor: &mut Cursor<'_>) -> Result<SelectExpr> {
-    let tag = read_byte(cursor)?;
-    match tag {
-        1 => Ok(SelectExpr::Column(read_string(cursor)?)),
-        2 => Ok(SelectExpr::Literal(read_value(cursor)?)),
-        3 => {
-            let func = AggFunc::from_u8(read_byte(cursor)?)?;
-            let arg = read_expr(cursor)?;
-            Ok(SelectExpr::Aggregate(crate::query::AggregateExpr { func, arg }))
-        }
-        4 => {
-            let func = AggFunc::from_u8(read_byte(cursor)?)?;
-            let arg = read_expr(cursor)?;
-            let spec = read_window_spec(cursor)?;
-            Ok(SelectExpr::Window(WindowExpr { func, arg, spec }))
-        }
-        5 => Ok(SelectExpr::Wildcard),
-        _ => Err(Error::Protocol("unknown select expr")),
-    }
-}
-
-fn write_window_spec(out: &mut Vec<u8>, spec: &WindowSpec) -> Result<()> {
-    write_string_list(out, &spec.partition_by)?;
-    write_string(out, &spec.order_by)?;
-    out.push(spec.unit as u8);
-    out.push(spec.start as u8);
-    match spec.start {
-        WindowBound::Preceding => {
-            write_u64(out, spec.start_value.unwrap_or(0))?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn read_window_spec(cursor: &mut Cursor<'_>) -> Result<WindowSpec> {
-    let partition_by = read_string_list(cursor)?;
-    let order_by = read_string(cursor)?;
-    let unit = WindowFrameUnit::Rows;
-    let bound = match read_byte(cursor)? {
-        1 => WindowBound::UnboundedPreceding,
-        2 => WindowBound::CurrentRow,
-        3 => WindowBound::Preceding,
-        _ => return Err(Error::Protocol("unknown window bound")),
-    };
-    let start_value = if bound == WindowBound::Preceding {
-        Some(read_u64(cursor)?)
-    } else {
-        None
-    };
-    Ok(WindowSpec {
-        partition_by,
-        order_by,
-        unit,
-        start: bound,
-        start_value,
-    })
-}
-
-fn write_join_option(out: &mut Vec<u8>, join: Option<&JoinSpec>) -> Result<()> {
-    match join {
-        Some(join) => {
-            out.push(1);
-            out.push(join.join_type as u8);
-            write_string(out, &join.right_table)?;
-            write_string(out, &join.left_on)?;
-            write_string(out, &join.right_on)?;
-            match &join.left_ts {
-                Some(value) => {
-                    out.push(1);
-                    write_string(out, value)?;
-                }
-                None => out.push(0),
-            }
-            match &join.right_ts {
-                Some(value) => {
-                    out.push(1);
-                    write_string(out, value)?;
-                }
-                None => out.push(0),
-            }
-            Ok(())
-        }
-        None => {
-            out.push(0);
-            Ok(())
-        }
-    }
-}
-
-fn read_join_option(cursor: &mut Cursor<'_>) -> Result<Option<JoinSpec>> {
-    let tag = read_byte(cursor)?;
-    if tag == 0 {
-        return Ok(None);
-    }
-    let join_type = JoinType::from_u8(read_byte(cursor)?)?;
-    let right_table = read_string(cursor)?;
-    let left_on = read_string(cursor)?;
-    let right_on = read_string(cursor)?;
-    let left_ts = if read_byte(cursor)? != 0 {
-        Some(read_string(cursor)?)
-    } else {
-        None
-    };
-    let right_ts = if read_byte(cursor)? != 0 {
-        Some(read_string(cursor)?)
-    } else {
-        None
-    };
-    Ok(Some(JoinSpec {
-        join_type,
-        right_table,
-        left_on,
-        right_on,
-        left_ts,
-        right_ts,
-    }))
 }

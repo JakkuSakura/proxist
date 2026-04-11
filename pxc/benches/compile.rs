@@ -1,5 +1,5 @@
 use criterion::{black_box, Criterion};
-use pxl_cli::compiler::{compile_to_frame, InputKind};
+use pxc::compiler::{compile_to_frame, InputKind};
 
 fn bench_compile_sql(c: &mut Criterion) {
     let sql = "SELECT value FROM ticks WHERE symbol = 'AAPL'";

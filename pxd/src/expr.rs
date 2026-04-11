@@ -1,26 +1,9 @@
 use crate::error::{Error, Result};
-use crate::types::{Row, Schema, Value, ValueRef};
+use crate::types::{Schema, Value, ValueRef};
 
-pub trait RowAccess {
-    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>>;
-}
-
-impl RowAccess for [Value] {
-    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
-        self.get(idx).map(ValueRef::from)
-    }
-}
-
-impl RowAccess for Vec<Value> {
-    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
-        self.get(idx).map(ValueRef::from)
-    }
-}
-
-impl RowAccess for Row {
-    fn get_value(&self, idx: usize) -> Option<ValueRef<'_>> {
-        self.values.get(idx).map(ValueRef::from)
-    }
+pub trait ColumnAccess {
+    fn row_count(&self) -> usize;
+    fn value_at(&self, col_idx: usize, row_idx: usize) -> Option<ValueRef<'_>>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,24 +45,27 @@ pub enum Expr {
     Not(Box<Expr>),
 }
 
-pub fn eval_predicate<R: RowAccess + ?Sized>(
+pub fn eval_predicate_at<A: ColumnAccess + ?Sized>(
     expr: &Expr,
-    row: &R,
+    access: &A,
     schema: &Schema,
+    row_idx: usize,
 ) -> Result<bool> {
     match expr {
         Expr::Binary { op, left, right } => {
-            let left_val = eval_value_ref(left, row, schema)?;
-            let right_val = eval_value_ref(right, row, schema)?;
+            let left_val = eval_value_ref(left, access, schema, row_idx)?;
+            let right_val = eval_value_ref(right, access, schema, row_idx)?;
             Ok(compare_values(op, &left_val, &right_val)?)
         }
         Expr::And(left, right) => Ok(
-            eval_predicate(left, row, schema)? && eval_predicate(right, row, schema)?,
+            eval_predicate_at(left, access, schema, row_idx)?
+                && eval_predicate_at(right, access, schema, row_idx)?,
         ),
         Expr::Or(left, right) => Ok(
-            eval_predicate(left, row, schema)? || eval_predicate(right, row, schema)?,
+            eval_predicate_at(left, access, schema, row_idx)?
+                || eval_predicate_at(right, access, schema, row_idx)?,
         ),
-        Expr::Not(inner) => Ok(!eval_predicate(inner, row, schema)?),
+        Expr::Not(inner) => Ok(!eval_predicate_at(inner, access, schema, row_idx)?),
         Expr::Literal(Value::Bool(value)) => Ok(*value),
         _ => Err(Error::InvalidData(
             "predicate expression is not boolean".to_string(),
@@ -87,41 +73,62 @@ pub fn eval_predicate<R: RowAccess + ?Sized>(
     }
 }
 
-fn eval_value_ref<'a, R: RowAccess + ?Sized>(
+fn eval_value_ref<'a, A: ColumnAccess + ?Sized>(
     expr: &'a Expr,
-    row: &'a R,
+    access: &'a A,
     schema: &Schema,
+    row_idx: usize,
 ) -> Result<ValueRef<'a>> {
     match expr {
         Expr::Column(name) => {
             let idx = schema
                 .column_index(name)
                 .ok_or_else(|| Error::InvalidData(format!("unknown column {name}")))?;
-            Ok(row
-                .get_value(idx)
+            Ok(access
+                .value_at(idx, row_idx)
                 .ok_or_else(|| Error::InvalidData("column out of range".to_string()))?)
         }
         Expr::Literal(value) => Ok(ValueRef::from(value)),
         Expr::Binary { op, left, right } => {
-            let left_val = eval_value_ref(left, row, schema)?;
-            let right_val = eval_value_ref(right, row, schema)?;
+            let left_val = eval_value_ref(left, access, schema, row_idx)?;
+            let right_val = eval_value_ref(right, access, schema, row_idx)?;
             Ok(ValueRef::Bool(compare_values(op, &left_val, &right_val)?))
         }
         Expr::And(_, _) | Expr::Or(_, _) | Expr::Not(_) => {
-            Ok(ValueRef::Bool(eval_predicate(expr, row, schema)?))
+            Ok(ValueRef::Bool(eval_predicate_at(
+                expr, access, schema, row_idx,
+            )?))
         }
     }
 }
 
-pub fn eval_value<R: RowAccess + ?Sized>(
+pub fn eval_value_at<A: ColumnAccess + ?Sized>(
     expr: &Expr,
-    row: &R,
+    access: &A,
     schema: &Schema,
+    row_idx: usize,
 ) -> Result<Value> {
-    Ok(eval_value_ref(expr, row, schema)?.to_value())
+    Ok(eval_value_ref(expr, access, schema, row_idx)?.to_value())
 }
 
-fn compare_values(op: &BinaryOp, left: &ValueRef<'_>, right: &ValueRef<'_>) -> Result<bool> {
+pub fn fill_predicate_mask<A: ColumnAccess + ?Sized>(
+    expr: &Expr,
+    access: &A,
+    schema: &Schema,
+    mask: &mut [u8],
+) -> Result<()> {
+    let row_count = access.row_count();
+    if mask.len() < row_count {
+        return Err(Error::InvalidData("mask length too small".to_string()));
+    }
+    for row_idx in 0..row_count {
+        let passed = eval_predicate_at(expr, access, schema, row_idx)?;
+        mask[row_idx] = if passed { 1 } else { 0 };
+    }
+    Ok(())
+}
+
+pub fn compare_values(op: &BinaryOp, left: &ValueRef<'_>, right: &ValueRef<'_>) -> Result<bool> {
     match op {
         BinaryOp::Eq => Ok(left == right),
         BinaryOp::NotEq => Ok(left != right),
@@ -144,8 +151,25 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{eval_predicate, eval_value, BinaryOp, Expr};
-    use crate::types::{ColumnSpec, ColumnType, Schema, Value};
+    use super::{eval_predicate_at, eval_value_at, BinaryOp, ColumnAccess, Expr};
+    use crate::types::{ColumnSpec, ColumnType, Schema, Value, ValueRef};
+
+    struct SingleRow<'a> {
+        row: &'a [Value],
+    }
+
+    impl<'a> ColumnAccess for SingleRow<'a> {
+        fn row_count(&self) -> usize {
+            1
+        }
+
+        fn value_at(&self, col_idx: usize, row_idx: usize) -> Option<ValueRef<'_>> {
+            if row_idx != 0 {
+                return None;
+            }
+            self.row.get(col_idx).map(ValueRef::from)
+        }
+    }
 
     fn base_schema() -> Schema {
         Schema::new(vec![
@@ -200,7 +224,8 @@ mod tests {
             )),
         );
 
-        let result = eval_predicate(&expr, &row, &schema).expect("predicate");
+        let access = SingleRow { row: &row };
+        let result = eval_predicate_at(&expr, &access, &schema, 0).expect("predicate");
         assert!(result);
 
         let value_expr = Expr::Binary {
@@ -208,7 +233,7 @@ mod tests {
             left: Box::new(Expr::Column("b".to_string())),
             right: Box::new(Expr::Literal(Value::I64(3))),
         };
-        let value = eval_value(&value_expr, &row, &schema).expect("value");
+        let value = eval_value_at(&value_expr, &access, &schema, 0).expect("value");
         assert_eq!(value, Value::Bool(true));
     }
 
@@ -226,7 +251,8 @@ mod tests {
             left: Box::new(Expr::Column("sym".to_string())),
             right: Box::new(Expr::Column("a".to_string())),
         };
-        let err = eval_predicate(&expr, &row, &schema).expect_err("should fail");
+        let access = SingleRow { row: &row };
+        let err = eval_predicate_at(&expr, &access, &schema, 0).expect_err("should fail");
         let msg = err.to_string();
         assert!(
             msg.contains("not comparable"),

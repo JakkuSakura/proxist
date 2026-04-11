@@ -2,7 +2,7 @@ use std::io::Cursor;
 use std::process::Command;
 
 use pxd::pxl::{
-    decode_delete_payload, decode_insert_payload, decode_query_payload, read_frame, Op,
+    decode_delete_payload, decode_insert_payload, decode_query_col_payload, read_frame, Op,
 };
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
@@ -25,7 +25,7 @@ fn decode_frame(bytes: Vec<u8>) -> pxd::pxl::Frame {
 
 #[test]
 fn cli_sql_to_insert_hex() {
-    let exe = env!("CARGO_BIN_EXE_pxl-cli");
+    let exe = env!("CARGO_BIN_EXE_pxc");
     let output = Command::new(exe)
         .args([
             "--sql",
@@ -35,7 +35,7 @@ fn cli_sql_to_insert_hex() {
             "--hex",
         ])
         .output()
-        .expect("run pxl-cli");
+        .expect("run pxc");
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let bytes = hex_to_bytes(stdout.trim());
@@ -50,27 +50,27 @@ fn cli_sql_to_insert_hex() {
 
 #[test]
 fn cli_prql_to_query_hex() {
-    let exe = env!("CARGO_BIN_EXE_pxl-cli");
+    let exe = env!("CARGO_BIN_EXE_pxc");
     let prql = r#"from ticks
 | filter symbol == "AAPL"
 | select {value}"#;
     let output = Command::new(exe)
         .args(["--prql", prql, "--req-id", "9", "--hex"])
         .output()
-        .expect("run pxl-cli");
+        .expect("run pxc");
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let bytes = hex_to_bytes(stdout.trim());
     let frame = decode_frame(bytes);
     assert_eq!(frame.req_id, 9);
-    assert_eq!(frame.op, Op::Query);
-    let plan = decode_query_payload(&frame.payload).expect("payload");
-    assert_eq!(plan.table, "ticks");
+    assert_eq!(frame.op, Op::QueryCol);
+    let query = decode_query_col_payload(&frame.payload).expect("payload");
+    assert_eq!(query.table, "ticks");
 }
 
 #[test]
 fn cli_sql_to_delete_hex() {
-    let exe = env!("CARGO_BIN_EXE_pxl-cli");
+    let exe = env!("CARGO_BIN_EXE_pxc");
     let output = Command::new(exe)
         .args([
             "--sql",
@@ -80,7 +80,7 @@ fn cli_sql_to_delete_hex() {
             "--hex",
         ])
         .output()
-        .expect("run pxl-cli");
+        .expect("run pxc");
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let bytes = hex_to_bytes(stdout.trim());

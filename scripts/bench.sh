@@ -6,6 +6,8 @@ COMPOSE_FILE="${ROOT_DIR}/container-compose.yaml"
 COMPOSE_CMD=(docker compose -f "${COMPOSE_FILE}")
 PROXIST_PORT="${PROXIST_PORT:-18124}"
 PROXIST_ADDR="127.0.0.1:${PROXIST_PORT}"
+DATA_DIR="$(mktemp -d)"
+WAL_PATH="$(mktemp)"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required to run benchmarks." >&2
@@ -25,7 +27,8 @@ cleanup() {
     kill "${PROXIST_PID}" >/dev/null 2>&1 || true
     wait "${PROXIST_PID}" 2>/dev/null || true
   fi
-  rm -f "${METADATA_DB}" "${PROXIST_LOG}"
+  rm -f "${METADATA_DB}" "${PROXIST_LOG}" "${WAL_PATH}"
+  rm -rf "${DATA_DIR}"
   echo "Stopping ClickHouse..."
   "${COMPOSE_CMD[@]}" down --remove-orphans >/dev/null
 }
@@ -38,12 +41,11 @@ done
 echo "Starting pxd (release build) for benchmarks..."
 (
   cd "${ROOT_DIR}" && \
-  PROXIST_METADATA_SQLITE_PATH="${METADATA_DB}" \
-  PROXIST_HTTP_ADDR="${PROXIST_ADDR}" \
-  PROXIST_CLICKHOUSE_ENDPOINT="http://127.0.0.1:18123" \
-  PROXIST_CLICKHOUSE_DATABASE="proxist" \
-  PROXIST_CLICKHOUSE_TABLE="ticks" \
-  cargo run --quiet --release --bin pxd
+  cargo run --quiet --release --bin pxd -- \
+    --addr "${PROXIST_ADDR}" \
+    --wal "${WAL_PATH}" \
+    --data "${DATA_DIR}" \
+    --partition "bench"
 ) >"${PROXIST_LOG}" 2>&1 &
 PROXIST_PID=$!
 

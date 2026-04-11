@@ -6,10 +6,9 @@ use crate::memstore::MemStore;
 use crate::pxl::{
     decode_alter_add_column_payload, decode_alter_drop_column_payload,
     decode_alter_rename_column_payload, decode_alter_set_default_payload,
-    decode_create_as_payload, decode_delete_payload, decode_drop_table_payload,
-    decode_insert_payload, decode_query_payload, decode_rename_table_payload,
-    decode_schema_payload, decode_update_payload, encode_error_payload,
-    encode_result_payload, Frame, Op,
+    decode_delete_payload, decode_drop_table_payload, decode_insert_payload,
+    decode_query_col_payload, decode_rename_table_payload, decode_schema_payload,
+    decode_update_payload, encode_error_payload, encode_result_payload, Frame, Op,
 };
 use crate::wal::Wal;
 
@@ -148,11 +147,11 @@ fn handle_frame(
                 payload: Vec::new(),
             })
         }
-        Op::Query => {
-            let plan = decode_query_payload(&frame.payload)?;
+        Op::QueryCol => {
+            let query = decode_query_col_payload(&frame.payload)?;
             let result = {
                 let mem = mem.read().map_err(|_| Error::Protocol("mem lock"))?;
-                mem.query(&plan)?
+                mem.query_col(&query)?
             };
             Ok(Frame {
                 flags: 0,
@@ -255,23 +254,6 @@ fn handle_frame(
             {
                 let mut mem = mem.write().map_err(|_| Error::Protocol("mem lock"))?;
                 mem.rename_table(&from, &to)?;
-            }
-            Ok(Frame {
-                flags: 0,
-                req_id: frame.req_id,
-                op: Op::Pong,
-                payload: Vec::new(),
-            })
-        }
-        Op::CreateAs => {
-            let (table, plan) = decode_create_as_payload(&frame.payload)?;
-            if let Some(wal) = wal {
-                let mut wal = wal.lock().map_err(|_| Error::Protocol("wal lock"))?;
-                wal.append_create_as(&table, &plan)?;
-            }
-            {
-                let mut mem = mem.write().map_err(|_| Error::Protocol("mem lock"))?;
-                mem.create_table_as(&table, &plan)?;
             }
             Ok(Frame {
                 flags: 0,

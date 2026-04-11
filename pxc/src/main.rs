@@ -16,7 +16,7 @@ struct Args {
 
 fn print_usage() {
     eprintln!(
-        "Usage: pxl-cli (--sql [SQL] | --prql [PRQL]) [--input <path>|-] [--req-id <u32>] [--hex]\n\
+        "Usage: pxc (--sql [SQL] | --prql [PRQL]) [--input <path>|-] [--req-id <u32>] [--hex]\n\
 \n\
 Options:\n\
   --sql [SQL]     Use SQL input. If SQL is omitted, read from --input or stdin.\n\

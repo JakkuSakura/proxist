@@ -1,31 +1,32 @@
 use criterion::{black_box, Criterion};
-use pxd::pxl::{encode_frame, read_frame, encode_query_payload, Frame, Op};
-use pxd::query::{QueryPlan, SelectExpr, SelectItem};
+use pxd::pxl::{
+    encode_frame, encode_query_col_payload, read_frame, ColumnProjectExpr, ColumnProjectItem,
+    ColumnQuery, Frame, Op,
+};
 use pxd::types::Value;
 use std::io::Cursor;
 
 fn build_frame() -> Frame {
-    let plan = QueryPlan {
+    let query = ColumnQuery {
         table: "ticks".to_string(),
-        join: None,
-        filter: None,
-        group_by: Vec::new(),
-        select: vec![
-            SelectItem {
-                expr: SelectExpr::Column("symbol".to_string()),
-                alias: None,
+        columns: vec!["symbol".to_string()],
+        filter: vec![],
+        project: vec![
+            ColumnProjectItem {
+                name: "symbol".to_string(),
+                expr: ColumnProjectExpr::Column(0),
             },
-            SelectItem {
-                expr: SelectExpr::Literal(Value::I64(1)),
-                alias: None,
+            ColumnProjectItem {
+                name: "one".to_string(),
+                expr: ColumnProjectExpr::Literal(Value::I64(1)),
             },
         ],
     };
-    let payload = encode_query_payload(&plan).expect("payload");
+    let payload = encode_query_col_payload(&query).expect("payload");
     Frame {
         flags: 0,
         req_id: 7,
-        op: Op::Query,
+        op: Op::QueryCol,
         payload,
     }
 }

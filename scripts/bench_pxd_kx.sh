@@ -59,7 +59,7 @@ if [ -n "${MEM_TOTAL_BYTES}" ] && [ "${ALLOW_OOM}" != "1" ]; then
 fi
 
 BUILD_MODE="release"
-cargo run -q -p pxd-bench --bin pxd_nano --release -- \
+cargo run -q -p pxd-bench --bin pxd --release -- \
   --rows "${ROWS}" \
   --random-reads "${RANDOM_READS}" \
   --cache-rows "${CACHE_ROWS}" \

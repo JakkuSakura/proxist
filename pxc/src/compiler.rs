@@ -1,9 +1,8 @@
 use fp_core::query::SqlDialect;
 use fp_core::sql_ast::{
-    AlterTableOperation, BinaryOperator, ColumnDef, ColumnOption, DataType, Expr, Function,
-    FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint, JoinOperator, ObjectName,
-    OrderByExpr, SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator,
-    Value as SqlValue, WindowFrameBound, WindowFrameUnits, WindowType,
+    AlterTableOperation, BinaryOperator, ColumnDef, ColumnOption, DataType, Expr, GroupByExpr,
+    ObjectName, SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator,
+    Value as SqlValue,
 };
 use fp_prql::compile_prql;
 use fp_sql::sql_ast::parse_sql_ast;
@@ -11,13 +10,10 @@ use pxd::expr::{BinaryOp as PxlBinaryOp, Expr as PxlExpr};
 use pxd::pxl::{
     encode_alter_add_column_payload, encode_alter_drop_column_payload,
     encode_alter_rename_column_payload, encode_alter_set_default_payload,
-    encode_create_as_payload, encode_delete_payload, encode_drop_table_payload, encode_frame,
-    encode_insert_payload, encode_query_payload, encode_rename_table_payload,
-    encode_schema_payload, encode_update_payload, Frame, Op,
-};
-use pxd::query::{
-    AggFunc, AggregateExpr, JoinSpec, JoinType, QueryPlan, SelectExpr, SelectItem, WindowBound,
-    WindowExpr, WindowFrameUnit, WindowSpec,
+    encode_delete_payload, encode_drop_table_payload, encode_frame, encode_insert_payload,
+    encode_query_col_payload,
+    encode_rename_table_payload, encode_schema_payload, encode_update_payload, ColumnInstr,
+    ColumnProjectExpr, ColumnProjectItem, ColumnQuery, Frame, Op,
 };
 use pxd::types::{ColumnSpec, ColumnType, Schema, Value as PxlValue};
 
@@ -140,16 +136,8 @@ fn compile_create_as(
     query: fp_core::sql_ast::Query,
     req_id: u32,
 ) -> Result<Frame, String> {
-    validate_query_shape(&query)?;
-    let plan = build_query_plan(query)?;
-    let payload = encode_create_as_payload(&name.to_string(), &plan)
-        .map_err(|err| format!("encode CTAS payload failed: {err}"))?;
-    Ok(Frame {
-        flags: 0,
-        req_id,
-        op: Op::CreateAs,
-        payload,
-    })
+    let _ = (name, query, req_id);
+    Err("CTAS is not supported in pxc (query plan removed; use CREATE TABLE + INSERT)".to_string())
 }
 
 fn compile_alter_table(
@@ -294,15 +282,17 @@ fn compile_update(
 
 fn compile_select(query: fp_core::sql_ast::Query, req_id: u32) -> Result<Frame, String> {
     validate_query_shape(&query)?;
-    let plan = build_query_plan(query)?;
-    let payload = encode_query_payload(&plan)
-        .map_err(|err| format!("encode query payload failed: {err}"))?;
-    Ok(Frame {
-        flags: 0,
-        req_id,
-        op: Op::Query,
-        payload,
-    })
+    if let Some(col_query) = build_column_query(&query)? {
+        let payload = encode_query_col_payload(&col_query)
+            .map_err(|err| format!("encode query_col payload failed: {err}"))?;
+        return Ok(Frame {
+            flags: 0,
+            req_id,
+            op: Op::QueryCol,
+            payload,
+        });
+    }
+    Err("SELECT uses unsupported features (only column-based SELECT is supported)".to_string())
 }
 
 fn compile_delete(
@@ -310,10 +300,7 @@ fn compile_delete(
     selection: Option<Expr>,
     req_id: u32,
 ) -> Result<Frame, String> {
-    let (table, join) = extract_table_and_join(&from)?;
-    if join.is_some() {
-        return Err("DELETE does not support JOIN".to_string());
-    }
+    let table = extract_table(&from)?;
     let filter = match selection.as_ref() {
         Some(expr) => Some(expr_to_predicate(expr)?),
         None => None,
@@ -507,28 +494,42 @@ fn validate_query_shape(query: &fp_core::sql_ast::Query) -> Result<(), String> {
     Ok(())
 }
 
-fn build_query_plan(query: fp_core::sql_ast::Query) -> Result<QueryPlan, String> {
-    let SetExpr::Select(select) = *query.body else {
-        return Err("SELECT only supports simple SELECT query".to_string());
+fn build_column_query(query: &fp_core::sql_ast::Query) -> Result<Option<ColumnQuery>, String> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
     };
-    let select = *select;
-    validate_select_shape(&select)?;
-
-    let (table, join) = extract_table_and_join(&select.from)?;
-    let filter = match select.selection.as_ref() {
-        Some(expr) => Some(expr_to_predicate(expr)?),
-        None => None,
+    let select = select.as_ref();
+    validate_select_shape(select)?;
+    let table = match extract_table(&select.from) {
+        Ok(table) => table,
+        Err(_) => return Ok(None),
     };
     let group_by = extract_group_by(&select.group_by)?;
-    let projection = extract_projection(&select.projection)?;
-
-    Ok(QueryPlan {
+    if !group_by.is_empty() {
+        return Ok(None);
+    }
+    if select
+        .projection
+        .iter()
+        .any(|item| matches!(item, fp_core::sql_ast::SelectItem::Wildcard))
+    {
+        return Ok(None);
+    }
+    let mut columns = Vec::new();
+    let filter = match select.selection.as_ref() {
+        Some(expr) => {
+            let predicate = expr_to_predicate(expr)?;
+            expr_to_col_instrs(&predicate, &mut columns)?
+        }
+        None => Vec::new(),
+    };
+    let project = build_project_list(&select.projection, &mut columns)?;
+    Ok(Some(ColumnQuery {
         table,
-        join,
+        columns,
         filter,
-        group_by,
-        select: projection,
-    })
+        project,
+    }))
 }
 
 fn validate_select_shape(select: &fp_core::sql_ast::Select) -> Result<(), String> {
@@ -541,93 +542,22 @@ fn validate_select_shape(select: &fp_core::sql_ast::Select) -> Result<(), String
     Ok(())
 }
 
-fn extract_table_and_join(from: &[TableWithJoins]) -> Result<(String, Option<JoinSpec>), String> {
+fn extract_table(from: &[TableWithJoins]) -> Result<String, String> {
     if from.len() != 1 {
         return Err("query must reference exactly one FROM item".to_string());
     }
     let base = &from[0];
-    let (left_table, left_alias) = extract_table_name(&base.relation)?;
-    if base.joins.is_empty() {
-        return Ok((left_table, None));
+    if !base.joins.is_empty() {
+        return Err("JOIN is not supported".to_string());
     }
-    if base.joins.len() != 1 {
-        return Err("only one JOIN is supported".to_string());
-    }
-    let join = &base.joins[0];
-    let (right_table, right_alias) = extract_table_name(&join.relation)?;
-    let join_type = match join.join_operator {
-        JoinOperator::Inner(_) => JoinType::Inner,
-        JoinOperator::LeftOuter(_) => JoinType::LeftOuter,
-    };
-    let constraint = match &join.join_operator {
-        JoinOperator::Inner(constraint) | JoinOperator::LeftOuter(constraint) => constraint,
-    };
-    let on_expr = match constraint {
-        JoinConstraint::On(expr) => expr,
-        JoinConstraint::None => return Err("JOIN requires ON condition".to_string()),
-    };
-    let (left_on, right_on) = parse_join_on(
-        on_expr,
-        &left_table,
-        left_alias.as_deref(),
-        &right_table,
-        right_alias.as_deref(),
-    )?;
-
-    Ok((
-        left_table,
-        Some(JoinSpec {
-            join_type,
-            right_table,
-            left_on,
-            right_on,
-            left_ts: None,
-            right_ts: None,
-        }),
-    ))
+    let (table, _alias) = extract_table_name(&base.relation)?;
+    Ok(table)
 }
 
 fn extract_table_name(relation: &TableFactor) -> Result<(String, Option<String>), String> {
     match relation {
         TableFactor::Table { name, alias } => Ok((name.to_string(), alias.as_ref().map(|a| a.name.value.clone()))),
         _ => Err("only direct table references are supported".to_string()),
-    }
-}
-
-fn parse_join_on(
-    expr: &Expr,
-    left_table: &str,
-    left_alias: Option<&str>,
-    right_table: &str,
-    right_alias: Option<&str>,
-) -> Result<(String, String), String> {
-    let mut expr = expr;
-    while let Expr::Nested(inner) = expr {
-        expr = inner;
-    }
-    let Expr::BinaryOp { left, op, right } = expr else {
-        return Err("JOIN ON must be a simple equality".to_string());
-    };
-    if *op != BinaryOperator::Eq {
-        return Err("JOIN ON must use =".to_string());
-    }
-    let (l_qual, l_name) = extract_qualified_name(left)?;
-    let (r_qual, r_name) = extract_qualified_name(right)?;
-
-    let is_left = |qual: &Option<String>| {
-        qual.as_deref() == Some(left_table) || qual.as_deref() == left_alias
-    };
-    let is_right = |qual: &Option<String>| {
-        qual.as_deref() == Some(right_table) || qual.as_deref() == right_alias
-    };
-
-    match (is_left(&l_qual), is_right(&l_qual), is_left(&r_qual), is_right(&r_qual)) {
-        (true, false, false, true) => Ok((l_name, r_name)),
-        (false, true, true, false) => Ok((r_name, l_name)),
-        (false, false, _, _) | (_, _, false, false) => {
-            Err("JOIN ON must qualify columns with table name or alias".to_string())
-        }
-        _ => Err("JOIN ON columns are ambiguous".to_string()),
     }
 }
 
@@ -640,138 +570,107 @@ fn extract_group_by(group_by: &GroupByExpr) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn extract_projection(items: &[fp_core::sql_ast::SelectItem]) -> Result<Vec<SelectItem>, String> {
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
+fn build_project_list(
+    projection: &[fp_core::sql_ast::SelectItem],
+    columns: &mut Vec<String>,
+) -> Result<Vec<ColumnProjectItem>, String> {
+    let mut items = Vec::with_capacity(projection.len());
+    for item in projection {
         match item {
-            fp_core::sql_ast::SelectItem::Wildcard => out.push(SelectItem {
-                expr: SelectExpr::Wildcard,
-                alias: None,
-            }),
+            fp_core::sql_ast::SelectItem::Wildcard => {
+                return Err("wildcard not supported for column bytecode".to_string());
+            }
             fp_core::sql_ast::SelectItem::UnnamedExpr(expr) => {
-                let expr = expr_to_select_expr(expr)?;
-                out.push(SelectItem { expr, alias: None });
+                let (name, expr) = project_expr(expr, None, columns)?;
+                items.push(ColumnProjectItem { name, expr });
             }
             fp_core::sql_ast::SelectItem::ExprWithAlias { expr, alias } => {
-                let expr = expr_to_select_expr(expr)?;
-                out.push(SelectItem {
-                    expr,
-                    alias: Some(alias.value.clone()),
-                });
+                let (name, expr) = project_expr(expr, Some(&alias.value), columns)?;
+                items.push(ColumnProjectItem { name, expr });
             }
         }
     }
+    Ok(items)
+}
+
+fn project_expr(
+    expr: &Expr,
+    alias: Option<&str>,
+    columns: &mut Vec<String>,
+) -> Result<(String, ColumnProjectExpr), String> {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let name = expr_to_column_name(expr)?;
+            let idx = intern_column(columns, &name)?;
+            let out_name = alias.map(|v| v.to_string()).unwrap_or_else(|| name.clone());
+            Ok((out_name, ColumnProjectExpr::Column(idx)))
+        }
+        Expr::Value(_) | Expr::UnaryOp { .. } | Expr::Nested(_) => {
+            let value = expr_to_literal_value(expr)?;
+            let out_name = alias.map(|v| v.to_string()).unwrap_or_else(|| "literal".to_string());
+            Ok((out_name, ColumnProjectExpr::Literal(value)))
+        }
+        Expr::Function(_) => Err("function not supported for column bytecode".to_string()),
+        _ => Err("projection not supported for column bytecode".to_string()),
+    }
+}
+
+fn expr_to_col_instrs(expr: &PxlExpr, columns: &mut Vec<String>) -> Result<Vec<ColumnInstr>, String> {
+    let mut out = Vec::new();
+    expr_to_col_instrs_inner(expr, columns, &mut out)?;
     Ok(out)
 }
 
-fn expr_to_select_expr(expr: &Expr) -> Result<SelectExpr, String> {
+fn expr_to_col_instrs_inner(
+    expr: &PxlExpr,
+    columns: &mut Vec<String>,
+    out: &mut Vec<ColumnInstr>,
+) -> Result<(), String> {
     match expr {
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-            Ok(SelectExpr::Column(expr_to_column_name(expr)?))
+        PxlExpr::Column(name) => {
+            let idx = intern_column(columns, name)?;
+            out.push(ColumnInstr::PushCol(idx));
+            Ok(())
         }
-        Expr::Value(_) => Ok(SelectExpr::Literal(expr_to_literal_value(expr)?)),
-        Expr::Function(func) => function_to_select_expr(func),
-        Expr::Nested(inner) => expr_to_select_expr(inner),
-        _ => Err("unsupported expression in SELECT projection".to_string()),
-    }
-}
-
-fn function_to_select_expr(func: &Function) -> Result<SelectExpr, String> {
-    let func_name = func
-        .name
-        .parts
-        .last()
-        .map(|ident| ident.value.to_ascii_lowercase())
-        .ok_or_else(|| "function name missing".to_string())?;
-    let agg = map_agg_func(&func_name)?;
-    let arg = function_arg_expr(&func.args)?;
-
-    if let Some(over) = &func.over {
-        let spec = build_window_spec(over)?;
-        return Ok(SelectExpr::Window(WindowExpr { func: agg, arg, spec }));
-    }
-
-    Ok(SelectExpr::Aggregate(AggregateExpr { func: agg, arg }))
-}
-
-fn function_arg_expr(args: &[FunctionArg]) -> Result<PxlExpr, String> {
-    if args.is_empty() {
-        return Ok(PxlExpr::Literal(PxlValue::I64(1)));
-    }
-    if args.len() != 1 {
-        return Err("function expects exactly one argument".to_string());
-    }
-    let FunctionArg::Unnamed(arg) = &args[0];
-    let FunctionArgExpr::Expr(expr) = arg;
-    match expr {
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-            Ok(PxlExpr::Column(expr_to_column_name(expr)?))
+        PxlExpr::Literal(value) => {
+            out.push(ColumnInstr::PushLit(value.clone()));
+            Ok(())
         }
-        Expr::Value(_) | Expr::Nested(_) | Expr::UnaryOp { .. } => {
-            Ok(PxlExpr::Literal(expr_to_literal_value(expr)?))
+        PxlExpr::Binary { op, left, right } => {
+            expr_to_col_instrs_inner(left, columns, out)?;
+            expr_to_col_instrs_inner(right, columns, out)?;
+            out.push(ColumnInstr::Cmp(*op));
+            Ok(())
         }
-        _ => Err("function argument must be a column or literal".to_string()),
-    }
-}
-
-fn build_window_spec(window: &WindowType) -> Result<WindowSpec, String> {
-    let WindowType::WindowSpec(spec) = window;
-    let spec = spec.as_ref();
-    let mut partition_by = Vec::with_capacity(spec.partition_by.len());
-    for expr in &spec.partition_by {
-        partition_by.push(expr_to_column_name(expr)?);
-    }
-    let order_by = parse_order_by(&spec.order_by)?;
-    let (start, start_value) = parse_window_frame(spec.window_frame.as_deref())?;
-    Ok(WindowSpec {
-        partition_by,
-        order_by,
-        unit: WindowFrameUnit::Rows,
-        start,
-        start_value,
-    })
-}
-
-fn parse_order_by(order_by: &[OrderByExpr]) -> Result<String, String> {
-    if order_by.len() != 1 {
-        return Err("window ORDER BY must specify exactly one column".to_string());
-    }
-    expr_to_column_name(&order_by[0].expr)
-}
-
-fn parse_window_frame(
-    frame: Option<&fp_core::sql_ast::WindowFrame>,
-) -> Result<(WindowBound, Option<u64>), String> {
-    let Some(frame) = frame else {
-        return Ok((WindowBound::UnboundedPreceding, None));
-    };
-    if frame.units != WindowFrameUnits::Rows {
-        return Err("window frame only supports ROWS".to_string());
-    }
-    if let Some(end) = &frame.end_bound {
-        if !matches!(end, WindowFrameBound::CurrentRow) {
-            return Err("window frame end bound is not supported".to_string());
+        PxlExpr::And(left, right) => {
+            expr_to_col_instrs_inner(left, columns, out)?;
+            expr_to_col_instrs_inner(right, columns, out)?;
+            out.push(ColumnInstr::And);
+            Ok(())
+        }
+        PxlExpr::Or(left, right) => {
+            expr_to_col_instrs_inner(left, columns, out)?;
+            expr_to_col_instrs_inner(right, columns, out)?;
+            out.push(ColumnInstr::Or);
+            Ok(())
+        }
+        PxlExpr::Not(inner) => {
+            expr_to_col_instrs_inner(inner, columns, out)?;
+            out.push(ColumnInstr::Not);
+            Ok(())
         }
     }
-    match &frame.start_bound {
-        WindowFrameBound::CurrentRow => Ok((WindowBound::CurrentRow, None)),
-        WindowFrameBound::Preceding(expr_opt) => match expr_opt {
-            None => Ok((WindowBound::UnboundedPreceding, None)),
-            Some(expr) => Ok((WindowBound::Preceding, Some(expr_to_u64(expr)?))),
-        },
-        WindowFrameBound::Following(_) => Err("window frame FOLLOWING is not supported".to_string()),
-    }
 }
 
-fn map_agg_func(name: &str) -> Result<AggFunc, String> {
-    match name {
-        "count" => Ok(AggFunc::Count),
-        "sum" => Ok(AggFunc::Sum),
-        "avg" => Ok(AggFunc::Avg),
-        "min" => Ok(AggFunc::Min),
-        "max" => Ok(AggFunc::Max),
-        _ => Err(format!("unsupported function: {name}")),
+fn intern_column(columns: &mut Vec<String>, name: &str) -> Result<u16, String> {
+    if let Some((idx, _)) = columns.iter().enumerate().find(|(_, v)| v.as_str() == name) {
+        return Ok(idx as u16);
     }
+    if columns.len() >= u16::MAX as usize {
+        return Err("too many columns in bytecode".to_string());
+    }
+    columns.push(name.to_string());
+    Ok((columns.len() - 1) as u16)
 }
 
 fn map_data_type(data_type: &DataType) -> Result<ColumnType, String> {
@@ -782,6 +681,15 @@ fn map_data_type(data_type: &DataType) -> Result<ColumnType, String> {
         DataType::Date | DataType::DateTime | DataType::DateTime64(_) => Ok(ColumnType::Timestamp),
         DataType::String => Ok(ColumnType::String),
         DataType::Uuid | DataType::Ipv4 => Ok(ColumnType::String),
+        DataType::Custom(name, _) => {
+            let name = name.to_ascii_lowercase();
+            match name.as_str() {
+                "symbol" => Ok(ColumnType::Symbol),
+                "bytes" | "binary" | "blob" => Ok(ColumnType::Bytes),
+                "timestamp" | "ts" => Ok(ColumnType::Timestamp),
+                _ => Err(format!("unsupported column type: {name}")),
+            }
+        }
         _ => Err("unsupported column type".to_string()),
     }
 }
@@ -845,25 +753,6 @@ fn expr_to_column_name(expr: &Expr) -> Result<String, String> {
             .ok_or_else(|| "expected column name".to_string()),
         Expr::Nested(inner) => expr_to_column_name(inner),
         _ => Err("expected column name".to_string()),
-    }
-}
-
-fn extract_qualified_name(expr: &Expr) -> Result<(Option<String>, String), String> {
-    match expr {
-        Expr::Identifier(ident) => Ok((None, ident.value.clone())),
-        Expr::CompoundIdentifier(idents) => {
-            if idents.len() < 2 {
-                return Err("expected qualified column".to_string());
-            }
-            let qual = idents.first().map(|ident| ident.value.clone());
-            let name = idents
-                .last()
-                .map(|ident| ident.value.clone())
-                .ok_or_else(|| "expected column name".to_string())?;
-            Ok((qual, name))
-        }
-        Expr::Nested(inner) => extract_qualified_name(inner),
-        _ => Err("expected column reference".to_string()),
     }
 }
 
@@ -933,9 +822,9 @@ mod tests {
     use pxd::pxl::{
         decode_alter_add_column_payload, decode_alter_drop_column_payload,
         decode_alter_rename_column_payload, decode_alter_set_default_payload,
-        decode_create_as_payload, decode_delete_payload, decode_drop_table_payload,
-        decode_insert_payload, decode_query_payload, decode_rename_table_payload,
-        decode_schema_payload, decode_update_payload, read_frame,
+        decode_delete_payload, decode_drop_table_payload,
+        decode_insert_payload, decode_query_col_payload,
+        decode_rename_table_payload, decode_schema_payload, decode_update_payload, read_frame,
     };
     use std::io::Cursor;
 
@@ -997,14 +886,22 @@ mod tests {
     }
 
     #[test]
-    fn compile_select_sql_to_query() {
+    fn compile_select_sql_to_query_col() {
         let sql = "SELECT value FROM ticks WHERE symbol = 'AAPL'";
         let bytes = compile_to_frame(sql, InputKind::Sql, 7).expect("compile");
         let frame = decode_frame(bytes);
-        assert_eq!(frame.op, Op::Query);
-        let plan = decode_query_payload(&frame.payload).expect("payload");
-        assert_eq!(plan.table, "ticks");
-        assert!(plan.filter.is_some());
+        assert_eq!(frame.op, Op::QueryCol);
+        let query = decode_query_col_payload(&frame.payload).expect("payload");
+        assert_eq!(query.table, "ticks");
+        assert!(!query.filter.is_empty());
+        assert_eq!(query.project.len(), 1);
+    }
+
+    #[test]
+    fn compile_select_sql_rejects_group_by() {
+        let sql = "SELECT symbol, avg(value) FROM ticks GROUP BY symbol";
+        let err = compile_to_frame(sql, InputKind::Sql, 99).expect_err("compile");
+        assert!(err.contains("unsupported"));
     }
 
     #[test]
@@ -1091,12 +988,8 @@ mod tests {
     #[test]
     fn compile_create_table_as_select() {
         let sql = "CREATE TABLE snap AS SELECT symbol, price FROM ticks";
-        let bytes = compile_to_frame(sql, InputKind::Sql, 18).expect("compile");
-        let frame = decode_frame(bytes);
-        assert_eq!(frame.op, Op::CreateAs);
-        let (table, plan) = decode_create_as_payload(&frame.payload).expect("payload");
-        assert_eq!(table, "snap");
-        assert_eq!(plan.table, "ticks");
+        let err = compile_to_frame(sql, InputKind::Sql, 18).expect_err("compile");
+        assert!(err.contains("CTAS"));
     }
 
     #[test]
@@ -1108,9 +1001,9 @@ from ticks
 "#;
         let bytes = compile_to_frame(prql, InputKind::Prql, 9).expect("compile");
         let frame = decode_frame(bytes);
-        assert_eq!(frame.op, Op::Query);
-        let plan = decode_query_payload(&frame.payload).expect("payload");
-        assert_eq!(plan.table, "ticks");
+        assert_eq!(frame.op, Op::QueryCol);
+        let query = decode_query_col_payload(&frame.payload).expect("payload");
+        assert_eq!(query.table, "ticks");
     }
 
     #[test]
@@ -1131,7 +1024,7 @@ from ticks
     fn compile_create_table_as_select_error() {
         let sql = "CREATE TABLE t AS SELECT 1";
         let err = compile_to_frame(sql, InputKind::Sql, 1).expect_err("error");
-        assert!(err.contains("FROM"));
+        assert!(err.contains("CTAS"));
     }
 
     #[test]

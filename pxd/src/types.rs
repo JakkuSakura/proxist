@@ -13,6 +13,7 @@ pub enum ColumnType {
     String = 4,
     Bytes = 5,
     Timestamp = 6,
+    Symbol = 7,
 }
 
 impl ColumnType {
@@ -24,6 +25,7 @@ impl ColumnType {
             4 => Ok(ColumnType::String),
             5 => Ok(ColumnType::Bytes),
             6 => Ok(ColumnType::Timestamp),
+            7 => Ok(ColumnType::Symbol),
             _ => Err(Error::Protocol("unknown column type")),
         }
     }
@@ -442,6 +444,7 @@ pub fn coerce_value(value: Value, target: ColumnType) -> Result<Value> {
         (Value::F64(v), ColumnType::I64) => Ok(Value::I64(v as i64)),
         (Value::Bool(v), ColumnType::Bool) => Ok(Value::Bool(v)),
         (Value::String(v), ColumnType::String) => Ok(Value::String(v)),
+        (Value::String(v), ColumnType::Symbol) => Ok(Value::String(v)),
         (Value::Bytes(v), ColumnType::Bytes) => Ok(Value::Bytes(v)),
         (Value::Timestamp(v), ColumnType::Timestamp) => Ok(Value::Timestamp(v)),
         (Value::Timestamp(v), ColumnType::I64) => Ok(Value::I64(v)),

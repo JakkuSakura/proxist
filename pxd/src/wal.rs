@@ -8,14 +8,13 @@ use crate::memstore::MemStore;
 use crate::pxl::{
     decode_alter_add_column_payload, decode_alter_drop_column_payload,
     decode_alter_rename_column_payload, decode_alter_set_default_payload,
-    decode_create_as_payload, decode_delete_payload, decode_drop_table_payload,
-    decode_insert_payload, decode_rename_table_payload, decode_schema_payload,
-    decode_update_payload, encode_alter_add_column_payload, encode_alter_drop_column_payload,
-    encode_alter_rename_column_payload, encode_alter_set_default_payload, encode_create_as_payload,
+    decode_delete_payload, decode_drop_table_payload, decode_insert_payload,
+    decode_rename_table_payload, decode_schema_payload, decode_update_payload,
+    encode_alter_add_column_payload, encode_alter_drop_column_payload,
+    encode_alter_rename_column_payload, encode_alter_set_default_payload,
     encode_delete_payload, encode_drop_table_payload, encode_insert_payload,
     encode_rename_table_payload, encode_schema_payload, encode_update_payload, Op,
 };
-use crate::query::QueryPlan;
 use crate::types::{ColumnSpec, Schema, Value};
 
 const MAGIC: [u8; 2] = *b"PW";
@@ -124,13 +123,20 @@ impl Wal {
         self.append_record(Op::RenameTable, &payload)
     }
 
-    pub fn append_create_as(
-        &mut self,
-        table: &str,
-        plan: &QueryPlan,
-    ) -> Result<u64> {
-        let payload = encode_create_as_payload(table, plan)?;
-        self.append_record(Op::CreateAs, &payload)
+    pub fn checkpoint(&mut self, mem: &mut MemStore) -> Result<()> {
+        mem.flush_to_store()?;
+        self.truncate()
+    }
+
+    fn truncate(&mut self) -> Result<()> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        if self.sync {
+            self.file.flush()?;
+            self.file.sync_all()?;
+        }
+        self.next_lsn = 1;
+        Ok(())
     }
 
     fn append_record(&mut self, op: Op, payload: &[u8]) -> Result<u64> {
@@ -233,10 +239,6 @@ fn replay_wal(path: &Path, mem: &mut MemStore) -> Result<u64> {
                 let (from, to) = decode_rename_table_payload(&payload)?;
                 mem.rename_table(&from, &to)?;
             }
-            Op::CreateAs => {
-                let (table, plan) = decode_create_as_payload(&payload)?;
-                mem.create_table_as(&table, &plan)?;
-            }
             _ => {}
         }
         last_lsn = last_lsn.max(lsn);
@@ -265,6 +267,7 @@ mod tests {
 
     use crate::expr::{BinaryOp, Expr};
     use crate::memstore::MemStore;
+    use crate::storage::{SplayedStore, StoreConfig};
     use crate::types::{ColumnSpec, ColumnType, Schema, Value};
 
     use super::Wal;
@@ -276,6 +279,16 @@ mod tests {
             .expect("system time")
             .as_nanos();
         path.push(format!("pxd_{label}_{nanos}.wal"));
+        path
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        path.push(format!("pxd_store_{label}_{nanos}"));
         path
     }
 
@@ -327,22 +340,7 @@ mod tests {
 
         let mut replayed = MemStore::new();
         let _wal = Wal::open(&path, &mut replayed, true).expect("replay wal");
-        let plan = crate::query::QueryPlan {
-            table: "ticks".to_string(),
-            join: None,
-            filter: Some(Expr::Binary {
-                op: BinaryOp::Eq,
-                left: Box::new(Expr::Column("symbol".to_string())),
-                right: Box::new(Expr::Literal(Value::String("AAPL".to_string()))),
-            }),
-            group_by: Vec::new(),
-            select: vec![crate::query::SelectItem {
-                expr: crate::query::SelectExpr::Column("price".to_string()),
-                alias: None,
-            }],
-        };
-        let result = replayed.query(&plan).expect("query");
-        assert_eq!(result.rows.len(), 1);
+        assert_eq!(replayed.table_row_count("ticks"), Some(1));
 
         let _ = fs::remove_file(&path);
     }
@@ -416,18 +414,7 @@ mod tests {
 
         let mut replayed = MemStore::new();
         let _wal = Wal::open(&path, &mut replayed, true).expect("replay wal");
-        let plan = crate::query::QueryPlan {
-            table: "ticks".to_string(),
-            join: None,
-            filter: None,
-            group_by: Vec::new(),
-            select: vec![crate::query::SelectItem {
-                expr: crate::query::SelectExpr::Column("price".to_string()),
-                alias: None,
-            }],
-        };
-        let result = replayed.query(&plan).expect("query");
-        assert!(result.rows.is_empty());
+        assert_eq!(replayed.table_row_count("ticks"), Some(0));
 
         let _ = fs::remove_file(&path);
     }
@@ -471,24 +458,6 @@ mod tests {
             wal.append_rename_table("ticks", "trades")
                 .expect("append rename table");
 
-            let plan = crate::query::QueryPlan {
-                table: "trades".to_string(),
-                join: None,
-                filter: None,
-                group_by: Vec::new(),
-                select: vec![
-                    crate::query::SelectItem {
-                        expr: crate::query::SelectExpr::Column("symbol".to_string()),
-                        alias: None,
-                    },
-                    crate::query::SelectItem {
-                        expr: crate::query::SelectExpr::Column("price".to_string()),
-                        alias: None,
-                    },
-                ],
-            };
-            wal.append_create_as("snap", &plan)
-                .expect("append create as");
         }
 
         let mut replayed = MemStore::new();
@@ -505,10 +474,59 @@ mod tests {
         let lots_idx = schema.column_index("lots").expect("lots idx");
         assert_eq!(row.values[lots_idx], Value::I64(100));
 
-        let snap_schema = replayed.table_schema("snap").expect("snap schema");
-        assert_eq!(snap_schema.columns().len(), 2);
-        assert_eq!(replayed.table_row_count("snap"), Some(1));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wal_checkpoint_flushes_to_store_and_truncates() {
+        let root = temp_root("checkpoint");
+        let cfg = StoreConfig {
+            root: root.clone(),
+            partition: "p".to_string(),
+        };
+        let store = SplayedStore::open(cfg.clone()).expect("open store");
+        let mut mem = MemStore::with_store(store);
+        let path = temp_wal_path("checkpoint");
+        let _ = fs::remove_file(&path);
+
+        {
+            let mut wal = Wal::open(&path, &mut mem, true).expect("open wal");
+            wal.append_create("ticks", &ticks_schema())
+                .expect("append create");
+            mem.create_table("ticks", ticks_schema()).expect("create");
+            wal.append_insert(
+                "ticks",
+                &["symbol".to_string(), "ts".to_string(), "price".to_string()],
+                &[vec![
+                    Value::String("AAPL".to_string()),
+                    Value::I64(1),
+                    Value::F64(10.0),
+                ]],
+            )
+            .expect("append insert");
+            mem.insert(
+                "ticks",
+                &["symbol".to_string(), "ts".to_string(), "price".to_string()],
+                &[vec![
+                    Value::String("AAPL".to_string()),
+                    Value::I64(1),
+                    Value::F64(10.0),
+                ]],
+            )
+            .expect("insert");
+            wal.checkpoint(&mut mem).expect("checkpoint");
+        }
+
+        let wal_len = fs::metadata(&path).expect("metadata").len();
+        assert_eq!(wal_len, 0);
+
+        let store = SplayedStore::open(cfg).expect("reopen store");
+        let mut reloaded = MemStore::with_store(store);
+        reloaded.load_from_store().expect("load");
+        let row = reloaded.table_row("ticks", 0).expect("row");
+        assert_eq!(row.values[0], Value::String("AAPL".to_string()));
 
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(root);
     }
 }
