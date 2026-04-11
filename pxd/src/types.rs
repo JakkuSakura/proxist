@@ -148,8 +148,49 @@ impl Schema {
 }
 
 #[derive(Debug, Clone)]
-pub struct Row {
-    pub values: Vec<Value>,
+pub struct ColumnBlock {
+    pub schema: Schema,
+    pub columns: Vec<ColumnBlockColumn>,
+    pub row_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnBlockColumn {
+    pub nulls: Vec<u8>,
+    pub data: ColumnBlockData,
+}
+
+#[derive(Debug, Clone)]
+pub enum ColumnBlockData {
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+    Bool(Vec<u8>),
+    String(Vec<String>),
+    Bytes(Vec<Vec<u8>>),
+    Timestamp(Vec<i64>),
+    Symbol(Vec<u32>),
+}
+
+impl ColumnBlock {
+    pub fn scalar_if_single(&self) -> Option<Value> {
+        if self.row_count != 1 || self.columns.len() != 1 {
+            return None;
+        }
+        let column = self.columns.get(0)?;
+        if column.nulls.get(0).copied().unwrap_or(0) == 1 {
+            return Some(Value::Null);
+        }
+        let value = match &column.data {
+            ColumnBlockData::I64(values) => Value::I64(*values.get(0)?),
+            ColumnBlockData::F64(values) => Value::F64(*values.get(0)?),
+            ColumnBlockData::Bool(values) => Value::Bool(*values.get(0)? != 0),
+            ColumnBlockData::String(values) => Value::String(values.get(0)?.clone()),
+            ColumnBlockData::Bytes(values) => Value::Bytes(values.get(0)?.clone()),
+            ColumnBlockData::Timestamp(values) => Value::Timestamp(*values.get(0)?),
+            ColumnBlockData::Symbol(_) => return None,
+        };
+        Some(value)
+    }
 }
 
 #[derive(Debug, Clone)]

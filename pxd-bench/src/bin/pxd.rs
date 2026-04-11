@@ -5,7 +5,8 @@ use std::slice;
 use std::time::Instant;
 
 use pxd::memstore::MemStore;
-use pxd::types::Value;
+use pxd::pxl::{ColumnProjectExpr, ColumnProjectItem, ColumnQuery};
+use pxd::types::{ColumnBlockData, Value};
 use pxd_bench::lcg_index_at;
 
 #[derive(Debug, Clone)]
@@ -190,9 +191,20 @@ fn main() {
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     emit("write", config.rows, config.rows, config.rows * row_bytes, elapsed);
 
-    let values_f64 = mem
-        .table_column_f64("ticks", "value")
-        .expect("value column f64");
+    let query = ColumnQuery {
+        table: "ticks".to_string(),
+        columns: vec!["value".to_string()],
+        filter: Vec::new(),
+        project: vec![ColumnProjectItem {
+            name: "value".to_string(),
+            expr: ColumnProjectExpr::Column(0),
+        }],
+    };
+    let block = mem.query_col(&query).expect("query_col");
+    let values_f64 = match &block.columns[0].data {
+        ColumnBlockData::F64(values) => values.as_slice(),
+        _ => panic!("value column not f64"),
+    };
 
     let start = Instant::now();
     let sum = sum_f64_unrolled(values_f64);

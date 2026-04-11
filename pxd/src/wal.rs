@@ -267,8 +267,9 @@ mod tests {
 
     use crate::expr::{BinaryOp, Expr};
     use crate::memstore::MemStore;
+    use crate::pxl::{ColumnProjectExpr, ColumnProjectItem, ColumnQuery};
     use crate::storage::{SplayedStore, StoreConfig};
-    use crate::types::{ColumnSpec, ColumnType, Schema, Value};
+    use crate::types::{ColumnBlock, ColumnBlockData, ColumnSpec, ColumnType, Schema, Value};
 
     use super::Wal;
 
@@ -314,6 +315,22 @@ mod tests {
             },
         ])
         .expect("schema")
+    }
+
+    fn block_column_i64(block: &ColumnBlock, name: &str) -> Vec<i64> {
+        let idx = block.schema.column_index(name).expect("column index");
+        match &block.columns[idx].data {
+            ColumnBlockData::I64(values) => values.clone(),
+            _ => panic!("expected i64 column"),
+        }
+    }
+
+    fn block_column_string(block: &ColumnBlock, name: &str) -> Vec<String> {
+        let idx = block.schema.column_index(name).expect("column index");
+        match &block.columns[idx].data {
+            ColumnBlockData::String(values) => values.clone(),
+            _ => panic!("expected string column"),
+        }
     }
 
     #[test]
@@ -470,9 +487,18 @@ mod tests {
         let price_idx = schema.column_index("price").expect("price idx");
         assert_eq!(schema.columns()[price_idx].default, Some(Value::F64(7.0)));
 
-        let row = replayed.table_row("trades", 0).expect("row");
-        let lots_idx = schema.column_index("lots").expect("lots idx");
-        assert_eq!(row.values[lots_idx], Value::I64(100));
+        let query = ColumnQuery {
+            table: "trades".to_string(),
+            columns: vec!["lots".to_string()],
+            filter: Vec::new(),
+            project: vec![ColumnProjectItem {
+                name: "lots".to_string(),
+                expr: ColumnProjectExpr::Column(0),
+            }],
+        };
+        let result = replayed.query_col(&query).expect("query_col");
+        let lots = block_column_i64(&result, "lots");
+        assert_eq!(lots[0], 100);
 
         let _ = fs::remove_file(&path);
     }
@@ -523,8 +549,18 @@ mod tests {
         let store = SplayedStore::open(cfg).expect("reopen store");
         let mut reloaded = MemStore::with_store(store);
         reloaded.load_from_store().expect("load");
-        let row = reloaded.table_row("ticks", 0).expect("row");
-        assert_eq!(row.values[0], Value::String("AAPL".to_string()));
+        let query = ColumnQuery {
+            table: "ticks".to_string(),
+            columns: vec!["symbol".to_string()],
+            filter: Vec::new(),
+            project: vec![ColumnProjectItem {
+                name: "symbol".to_string(),
+                expr: ColumnProjectExpr::Column(0),
+            }],
+        };
+        let result = reloaded.query_col(&query).expect("query_col");
+        let symbols = block_column_string(&result, "symbol");
+        assert_eq!(symbols[0], "AAPL");
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(root);

@@ -8,7 +8,7 @@ use crate::pxl::{
     decode_alter_rename_column_payload, decode_alter_set_default_payload,
     decode_delete_payload, decode_drop_table_payload, decode_insert_payload,
     decode_query_col_payload, decode_rename_table_payload, decode_schema_payload,
-    decode_update_payload, encode_error_payload, encode_result_payload, Frame, Op,
+    decode_update_payload, encode_error_payload, encode_scalar_payload, Frame, Op,
 };
 use crate::wal::Wal;
 
@@ -153,11 +153,14 @@ fn handle_frame(
                 let mem = mem.read().map_err(|_| Error::Protocol("mem lock"))?;
                 mem.query_col(&query)?
             };
+            let scalar = result
+                .scalar_if_single()
+                .ok_or_else(|| Error::InvalidData("query must return single scalar".to_string()))?;
             Ok(Frame {
                 flags: 0,
                 req_id: frame.req_id,
                 op: Op::Result,
-                payload: encode_result_payload(&result.schema, &result.rows)?,
+                payload: encode_scalar_payload(&scalar)?,
             })
         }
         Op::AlterAddColumn => {

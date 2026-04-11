@@ -5,10 +5,13 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use crate::error::{Error, Result};
-use crate::expr::{compare_values, eval_predicate_at, ColumnAccess, Expr};
+use crate::expr::{eval_predicate_at, BinaryOp, ColumnAccess, Expr};
 use crate::pxl::{ColumnInstr, ColumnProjectExpr, ColumnQuery};
 use crate::storage::{MmapWrite, SplayedStore};
-use crate::types::{coerce_value, ColumnSpec, ColumnType, Row, Schema, Value, ValueRef};
+use crate::types::{
+    coerce_value, ColumnBlock, ColumnBlockColumn, ColumnBlockData, ColumnSpec, ColumnType, Schema,
+    Value, ValueRef,
+};
 
 #[derive(Debug)]
 struct Table {
@@ -623,6 +626,101 @@ impl ColumnData {
         }
     }
 
+    fn scalar_at<'a>(
+        &'a self,
+        idx: usize,
+        symbols: Option<&'a SymbolInterner>,
+    ) -> Option<ScalarRef<'a>> {
+        if idx >= self.len() {
+            return None;
+        }
+        if self.nulls.get(idx).unwrap_or(0) == 1 {
+            return Some(ScalarRef::Null);
+        }
+        match &self.data {
+            ColumnStorage::I64(values) => values.get(idx).copied().map(ScalarRef::I64),
+            ColumnStorage::F64(values) => values.get(idx).copied().map(ScalarRef::F64),
+            ColumnStorage::Bool(values) => values.get(idx).map(|v| ScalarRef::Bool(*v != 0)),
+            ColumnStorage::String(values) => values.get(idx).map(|v| ScalarRef::String(v.as_str())),
+            ColumnStorage::Bytes(values) => values.get(idx).map(|v| ScalarRef::Bytes(v.as_slice())),
+            ColumnStorage::Timestamp(values) => values.get(idx).copied().map(ScalarRef::Timestamp),
+            ColumnStorage::Symbol(values) => {
+                let id = *values.get(idx)?;
+                let sym = symbols.and_then(|sym| sym.resolve(id)).unwrap_or("");
+                Some(ScalarRef::String(sym))
+            }
+            ColumnStorage::MmapI64W(view) => mmap_write_as_slice::<i64>(view)
+                .get(idx)
+                .copied()
+                .map(ScalarRef::I64),
+            ColumnStorage::MmapF64W(view) => mmap_write_as_slice::<f64>(view)
+                .get(idx)
+                .copied()
+                .map(ScalarRef::F64),
+            ColumnStorage::MmapBoolW(view) => view
+                .as_slice()
+                .get(idx)
+                .copied()
+                .map(|v| ScalarRef::Bool(v != 0)),
+            ColumnStorage::MmapTimestampW(view) => mmap_write_as_slice::<i64>(view)
+                .get(idx)
+                .copied()
+                .map(ScalarRef::Timestamp),
+            ColumnStorage::MmapSymbolW(values) => {
+                let ids = mmap_write_as_slice::<u32>(values);
+                let id = *ids.get(idx)?;
+                let sym = symbols.and_then(|sym| sym.resolve(id)).unwrap_or("");
+                Some(ScalarRef::String(sym))
+            }
+            ColumnStorage::MmapVarStringW { offsets, data } => {
+                let offsets = mmap_write_as_slice::<u64>(offsets);
+                let data = data.as_slice();
+                if idx >= offsets.len() {
+                    return None;
+                }
+                let start = offsets[idx] as usize;
+                if start + 4 > data.len() {
+                    return Some(ScalarRef::Null);
+                }
+                let len = u32::from_le_bytes([
+                    data[start],
+                    data[start + 1],
+                    data[start + 2],
+                    data[start + 3],
+                ]) as usize;
+                let end = start + 4 + len;
+                if end > data.len() {
+                    return Some(ScalarRef::Null);
+                }
+                let bytes = &data[start + 4..end];
+                let value = std::str::from_utf8(bytes).ok()?;
+                Some(ScalarRef::String(value))
+            }
+            ColumnStorage::MmapVarBytesW { offsets, data } => {
+                let offsets = mmap_write_as_slice::<u64>(offsets);
+                let data = data.as_slice();
+                if idx >= offsets.len() {
+                    return None;
+                }
+                let start = offsets[idx] as usize;
+                if start + 4 > data.len() {
+                    return Some(ScalarRef::Null);
+                }
+                let len = u32::from_le_bytes([
+                    data[start],
+                    data[start + 1],
+                    data[start + 2],
+                    data[start + 3],
+                ]) as usize;
+                let end = start + 4 + len;
+                if end > data.len() {
+                    return Some(ScalarRef::Null);
+                }
+                Some(ScalarRef::Bytes(&data[start + 4..end]))
+            }
+        }
+    }
+
     fn get_ref_with_symbols<'a>(
         &'a self,
         idx: usize,
@@ -780,14 +878,77 @@ fn resolve_column_map(schema: &Schema, columns: &[String]) -> Result<Vec<usize>>
     Ok(map)
 }
 
+#[derive(Clone, Copy)]
+enum ScalarRef<'a> {
+    Null,
+    I64(i64),
+    F64(f64),
+    Bool(bool),
+    String(&'a str),
+    Bytes(&'a [u8]),
+    Timestamp(i64),
+}
+
 enum ColStackValue<'a> {
-    Value(ValueRef<'a>),
+    Value(ScalarRef<'a>),
     Bool(bool),
 }
 
-fn eval_column_filter<A: ColumnAccess + ?Sized>(
+impl<'a> ScalarRef<'a> {
+    fn from_value(value: &'a Value) -> Self {
+        match value {
+            Value::Null => ScalarRef::Null,
+            Value::I64(v) => ScalarRef::I64(*v),
+            Value::F64(v) => ScalarRef::F64(*v),
+            Value::Bool(v) => ScalarRef::Bool(*v),
+            Value::String(v) => ScalarRef::String(v.as_str()),
+            Value::Bytes(v) => ScalarRef::Bytes(v.as_slice()),
+            Value::Timestamp(v) => ScalarRef::Timestamp(*v),
+        }
+    }
+}
+
+fn compare_scalar(op: &BinaryOp, left: ScalarRef<'_>, right: ScalarRef<'_>) -> Result<bool> {
+    let eq = match (left, right) {
+        (ScalarRef::Null, ScalarRef::Null) => true,
+        (ScalarRef::I64(a), ScalarRef::I64(b)) => a == b,
+        (ScalarRef::F64(a), ScalarRef::F64(b)) => a.to_bits() == b.to_bits(),
+        (ScalarRef::Bool(a), ScalarRef::Bool(b)) => a == b,
+        (ScalarRef::String(a), ScalarRef::String(b)) => a == b,
+        (ScalarRef::Bytes(a), ScalarRef::Bytes(b)) => a == b,
+        (ScalarRef::Timestamp(a), ScalarRef::Timestamp(b)) => a == b,
+        _ => false,
+    };
+    match op {
+        BinaryOp::Eq => Ok(eq),
+        BinaryOp::NotEq => Ok(!eq),
+        BinaryOp::Lt => compare_ordering_scalar(left, right, |o| o.is_lt()),
+        BinaryOp::LtEq => compare_ordering_scalar(left, right, |o| o.is_le()),
+        BinaryOp::Gt => compare_ordering_scalar(left, right, |o| o.is_gt()),
+        BinaryOp::GtEq => compare_ordering_scalar(left, right, |o| o.is_ge()),
+    }
+}
+
+fn compare_ordering_scalar<F>(left: ScalarRef<'_>, right: ScalarRef<'_>, pred: F) -> Result<bool>
+where
+    F: FnOnce(std::cmp::Ordering) -> bool,
+{
+    let ord = match (left, right) {
+        (ScalarRef::I64(a), ScalarRef::I64(b)) => Some(a.cmp(&b)),
+        (ScalarRef::Timestamp(a), ScalarRef::Timestamp(b)) => Some(a.cmp(&b)),
+        (ScalarRef::F64(a), ScalarRef::F64(b)) => a.partial_cmp(&b),
+        (ScalarRef::String(a), ScalarRef::String(b)) => Some(a.cmp(b)),
+        (ScalarRef::Bytes(a), ScalarRef::Bytes(b)) => Some(a.cmp(b)),
+        (ScalarRef::Bool(a), ScalarRef::Bool(b)) => Some(a.cmp(&b)),
+        _ => None,
+    }
+    .ok_or_else(|| Error::InvalidData("values not comparable".to_string()))?;
+    Ok(pred(ord))
+}
+
+fn eval_column_filter(
     instrs: &[ColumnInstr],
-    access: &A,
+    table: &Table,
     col_map: &[usize],
     row_idx: usize,
 ) -> Result<bool> {
@@ -800,11 +961,17 @@ fn eval_column_filter<A: ColumnAccess + ?Sized>(
                     return Err(Error::InvalidData("filter column out of range".to_string()));
                 }
                 let schema_idx = col_map[idx];
-                let value = access.value_at(schema_idx, row_idx).unwrap_or(ValueRef::Null);
+                let column = table
+                    .columns
+                    .get(schema_idx)
+                    .ok_or_else(|| Error::InvalidData("filter column out of range".to_string()))?;
+                let value = column
+                    .scalar_at(row_idx, Some(&table.symbols))
+                    .unwrap_or(ScalarRef::Null);
                 stack.push(ColStackValue::Value(value));
             }
             ColumnInstr::PushLit(value) => {
-                stack.push(ColStackValue::Value(ValueRef::from(value)));
+                stack.push(ColStackValue::Value(ScalarRef::from_value(value)));
             }
             ColumnInstr::Cmp(op) => {
                 let right = match stack.pop() {
@@ -823,7 +990,7 @@ fn eval_column_filter<A: ColumnAccess + ?Sized>(
                         ))
                     }
                 };
-                let passed = compare_values(op, &left, &right)?;
+                let passed = compare_scalar(op, left, right)?;
                 stack.push(ColStackValue::Bool(passed));
             }
             ColumnInstr::And => {
@@ -889,12 +1056,6 @@ pub struct MemStore {
     store: Option<SplayedStore>,
     scratch_col_indices: Vec<usize>,
     scratch_value_pos: Vec<usize>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ResultSet {
-    pub schema: Schema,
-    pub rows: Vec<Row>,
 }
 
 impl MemStore {
@@ -1362,25 +1523,6 @@ impl MemStore {
         self.tables.get(name).map(|table| table.row_count)
     }
 
-    pub fn table_column_f64(&self, name: &str, column: &str) -> Option<&[f64]> {
-        let table = self.tables.get(name)?;
-        let idx = table.schema.column_index(column)?;
-        let column = table.columns.get(idx)?;
-        match &column.data {
-            ColumnStorage::F64(values) => Some(values.as_slice()),
-            ColumnStorage::MmapF64W(view) => Some(mmap_write_as_slice::<f64>(view)),
-            _ => None,
-        }
-    }
-
-    pub fn table_row(&self, name: &str, index: usize) -> Option<Row> {
-        self.tables.get(name).and_then(|table| table_row(table, index))
-    }
-
-    pub fn table_rows(&self, name: &str) -> Option<Vec<Row>> {
-        self.tables.get(name).map(table_rows)
-    }
-
     pub fn update(
         &mut self,
         table: &str,
@@ -1485,26 +1627,26 @@ impl MemStore {
     }
 
 
-    pub fn query_col(&self, query: &ColumnQuery) -> Result<ResultSet> {
+    pub fn query_col(&self, query: &ColumnQuery) -> Result<ColumnBlock> {
         let table = self
             .tables
             .get(&query.table)
             .ok_or_else(|| Error::InvalidData("table not found".to_string()))?;
         let schema = &table.schema;
         let col_map = resolve_column_map(schema, &query.columns)?;
-        let access = TableAccess::new(table);
         let mut row_indices = Vec::new();
         if query.filter.is_empty() {
             row_indices.extend(0..table.row_count);
         } else {
             for row_idx in 0..table.row_count {
-                if eval_column_filter(&query.filter, &access, &col_map, row_idx)? {
+                if eval_column_filter(&query.filter, table, &col_map, row_idx)? {
                     row_indices.push(row_idx);
                 }
             }
         }
 
         let mut out_schema = Vec::with_capacity(query.project.len());
+        let mut out_columns = Vec::with_capacity(query.project.len());
         for item in &query.project {
             let (name, col_type) = match &item.expr {
                 ColumnProjectExpr::Column(idx) => {
@@ -1513,47 +1655,152 @@ impl MemStore {
                         return Err(Error::InvalidData("project column out of range".to_string()));
                     }
                     let schema_idx = col_map[idx];
-                    let col_type = schema.columns()[schema_idx].col_type;
-                    (item.name.clone(), col_type)
+                    let src_type = schema.columns()[schema_idx].col_type;
+                    let out_type = if src_type == ColumnType::Symbol {
+                        ColumnType::String
+                    } else {
+                        src_type
+                    };
+                    (item.name.clone(), out_type)
                 }
                 ColumnProjectExpr::Literal(value) => (item.name.clone(), value.column_type()),
             };
             out_schema.push(ColumnSpec {
-                name,
+                name: name.clone(),
                 col_type,
                 nullable: true,
                 default: None,
             });
+            out_columns.push(ColumnBlockColumn {
+                nulls: Vec::with_capacity(row_indices.len()),
+                data: new_block_data(col_type, row_indices.len()),
+            });
         }
         let result_schema = Schema::new(out_schema)?;
-        let mut rows = Vec::with_capacity(row_indices.len());
-        for row_idx in row_indices {
-            let mut values = Vec::with_capacity(query.project.len());
-            for item in &query.project {
-                let value = match &item.expr {
+        let row_count = row_indices.len();
+        for row_idx in row_indices.iter().copied() {
+            for (col_idx, item) in query.project.iter().enumerate() {
+                let out_col = out_columns
+                    .get_mut(col_idx)
+                    .ok_or_else(|| Error::InvalidData("project column out of range".to_string()))?;
+                match &item.expr {
                     ColumnProjectExpr::Column(idx) => {
                         let idx = *idx as usize;
                         if idx >= col_map.len() {
                             return Err(Error::InvalidData("project column out of range".to_string()));
                         }
                         let schema_idx = col_map[idx];
-                        access
-                            .value_at(schema_idx, row_idx)
-                            .unwrap_or(ValueRef::Null)
-                            .to_value()
+                        let src_col = table
+                            .columns
+                            .get(schema_idx)
+                            .ok_or_else(|| Error::InvalidData("project column out of range".to_string()))?;
+                        let scalar = src_col
+                            .scalar_at(row_idx, Some(&table.symbols))
+                            .unwrap_or(ScalarRef::Null);
+                        push_block_value(out_col, scalar)?;
                     }
-                    ColumnProjectExpr::Literal(value) => value.clone(),
-                };
-                values.push(value);
+                    ColumnProjectExpr::Literal(value) => {
+                        let literal = ScalarRef::from_value(value);
+                        push_block_value(out_col, literal)?;
+                    }
+                }
             }
-            rows.push(Row { values });
         }
-        Ok(ResultSet {
+        Ok(ColumnBlock {
             schema: result_schema,
-            rows,
+            columns: out_columns,
+            row_count,
         })
     }
 
+}
+
+fn new_block_data(col_type: ColumnType, capacity: usize) -> ColumnBlockData {
+    match col_type {
+        ColumnType::I64 => ColumnBlockData::I64(Vec::with_capacity(capacity)),
+        ColumnType::F64 => ColumnBlockData::F64(Vec::with_capacity(capacity)),
+        ColumnType::Bool => ColumnBlockData::Bool(Vec::with_capacity(capacity)),
+        ColumnType::String => ColumnBlockData::String(Vec::with_capacity(capacity)),
+        ColumnType::Bytes => ColumnBlockData::Bytes(Vec::with_capacity(capacity)),
+        ColumnType::Timestamp => ColumnBlockData::Timestamp(Vec::with_capacity(capacity)),
+        ColumnType::Symbol => ColumnBlockData::Symbol(Vec::with_capacity(capacity)),
+    }
+}
+
+fn push_block_value(out: &mut ColumnBlockColumn, value: ScalarRef<'_>) -> Result<()> {
+    match value {
+        ScalarRef::Null => {
+            out.nulls.push(1);
+            match &mut out.data {
+                ColumnBlockData::I64(values) => values.push(0),
+                ColumnBlockData::F64(values) => values.push(0.0),
+                ColumnBlockData::Bool(values) => values.push(0),
+                ColumnBlockData::String(values) => values.push(String::new()),
+                ColumnBlockData::Bytes(values) => values.push(Vec::new()),
+                ColumnBlockData::Timestamp(values) => values.push(0),
+                ColumnBlockData::Symbol(values) => values.push(0),
+            }
+            Ok(())
+        }
+        ScalarRef::I64(v) => match &mut out.data {
+            ColumnBlockData::I64(values) => {
+                out.nulls.push(0);
+                values.push(v);
+                Ok(())
+            }
+            ColumnBlockData::Timestamp(values) => {
+                out.nulls.push(0);
+                values.push(v);
+                Ok(())
+            }
+            _ => Err(Error::InvalidData("project column type mismatch".to_string())),
+        },
+        ScalarRef::F64(v) => match &mut out.data {
+            ColumnBlockData::F64(values) => {
+                out.nulls.push(0);
+                values.push(v);
+                Ok(())
+            }
+            _ => Err(Error::InvalidData("project column type mismatch".to_string())),
+        },
+        ScalarRef::Bool(v) => match &mut out.data {
+            ColumnBlockData::Bool(values) => {
+                out.nulls.push(0);
+                values.push(if v { 1 } else { 0 });
+                Ok(())
+            }
+            _ => Err(Error::InvalidData("project column type mismatch".to_string())),
+        },
+        ScalarRef::String(v) => match &mut out.data {
+            ColumnBlockData::String(values) => {
+                out.nulls.push(0);
+                values.push(v.to_string());
+                Ok(())
+            }
+            _ => Err(Error::InvalidData("project column type mismatch".to_string())),
+        },
+        ScalarRef::Bytes(v) => match &mut out.data {
+            ColumnBlockData::Bytes(values) => {
+                out.nulls.push(0);
+                values.push(v.to_vec());
+                Ok(())
+            }
+            _ => Err(Error::InvalidData("project column type mismatch".to_string())),
+        },
+        ScalarRef::Timestamp(v) => match &mut out.data {
+            ColumnBlockData::Timestamp(values) => {
+                out.nulls.push(0);
+                values.push(v);
+                Ok(())
+            }
+            ColumnBlockData::I64(values) => {
+                out.nulls.push(0);
+                values.push(v);
+                Ok(())
+            }
+            _ => Err(Error::InvalidData("project column type mismatch".to_string())),
+        },
+    }
 }
 
 fn load_column_from_store(
@@ -1718,42 +1965,13 @@ fn infer_column_type_from_rows(rows: &[Vec<Value>], col_pos: usize) -> ColumnTyp
     ColumnType::String
 }
 
-fn table_row(table: &Table, index: usize) -> Option<Row> {
-    if index >= table.row_count {
-        return None;
-    }
-    let mut values = Vec::with_capacity(table.columns.len());
-    for column in &table.columns {
-        let value = if column.ty == ColumnType::Symbol {
-            column
-                .get_ref_with_symbols(index, &table.symbols)
-                .unwrap_or(ValueRef::Null)
-                .to_value()
-        } else {
-            column.get_ref(index).unwrap_or(ValueRef::Null).to_value()
-        };
-        values.push(value);
-    }
-    Some(Row { values })
-}
-
-fn table_rows(table: &Table) -> Vec<Row> {
-    let mut rows = Vec::with_capacity(table.row_count);
-    for idx in 0..table.row_count {
-        if let Some(row) = table_row(table, idx) {
-            rows.push(row);
-        }
-    }
-    rows
-}
-
 #[cfg(test)]
 mod tests {
     use super::{load_varlen_offsets, MemStore};
     use crate::expr::{BinaryOp, Expr};
     use crate::pxl::{ColumnInstr, ColumnProjectExpr, ColumnProjectItem, ColumnQuery};
     use crate::storage::{SplayedStore, StoreConfig};
-    use crate::types::{ColumnSpec, ColumnType, Schema, Value};
+    use crate::types::{ColumnBlock, ColumnBlockData, ColumnSpec, ColumnType, Schema, Value};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1766,6 +1984,30 @@ mod tests {
             .as_nanos();
         path.push(format!("pxd_{name}_{nanos}"));
         path
+    }
+
+    fn block_column_f64(block: &ColumnBlock, name: &str) -> Vec<f64> {
+        let idx = block.schema.column_index(name).expect("column index");
+        match &block.columns[idx].data {
+            ColumnBlockData::F64(values) => values.clone(),
+            _ => panic!("expected f64 column"),
+        }
+    }
+
+    fn block_column_i64(block: &ColumnBlock, name: &str) -> Vec<i64> {
+        let idx = block.schema.column_index(name).expect("column index");
+        match &block.columns[idx].data {
+            ColumnBlockData::I64(values) => values.clone(),
+            _ => panic!("expected i64 column"),
+        }
+    }
+
+    fn block_column_string(block: &ColumnBlock, name: &str) -> Vec<String> {
+        let idx = block.schema.column_index(name).expect("column index");
+        match &block.columns[idx].data {
+            ColumnBlockData::String(values) => values.clone(),
+            _ => panic!("expected string column"),
+        }
     }
 
     #[test]
@@ -1808,8 +2050,9 @@ mod tests {
             }],
         };
         let result = mem.query_col(&query).expect("query_col");
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].values[0], Value::F64(10.0));
+        assert_eq!(result.row_count, 1);
+        let values = block_column_f64(&result, "price");
+        assert_eq!(values[0], 10.0);
     }
 
     #[test]
@@ -1855,8 +2098,9 @@ mod tests {
             }],
         };
         let result = mem.query_col(&query).expect("query_col");
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].values[0], Value::F64(10.0));
+        assert_eq!(result.row_count, 1);
+        let values = block_column_f64(&result, "price");
+        assert_eq!(values[0], 10.0);
     }
 
     #[test]
@@ -1872,16 +2116,21 @@ mod tests {
         )
         .expect("insert");
 
-        let schema = mem.table_schema("ticks").expect("schema");
-        let price_idx = schema.column_index("price").expect("price idx");
         assert_eq!(mem.table_row_count("ticks"), Some(2));
-
-        let rows = mem.table_rows("ticks").expect("rows");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values[price_idx], Value::F64(10.0));
-
-        let row = mem.table_row("ticks", 1).expect("row");
-        assert_eq!(row.values[price_idx], Value::F64(12.0));
+        let query = ColumnQuery {
+            table: "ticks".to_string(),
+            columns: vec!["price".to_string()],
+            filter: Vec::new(),
+            project: vec![ColumnProjectItem {
+                name: "price".to_string(),
+                expr: ColumnProjectExpr::Column(0),
+            }],
+        };
+        let result = mem.query_col(&query).expect("query_col");
+        let prices = block_column_f64(&result, "price");
+        assert_eq!(prices.len(), 2);
+        assert_eq!(prices[0], 10.0);
+        assert_eq!(prices[1], 12.0);
     }
 
     #[test]
@@ -1910,14 +2159,21 @@ mod tests {
             )
             .expect("update");
         assert_eq!(updated, 1);
-        let rows = mem.table_rows("ticks").expect("rows");
-        let notes_idx = mem
-            .table_schema("ticks")
-            .expect("schema")
-            .column_index("notes")
-            .expect("notes idx");
-        let notes: Vec<Value> = rows.into_iter().map(|row| row.values[notes_idx].clone()).collect();
-        assert_eq!(notes.iter().filter(|v| **v == Value::String("hot".to_string())).count(), 1);
+        let query = ColumnQuery {
+            table: "ticks".to_string(),
+            columns: vec!["notes".to_string()],
+            filter: Vec::new(),
+            project: vec![ColumnProjectItem {
+                name: "notes".to_string(),
+                expr: ColumnProjectExpr::Column(0),
+            }],
+        };
+        let result = mem.query_col(&query).expect("query_col");
+        let notes = block_column_string(&result, "notes");
+        assert_eq!(
+            notes.iter().filter(|v| v.as_str() == "hot").count(),
+            1
+        );
     }
 
     #[test]
@@ -1980,10 +2236,18 @@ mod tests {
             },
         )
         .expect("alter add");
-        let schema = mem.table_schema("ticks").expect("schema");
-        let lot_idx = schema.column_index("lot").expect("lot idx");
-        let row = mem.table_row("ticks", 0).expect("row");
-        assert_eq!(row.values[lot_idx], Value::I64(100));
+        let query = ColumnQuery {
+            table: "ticks".to_string(),
+            columns: vec!["lot".to_string()],
+            filter: Vec::new(),
+            project: vec![ColumnProjectItem {
+                name: "lot".to_string(),
+                expr: ColumnProjectExpr::Column(0),
+            }],
+        };
+        let result = mem.query_col(&query).expect("query_col");
+        let lots = block_column_i64(&result, "lot");
+        assert_eq!(lots[0], 100);
 
         mem.alter_rename_column("ticks", "lot", "lots")
             .expect("rename");
@@ -1995,8 +2259,23 @@ mod tests {
             .expect("drop column");
         let schema = mem.table_schema("ticks").expect("schema");
         assert!(schema.column_index("price").is_none());
-        let row = mem.table_row("ticks", 0).expect("row");
-        assert_eq!(row.values.len(), schema.columns().len());
+        let query = ColumnQuery {
+            table: "ticks".to_string(),
+            columns: vec!["symbol".to_string(), "lots".to_string()],
+            filter: Vec::new(),
+            project: vec![
+                ColumnProjectItem {
+                    name: "symbol".to_string(),
+                    expr: ColumnProjectExpr::Column(0),
+                },
+                ColumnProjectItem {
+                    name: "lots".to_string(),
+                    expr: ColumnProjectExpr::Column(1),
+                },
+            ],
+        };
+        let result = mem.query_col(&query).expect("query_col");
+        assert_eq!(result.schema.columns().len(), schema.columns().len());
     }
 
     #[test]
@@ -2026,10 +2305,18 @@ mod tests {
             &[vec![Value::String("AAPL".to_string())]],
         )
         .expect("insert");
-        let schema = mem.table_schema("ticks").expect("schema");
-        let price_idx = schema.column_index("price").expect("price idx");
-        let row = mem.table_row("ticks", 0).expect("row");
-        assert_eq!(row.values[price_idx], Value::F64(7.0));
+        let query = ColumnQuery {
+            table: "ticks".to_string(),
+            columns: vec!["price".to_string()],
+            filter: Vec::new(),
+            project: vec![ColumnProjectItem {
+                name: "price".to_string(),
+                expr: ColumnProjectExpr::Column(0),
+            }],
+        };
+        let result = mem.query_col(&query).expect("query_col");
+        let prices = block_column_f64(&result, "price");
+        assert_eq!(prices[0], 7.0);
     }
 
     #[test]
@@ -2060,12 +2347,28 @@ mod tests {
         let mut reloaded = MemStore::with_store(store);
         reloaded.load_from_store().expect("load");
 
-        let row0 = reloaded.table_row("ticks", 0).expect("row0");
-        let row1 = reloaded.table_row("ticks", 1).expect("row1");
-        assert_eq!(row0.values[0], Value::String("A".to_string()));
-        assert_eq!(row1.values[0], Value::Null);
-        assert_eq!(row0.values[1], Value::I64(3));
-        assert_eq!(row1.values[1], Value::I64(3));
+        let query = ColumnQuery {
+            table: "ticks".to_string(),
+            columns: vec!["sym".to_string(), "price".to_string()],
+            filter: Vec::new(),
+            project: vec![
+                ColumnProjectItem {
+                    name: "sym".to_string(),
+                    expr: ColumnProjectExpr::Column(0),
+                },
+                ColumnProjectItem {
+                    name: "price".to_string(),
+                    expr: ColumnProjectExpr::Column(1),
+                },
+            ],
+        };
+        let result = reloaded.query_col(&query).expect("query_col");
+        let syms = block_column_string(&result, "sym");
+        let prices = block_column_i64(&result, "price");
+        assert_eq!(syms[0], "A");
+        assert_eq!(syms[1], "");
+        assert_eq!(prices[0], 3);
+        assert_eq!(prices[1], 3);
     }
 
     #[test]
@@ -2107,10 +2410,19 @@ mod tests {
         let store = SplayedStore::open(cfg).expect("reopen store");
         let mut reloaded = MemStore::with_store(store);
         reloaded.load_from_store().expect("load");
-        let row0 = reloaded.table_row("ticks", 0).expect("row0");
-        let row1 = reloaded.table_row("ticks", 1).expect("row1");
-        assert_eq!(row0.values[0], Value::String("AAPL".to_string()));
-        assert_eq!(row1.values[0], Value::String("MSFT".to_string()));
+        let query = ColumnQuery {
+            table: "ticks".to_string(),
+            columns: vec!["sym".to_string()],
+            filter: Vec::new(),
+            project: vec![ColumnProjectItem {
+                name: "sym".to_string(),
+                expr: ColumnProjectExpr::Column(0),
+            }],
+        };
+        let result = reloaded.query_col(&query).expect("query_col");
+        let syms = block_column_string(&result, "sym");
+        assert_eq!(syms[0], "AAPL");
+        assert_eq!(syms[1], "MSFT");
     }
 
     #[test]

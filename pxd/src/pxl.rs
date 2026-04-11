@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 
 use crate::error::{Error, Result};
 use crate::expr::{BinaryOp, Expr};
-use crate::types::{ColumnSpec, ColumnType, Row, Schema, Value};
+use crate::types::{ColumnSpec, ColumnType, Schema, Value};
 
 const MAGIC: [u8; 2] = *b"PX";
 const VERSION: u8 = 2;
@@ -444,13 +444,9 @@ fn read_column_query_payload(cursor: &mut Cursor<'_>) -> Result<ColumnQuery> {
     })
 }
 
-pub fn encode_result_payload(schema: &Schema, rows: &[Row]) -> Result<Vec<u8>> {
+pub fn encode_scalar_payload(value: &Value) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    write_schema(&mut out, schema)?;
-    write_u32(&mut out, rows.len() as u32)?;
-    for row in rows {
-        write_values(&mut out, &row.values)?;
-    }
+    write_value(&mut out, value)?;
     Ok(out)
 }
 
